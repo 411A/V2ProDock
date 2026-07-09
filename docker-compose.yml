@@ -3,16 +3,45 @@ services:
     build: .
     container_name: v2proxy
     restart: unless-stopped
+    networks:
+      - proxy-net
     ports:
-      - "27019:27019"
-      - "27020:27020"
+      - "27019:27019"   # SOCKS5
+      - "27020:27020"   # HTTP
     volumes:
       - ./config:/root/config
     environment:
       - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
-      - HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://httpbin.org/ip}
+      - HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://api.ipify.org}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:27020"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Example: another service using the proxy
+  # Uncomment and modify for your needs
+  # app:
+  #   image: your-app:latest
+  #   container_name: app
+  #   restart: unless-stopped
+  #   networks:
+  #     - proxy-net
+  #   environment:
+  #     - HTTP_PROXY=http://v2proxy:27020
+  #     - HTTPS_PROXY=socks5://v2proxy:27019
+  #     - NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
+
+networks:
+  proxy-net:
+    driver: bridge
