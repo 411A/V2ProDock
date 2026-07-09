@@ -18,10 +18,10 @@ Enter your subscription URL when prompted. The script:
 
 ```bash
 # SOCKS5
-curl --socks5 127.0.0.1:1080 https://api.ipify.org
+curl --socks5 127.0.0.1:27019 https://api.ipify.org
 
 # HTTP
-curl --proxy http://127.0.0.1:27019 https://api.ipify.org
+curl --proxy http://127.0.0.1:27020 https://api.ipify.org
 ```
 
 ## Commands
@@ -37,7 +37,7 @@ sudo bash setup-v2prodock.sh uninstall  # Remove
 
 1. Fetches subscription, parses vless/vmess/trojan/ss URLs
 2. Converts to xray-core JSON configs
-3. Starts xray providing SOCKS5 (:1080) + HTTP (:27019)
+3. Starts xray providing SOCKS5 (:27019) + HTTP (:27020)
 4. Health-checks every 60s, auto-switches on failure
 5. Refreshes subscription every 120s
 
@@ -52,8 +52,8 @@ sudo bash setup-v2prodock.sh
 
 Other apps on the VPS can use the proxy:
 ```bash
-export HTTP_PROXY=http://127.0.0.1:27019
-export HTTPS_PROXY=socks5://127.0.0.1:1080
+export HTTP_PROXY=http://127.0.0.1:27020
+export HTTPS_PROXY=socks5://127.0.0.1:27019
 ```
 
 ## Supported Protocols

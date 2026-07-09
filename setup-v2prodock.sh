@@ -35,11 +35,11 @@ case "${1:-}" in
         ok "Started"
         echo ""
         echo -e "${CYAN}Proxies:${NC}"
-        echo "  SOCKS5: localhost:1080"
-        echo "  HTTP:   localhost:27019"
+        echo "  SOCKS5: localhost:27019"
+        echo "  HTTP:   localhost:27020"
         echo ""
         echo "Test:"
-        echo "  curl --socks5 localhost:1080 http://httpbin.org/ip"
-        echo "  curl --proxy http://localhost:27019 http://httpbin.org/ip"
+        echo "  curl --socks5 localhost:27019 http://httpbin.org/ip"
+        echo "  curl --proxy http://localhost:27020 http://httpbin.org/ip"
         ;;
 esac
