@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const xraySocksPort = "1080"
+const xraySocksPort = "27019"
 
 type ProxySelector struct {
 	mu            sync.Mutex
@@ -149,7 +149,7 @@ func (s *ProxySelector) startXray(index int) error {
 		"inbounds": []map[string]interface{}{
 			{
 				"tag":      "socks-in",
-				"port":     1080,
+				"port":     27019,
 				"listen":   "0.0.0.0",
 				"protocol": "socks",
 				"settings": map[string]interface{}{

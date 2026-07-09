@@ -4,8 +4,8 @@ services:
     container_name: v2proxy
     restart: unless-stopped
     ports:
-      - "1080:1080"
       - "27019:27019"
+      - "27020:27020"
     volumes:
       - ./config:/root/config
     environment:

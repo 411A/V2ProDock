@@ -20,5 +20,5 @@ WORKDIR /root/
 COPY --from=builder /app/v2proxy .
 RUN mkdir -p /root/config
 
-EXPOSE 1080 27019
+EXPOSE 27019 27020
 ENTRYPOINT ["./v2proxy"]
