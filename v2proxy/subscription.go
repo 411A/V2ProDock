@@ -32,8 +32,18 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	}
 
 	content := strings.TrimSpace(string(body))
-	if decoded, err := base64.StdEncoding.DecodeString(content); err == nil {
-		content = string(decoded)
+
+	// Try multiple base64 decodings
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(content); err == nil {
+			content = string(decoded)
+			break
+		}
 	}
 
 	var proxies []ProxyConfig
@@ -118,7 +128,16 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		}
 	case "tcp":
 		if security == "reality" {
-			return nil, fmt.Errorf("reality protocol requires xray v1.8+ client config, skipping")
+			stream["realitySettings"] = map[string]interface{}{
+				"serverName":  q.Get("sni"),
+				"fingerprint": q.Get("fp"),
+				"publicKey":   q.Get("pbk"),
+				"shortId":     q.Get("sid"),
+				"spiderX":     q.Get("spx"),
+			}
+			if flow != "" {
+				stream["flow"] = flow
+			}
 		} else if security == "tls" {
 			stream["tlsSettings"] = buildTLS(q, "tcp")
 		}
@@ -156,9 +175,23 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 
 func parseVmess(raw, name string) (*ProxyConfig, error) {
 	b64 := strings.TrimPrefix(raw, "vmess://")
-	jsonData, err := base64.StdEncoding.DecodeString(b64)
+
+	// Try multiple base64 decodings
+	var jsonData []byte
+	var err error
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		jsonData, err = enc.DecodeString(b64)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode vmess base64: %w", err)
 	}
 
 	var m map[string]interface{}
