@@ -1,0 +1,30 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Go
+*.go text diff=golang
+go.mod text diff=golang
+go.sum text diff=golang
+
+# Shell scripts
+*.sh text eol=lf
+
+# Docker
+Dockerfile text diff=dockerfile
+docker-compose.yml text
+
+# Markdown
+*.md text diff=markdown
+
+# Config
+*.json text
+*.yml text
+*.yaml text
+
+# Binary
+*.exe binary
+*.zip binary
+xray/* binary
+
+# Enforce LF line endings for shell scripts
+*.sh text eol=lf

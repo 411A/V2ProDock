@@ -1,0 +1,37 @@
+# Binaries
+*.exe
+v2proxy/v2proxy
+v2proxy/*.test
+
+# Go
+vendor/
+*.sum
+
+# Xray
+xray/
+config/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+
+# Old files
+OLD_*

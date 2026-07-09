@@ -1,0 +1,18 @@
+services:
+  v2proxy:
+    build: .
+    container_name: v2proxy
+    restart: unless-stopped
+    ports:
+      - "1080:1080"
+      - "27019:27019"
+    volumes:
+      - ./config:/root/config
+    environment:
+      - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
+      - HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://httpbin.org/ip}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
