@@ -20,6 +20,14 @@ fi
 # Install unzip if not present
 command -v unzip &>/dev/null || sudo apt-get install -y unzip
 
+# Install zellij if not present
+if ! command -v zellij &>/dev/null; then
+    echo "Installing zellij..."
+    curl -sL https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | tar -C /usr/local/bin -xzf -
+    chmod +x /usr/local/bin/zellij
+    ok "Zellij installed"
+fi
+
 # Download xray if not present
 if [ ! -f "$DIR/xray/xray" ]; then
     echo "Downloading xray..."
@@ -71,17 +79,22 @@ read -p "URL: " input; health_url=${input:-$health_url}
 
 ok "Config ready"
 
-# Start proxy
+# Kill existing session if running
+zellij kill-session v2proxy 2>/dev/null || true
+
+# Start in zellij session
 echo ""
-echo -e "${CYAN}Starting V2Ray Proxy...${NC}"
+echo -e "${CYAN}Starting V2Ray Proxy in zellij session 'v2proxy'...${NC}"
+echo ""
 echo "  SOCKS5: localhost:27019"
 echo "  HTTP:   localhost:27020"
 echo ""
-echo "Press Ctrl+C to stop"
+echo "  Attach:  zellij attach v2proxy"
+echo "  Detach:  Ctrl+O then D"
 echo ""
 
 export SUBSCRIPTION_URL="$sub_url"
 export HEALTH_CHECK_URL="$health_url"
 export XRAY_DIR="$DIR/xray"
 
-exec "$DIR/v2proxy"
+zellij --session v2proxy -- "$DIR/v2proxy"
