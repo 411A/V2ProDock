@@ -1,0 +1,1397 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: v2proxy, v2proxy/config.go, v2proxy/go.mod, v2proxy/go.sum, v2proxy/healthcheck.go, v2proxy/httpproxy.go, v2proxy/main.go, v2proxy/selector.go, v2proxy/subscription.go, .gitattributes, .gitignore, docker-compose.yml, Dockerfile, README.md, setup-v2prodock.sh, setup.sh
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitattributes
+.gitignore
+docker-compose.yml
+Dockerfile
+README.md
+setup-v2prodock.sh
+setup.sh
+v2proxy/config.go
+v2proxy/go.mod
+v2proxy/healthcheck.go
+v2proxy/httpproxy.go
+v2proxy/main.go
+v2proxy/selector.go
+v2proxy/subscription.go
+v2proxy/v2proxy-linux
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitattributes">
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Go
+*.go text diff=golang
+go.mod text diff=golang
+go.sum text diff=golang
+
+# Shell scripts
+*.sh text eol=lf
+
+# Docker
+Dockerfile text diff=dockerfile
+docker-compose.yml text
+
+# Markdown
+*.md text diff=markdown
+
+# Config
+*.json text
+*.yml text
+*.yaml text
+
+# Binary
+*.exe binary
+*.zip binary
+xray/* binary
+
+# Enforce LF line endings for shell scripts
+*.sh text eol=lf
+</file>
+
+<file path=".gitignore">
+# Binaries
+*.exe
+v2proxy/v2proxy
+v2proxy/*.test
+
+# Go
+vendor/
+*.sum
+
+# Xray
+xray/
+config/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+
+# Old files
+OLD_*
+</file>
+
+<file path="v2proxy/config.go">
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+func EnsureXray(xrayDir string) error {
+	xrayBin := filepath.Join(xrayDir, "xray")
+	if runtime.GOOS == "windows" {
+		xrayBin += ".exe"
+	}
+
+	if _, err := os.Stat(xrayBin); err == nil {
+		log.Printf("Xray ready at %s", xrayBin)
+		return nil
+	}
+
+	return downloadXray(xrayDir, xrayBin)
+}
+
+func downloadXray(xrayDir, xrayBin string) error {
+	os.MkdirAll(xrayDir, 0755)
+
+	arch := runtime.GOARCH
+	osName := runtime.GOOS
+
+	var archName string
+	switch arch {
+	case "amd64", "x86_64":
+		archName = "64"
+	case "arm64", "aarch64":
+		archName = "arm64-v8a"
+	case "arm":
+		archName = "arm32-v7a"
+	default:
+		archName = "64"
+	}
+
+	var osName2 string
+	switch osName {
+	case "linux":
+		osName2 = "linux"
+	case "darwin":
+		osName2 = "macos"
+	case "windows":
+		osName2 = "windows"
+	default:
+		osName2 = "linux"
+	}
+
+	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/latest/download/Xray-%s-%s.zip", osName2, archName)
+	log.Printf("Downloading xray: %s", url)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("download returned status %d", resp.StatusCode)
+	}
+
+	tmpFile := filepath.Join(xrayDir, "xray.zip")
+	out, err := os.Create(tmpFile)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, resp.Body)
+	out.Close()
+	if err != nil {
+		return err
+	}
+
+	if err := extractZip(tmpFile, xrayDir); err != nil {
+		return fmt.Errorf("extract failed: %w", err)
+	}
+	os.Remove(tmpFile)
+
+	if runtime.GOOS != "windows" {
+		os.Chmod(xrayBin, 0755)
+	}
+
+	if _, err := os.Stat(xrayBin); err != nil {
+		return fmt.Errorf("xray binary not found after extraction at %s", xrayBin)
+	}
+
+	log.Printf("Xray installed: %s", xrayBin)
+	return nil
+}
+
+func extractZip(src, dst string) error {
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		// Try unzip first
+		cmd := exec.Command("unzip", "-o", src, "-d", dst)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			// unzip might not be available, try tar or python
+			if strings.Contains(string(output), "not found") || strings.Contains(string(output), "No such file") {
+				cmd2 := exec.Command("python3", "-c",
+					fmt.Sprintf("import zipfile; zipfile.ZipFile('%s').extractall('%s')", src, dst))
+				if output2, err2 := cmd2.CombinedOutput(); err2 != nil {
+					return fmt.Errorf("extract failed: %s %s", string(output), string(output2))
+				}
+				return nil
+			}
+			return fmt.Errorf("unzip failed: %w", err)
+		}
+		return nil
+	}
+
+	// Windows: use PowerShell
+	psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", src, dst)
+	cmd := exec.Command("powershell", "-Command", psCmd)
+	return cmd.Run()
+}
+</file>
+
+<file path="v2proxy/go.mod">
+module v2proxy
+
+go 1.25.0
+
+require golang.org/x/net v0.57.0
+</file>
+
+<file path="v2proxy/healthcheck.go">
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+type HealthResult struct {
+	Latency time.Duration
+	Working bool
+	Error   error
+}
+
+func TestProxyHealth(proxyAddr string, testURL string, timeout time.Duration) HealthResult {
+	result := HealthResult{}
+
+	transport := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(fmt.Sprintf("socks5://%s", proxyAddr))
+		},
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		DisableKeepAlives:     true,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+
+	start := time.Now()
+	resp, err := client.Get(testURL)
+	latency := time.Since(start)
+
+	if err != nil {
+		result.Error = err
+		result.Latency = latency
+		return result
+	}
+	defer resp.Body.Close()
+
+	// Accept any response - the proxy is working if we get a response at all
+	result.Working = true
+	result.Latency = latency
+	return result
+}
+</file>
+
+<file path="v2proxy/httpproxy.go">
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"golang.org/x/net/proxy"
+)
+
+func startHTTPProxy(addr, socksAddr string) {
+	transport := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(fmt.Sprintf("socks5://%s", socksAddr))
+		},
+	}
+
+	server := &http.Server{
+		Addr: addr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleConnect(w, r, socksAddr)
+			} else {
+				handlePlainHTTP(w, r, transport)
+			}
+		}),
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("HTTP proxy bind failed on %s: %v (SOCKS5 on :1080)", addr, err)
+		return
+	}
+
+	go func() {
+		log.Printf("HTTP proxy on %s (via %s)", addr, socksAddr)
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP proxy error: %v", err)
+		}
+	}()
+}
+
+func handlePlainHTTP(w http.ResponseWriter, r *http.Request, transport *http.Transport) {
+	r.Header.Del("Proxy-Connection")
+	r.Header.Del("Proxy-Authorization")
+
+	resp, err := transport.RoundTrip(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func handleConnect(w http.ResponseWriter, r *http.Request, socksAddr string) {
+	target := r.Host
+	if !strings.Contains(target, ":") {
+		target += ":443"
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	conn, err := dialer.Dial("tcp", target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		conn.Close()
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	go relay(conn, clientConn)
+	go relay(clientConn, conn)
+}
+
+func relay(dst, src net.Conn) {
+	defer dst.Close()
+	defer src.Close()
+	io.Copy(dst, src)
+}
+</file>
+
+<file path="v2proxy/subscription.go">
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type ProxyConfig struct {
+	Name    string
+	Raw     string
+	XrayCfg json.RawMessage
+}
+
+func FetchSubscription(subURL string) ([]ProxyConfig, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(subURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch subscription: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	content := strings.TrimSpace(string(body))
+	if decoded, err := base64.StdEncoding.DecodeString(content); err == nil {
+		content = string(decoded)
+	}
+
+	var proxies []ProxyConfig
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		proxy, err := parseToXrayConfig(line)
+		if err != nil {
+			continue
+		}
+		proxies = append(proxies, *proxy)
+	}
+	return proxies, nil
+}
+
+func parseToXrayConfig(raw string) (*ProxyConfig, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	scheme := strings.ToLower(u.Scheme)
+	name, _ := url.PathUnescape(strings.TrimPrefix(u.Fragment, "#"))
+	if name == "" {
+		name = u.Host
+	}
+
+	switch scheme {
+	case "vless":
+		return parseVless(u, raw, name)
+	case "vmess":
+		return parseVmess(raw, name)
+	case "trojan":
+		return parseTrojan(u, raw, name)
+	case "ss":
+		return parseSS(u, raw, name)
+	case "hysteria2", "hy2":
+		return parseHy2(u, raw, name)
+	default:
+		return nil, fmt.Errorf("unsupported: %s", scheme)
+	}
+}
+
+func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
+	q := u.Query()
+	server := u.Hostname()
+	port := toInt(u.Port(), 443)
+	uuid := u.User.Username()
+	security := q.Get("security")
+	flow := q.Get("flow")
+	transport := q.Get("type")
+	if transport == "" {
+		transport = "tcp"
+	}
+
+	stream := map[string]interface{}{
+		"network":  transport,
+		"security": security,
+	}
+
+	switch transport {
+	case "ws":
+		host := q.Get("host")
+		path := q.Get("path")
+		if path == "" {
+			path = "/"
+		}
+		stream["wsSettings"] = map[string]interface{}{
+			"path": path,
+			"host": host,
+		}
+		if security == "tls" {
+			stream["tlsSettings"] = buildTLS(q, "ws")
+		}
+	case "grpc":
+		stream["grpcSettings"] = map[string]interface{}{
+			"serviceName": q.Get("serviceName"),
+		}
+		if security == "tls" {
+			stream["tlsSettings"] = buildTLS(q, "grpc")
+		}
+	case "tcp":
+		if security == "reality" {
+			return nil, fmt.Errorf("reality protocol requires xray v1.8+ client config, skipping")
+		} else if security == "tls" {
+			stream["tlsSettings"] = buildTLS(q, "tcp")
+		}
+	default:
+		if security == "tls" {
+			stream["tlsSettings"] = buildTLS(q, transport)
+		}
+	}
+
+	outbound := map[string]interface{}{
+		"protocol": "vless",
+		"settings": map[string]interface{}{
+			"vnext": []map[string]interface{}{
+				{
+					"address": server,
+					"port":    port,
+					"users": []map[string]interface{}{
+						{
+							"id":         uuid,
+							"encryption": "none",
+							"flow":       flow,
+							"password":   "",
+						},
+					},
+				},
+			},
+		},
+		"streamSettings": stream,
+		"tag":            "proxy",
+	}
+
+	cfgBytes, _ := json.Marshal(outbound)
+	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+}
+
+func parseVmess(raw, name string) (*ProxyConfig, error) {
+	b64 := strings.TrimPrefix(raw, "vmess://")
+	jsonData, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(jsonData, &m); err != nil {
+		return nil, err
+	}
+
+	server, _ := m["add"].(string)
+	port := toInt(fmt.Sprint(m["port"]), 443)
+	id, _ := m["id"].(string)
+	aid := toInt(fmt.Sprint(m["aid"]), 0)
+	net, _ := m["net"].(string)
+	if net == "" {
+		net = "tcp"
+	}
+	tls, _ := m["tls"].(string)
+
+	stream := map[string]interface{}{
+		"network":  net,
+		"security": tls,
+	}
+	if net == "ws" {
+		stream["wsSettings"] = map[string]interface{}{
+			"path": m["path"],
+			"host": m["host"],
+		}
+	}
+	if tls == "tls" {
+		stream["tlsSettings"] = map[string]interface{}{
+			"serverName":  m["sni"],
+			"fingerprint": m["fp"],
+		}
+	}
+
+	outbound := map[string]interface{}{
+		"protocol": "vmess",
+		"settings": map[string]interface{}{
+			"vnext": []map[string]interface{}{
+				{
+					"address": server,
+					"port":    port,
+					"users": []map[string]interface{}{
+						{
+							"id":       id,
+							"alterId":  aid,
+							"security": "auto",
+						},
+					},
+				},
+			},
+		},
+		"streamSettings": stream,
+		"tag":            "proxy",
+	}
+
+	cfgBytes, _ := json.Marshal(outbound)
+	if name == "" {
+		name = server
+	}
+	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+}
+
+func parseTrojan(u *url.URL, raw, name string) (*ProxyConfig, error) {
+	q := u.Query()
+	server := u.Hostname()
+	port := toInt(u.Port(), 443)
+	password := u.User.Username()
+	transport := q.Get("type")
+	if transport == "" {
+		transport = "tcp"
+	}
+
+	stream := map[string]interface{}{
+		"network":  transport,
+		"security": "tls",
+		"tlsSettings": map[string]interface{}{
+			"serverName":  q.Get("sni"),
+			"fingerprint": q.Get("fp"),
+		},
+	}
+	// Only add ALPN for non-WebSocket transports (deprecated in xray v26 for WS)
+	if transport != "ws" {
+		stream["tlsSettings"].(map[string]interface{})["alpn"] = []string{"h2", "http/1.1"}
+	}
+
+	switch transport {
+	case "ws":
+		stream["wsSettings"] = map[string]interface{}{
+			"path": q.Get("path"),
+			"host": q.Get("host"),
+		}
+	case "grpc":
+		stream["grpcSettings"] = map[string]interface{}{
+			"serviceName": q.Get("serviceName"),
+		}
+	}
+
+	// Trojan in xray: password is at the SERVER level, NOT inside users
+	outbound := map[string]interface{}{
+		"protocol": "trojan",
+		"settings": map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"address":  server,
+					"port":     port,
+					"password": password,
+				},
+			},
+		},
+		"streamSettings": stream,
+		"tag":            "proxy",
+	}
+
+	cfgBytes, _ := json.Marshal(outbound)
+	if name == "" {
+		name = server
+	}
+	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+}
+
+func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
+	server := u.Hostname()
+	port := toInt(u.Port(), 443)
+
+	userInfo := u.User.Username()
+	decoded, err := base64.StdEncoding.DecodeString(userInfo)
+	var method, password string
+	if err == nil {
+		parts := strings.SplitN(string(decoded), ":", 2)
+		if len(parts) == 2 {
+			method = parts[0]
+			password = parts[1]
+		}
+	}
+	if method == "" {
+		method = "chacha20-ietf-poly1305"
+		password = userInfo
+	}
+
+	outbound := map[string]interface{}{
+		"protocol": "shadowsocks",
+		"settings": map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"address":  server,
+					"port":     port,
+					"method":   method,
+					"password": password,
+				},
+			},
+		},
+		"streamSettings": map[string]interface{}{
+			"network": "tcp",
+		},
+		"tag": "proxy",
+	}
+
+	cfgBytes, _ := json.Marshal(outbound)
+	if name == "" {
+		name = server
+	}
+	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+}
+
+func parseHy2(u *url.URL, raw, name string) (*ProxyConfig, error) {
+	// Hysteria2 is NOT supported by xray-core - skip it
+	return nil, fmt.Errorf("hysteria2 not supported by xray-core")
+}
+
+func buildTLS(q url.Values, transport string) map[string]interface{} {
+	m := map[string]interface{}{
+		"serverName": q.Get("sni"),
+	}
+	if fp := q.Get("fp"); fp != "" {
+		m["fingerprint"] = fp
+	}
+	// Don't include ALPN for WebSocket transport (deprecated in xray v26)
+	if transport != "ws" {
+		if alpn := q.Get("alpn"); alpn != "" {
+			m["alpn"] = strings.Split(alpn, ",")
+		}
+	}
+	return m
+}
+
+func toInt(s string, def int) int {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "<nil>" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return v
+}
+</file>
+
+<file path="docker-compose.yml">
+services:
+  v2proxy:
+    build: .
+    container_name: v2proxy
+    restart: unless-stopped
+    ports:
+      - "27019:27019"
+      - "27020:27020"
+    volumes:
+      - ./config:/root/config
+    environment:
+      - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
+      - HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://httpbin.org/ip}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+</file>
+
+<file path="Dockerfile">
+FROM golang:1.23-alpine AS builder
+WORKDIR /app
+COPY v2proxy/ .
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o v2proxy .
+
+FROM alpine:3.20
+RUN apk --no-cache add ca-certificates curl unzip && \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  XARCH="64" ;; \
+      aarch64) XARCH="arm64-v8a" ;; \
+      armv7l)  XARCH="arm32-v7a" ;; \
+      *)       XARCH="64" ;; \
+    esac && \
+    curl -sL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" -o /tmp/x.zip && \
+    unzip /tmp/x.zip -d /root/xray && rm /tmp/x.zip && chmod +x /root/xray/xray && \
+    apk del curl unzip
+
+WORKDIR /root/
+COPY --from=builder /app/v2proxy .
+RUN mkdir -p /root/config
+
+EXPOSE 27019 27020
+ENTRYPOINT ["./v2proxy"]
+</file>
+
+<file path="setup-v2prodock.sh">
+#!/bin/bash
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
+ok() { echo -e "${GREEN}[OK] $1${NC}"; }
+err() { echo -e "${RED}[ERROR] $1${NC}"; }
+
+[[ $EUID -ne 0 ]] && { err "Run as root"; exit 1; }
+command -v docker &>/dev/null || { err "Docker not installed"; exit 1; }
+docker compose version &>/dev/null || { err "Docker Compose not available"; exit 1; }
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+case "${1:-}" in
+    start)  docker compose up -d; ok "Started" ;;
+    stop)   docker compose stop; ok "Stopped" ;;
+    status) docker compose ps; echo; docker logs --tail 10 v2proxy 2>&1 ;;
+    uninstall)
+        read -p "Remove everything? [y/N]: " -n 1 -r; echo
+        [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
+        docker compose down -v; rm -rf config .env; ok "Removed" ;;
+    *)
+        mkdir -p config
+        echo "Enter subscription URL:"
+        read -p "URL: " sub_url
+        [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
+        echo "$sub_url" > config/subscription.txt
+        echo "Health check URL (default: http://httpbin.org/ip):"
+        read -p "URL: " health_url; health_url=${health_url:-"http://httpbin.org/ip"}
+        echo -e "SUBSCRIPTION_URL=$sub_url\nHEALTH_CHECK_URL=$health_url" > .env
+        ok "Config saved"
+        docker compose build 2>&1
+        docker compose up -d 2>&1
+        ok "Started"
+        echo ""
+        echo -e "${CYAN}Proxies:${NC}"
+        echo "  SOCKS5: localhost:27019"
+        echo "  HTTP:   localhost:27020"
+        echo ""
+        echo "Test:"
+        echo "  curl --socks5 localhost:27019 http://httpbin.org/ip"
+        echo "  curl --proxy http://localhost:27020 http://httpbin.org/ip"
+        ;;
+esac
+</file>
+
+<file path="setup.sh">
+#!/bin/bash
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
+ok() { echo -e "${GREEN}[OK] $1${NC}"; }
+err() { echo -e "${RED}[ERROR] $1${NC}"; }
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+# Install Go if not present
+if ! command -v go &>/dev/null; then
+    echo "Installing Go..."
+    curl -sL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
+    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+    export PATH=$PATH:/usr/local/go/bin
+    ok "Go installed"
+fi
+
+# Install unzip if not present
+command -v unzip &>/dev/null || sudo apt-get install -y unzip
+
+# Install zellij if not present
+if ! command -v zellij &>/dev/null; then
+    echo "Installing zellij..."
+    curl -sL https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | tar -C /usr/local/bin -xzf -
+    chmod +x /usr/local/bin/zellij
+    ok "Zellij installed"
+fi
+
+# Download xray if not present
+if [ ! -f "$DIR/xray/xray" ]; then
+    echo "Downloading xray..."
+    mkdir -p "$DIR/xray"
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  XARCH="64" ;;
+        aarch64) XARCH="arm64-v8a" ;;
+        armv7l)  XARCH="arm32-v7a" ;;
+        *)       XARCH="64" ;;
+    esac
+    curl -sL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" -o /tmp/x.zip
+    unzip -o /tmp/x.zip -d "$DIR/xray" && rm /tmp/x.zip
+    chmod +x "$DIR/xray/xray"
+    ok "Xray downloaded"
+fi
+
+# Build Go binary if not present or source changed
+if [ ! -f "$DIR/v2proxy" ] || [ -n "$(find v2proxy/ -newer v2proxy -maxdepth 0 2>/dev/null)" ]; then
+    echo "Building v2proxy..."
+    cd "$DIR/v2proxy"
+    go build -o "$DIR/v2proxy" .
+    cd "$DIR"
+    ok "Built"
+fi
+
+# Create config dir
+mkdir -p "$DIR/config"
+
+# Get subscription URL
+if [ -f "$DIR/config/subscription.txt" ]; then
+    sub_url=$(cat "$DIR/config/subscription.txt")
+    echo "Current subscription: $sub_url"
+    read -p "Keep? [Y/n]: " -n 1 -r; echo
+    [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
+fi
+
+if [ -z "$sub_url" ]; then
+    echo "Enter subscription URL:"
+    read -p "URL: " sub_url
+    [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
+    echo "$sub_url" > "$DIR/config/subscription.txt"
+fi
+
+# Get health check URL
+health_url="http://api.ipify.org"
+echo "Health check URL (default: $health_url):"
+read -p "URL: " input; health_url=${input:-$health_url}
+
+ok "Config ready"
+
+# Kill existing session if running
+zellij kill-session v2proxy 2>/dev/null || true
+
+# Start in zellij session
+echo ""
+echo -e "${CYAN}Starting V2Ray Proxy in zellij session 'v2proxy'...${NC}"
+echo ""
+echo "  SOCKS5: localhost:27019"
+echo "  HTTP:   localhost:27020"
+echo ""
+echo "  Attach:  zellij attach v2proxy"
+echo "  Detach:  Ctrl+O then D"
+echo ""
+
+export SUBSCRIPTION_URL="$sub_url"
+export HEALTH_CHECK_URL="$health_url"
+export XRAY_DIR="$DIR/xray"
+
+zellij --session v2proxy -- "$DIR/v2proxy"
+</file>
+
+<file path="v2proxy/main.go">
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("Starting V2Ray Proxy...")
+
+	xrayDir := "/root/xray"
+	testURL := "http://httpbin.org/ip"
+	subURL := ""
+
+	if v := os.Getenv("SUBSCRIPTION_URL"); v != "" {
+		subURL = v
+	}
+	if v := os.Getenv("HEALTH_CHECK_URL"); v != "" {
+		testURL = v
+	}
+	if v := os.Getenv("XRAY_DIR"); v != "" {
+		xrayDir = v
+	}
+
+	if subURL == "" {
+		subFile := filepath.Join("/root/config", "subscription.txt")
+		if data, err := os.ReadFile(subFile); err == nil {
+			subURL = string(data)
+		}
+	}
+	if subURL == "" {
+		fmt.Print("Enter subscription URL: ")
+		fmt.Scanln(&subURL)
+		if subURL == "" {
+			log.Fatal("Subscription URL is required")
+		}
+		os.MkdirAll("/root/config", 0755)
+		os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644)
+	}
+
+	if err := EnsureXray(xrayDir); err != nil {
+		log.Fatalf("Xray setup failed: %v", err)
+	}
+
+	selector := NewProxySelector(xrayDir, testURL, 60*time.Second)
+
+	log.Printf("Fetching: %s", subURL)
+	configs, err := FetchSubscription(subURL)
+	if err != nil {
+		log.Fatalf("Subscription fetch failed: %v", err)
+	}
+	log.Printf("Parsed %d configs", len(configs))
+	selector.UpdateConfigs(configs)
+
+	log.Println("Finding working proxy...")
+	if err := selector.StartWithBest(); err != nil {
+		log.Fatalf("No working proxy: %v", err)
+	}
+	log.Println(selector.GetStatus())
+
+	// Start HTTP proxy via Go (forwards through SOCKS5)
+	startHTTPProxy("127.0.0.1:27020", "127.0.0.1:27019")
+
+	go subscriptionLoop(subURL, selector)
+	go healthCheckLoop(selector)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("Shutting down...")
+	selector.Stop()
+}
+
+func subscriptionLoop(subURL string, selector *ProxySelector) {
+	ticker := time.NewTicker(120 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Println("Refreshing subscription...")
+		configs, err := FetchSubscription(subURL)
+		if err != nil {
+			log.Printf("Refresh failed: %v", err)
+			continue
+		}
+		log.Printf("Refreshed: %d configs", len(configs))
+		selector.UpdateConfigs(configs)
+	}
+}
+
+func healthCheckLoop(selector *ProxySelector) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !selector.ShouldCheck() {
+			continue
+		}
+		if selector.HealthCheck() {
+			continue
+		}
+		log.Println("Proxy failed, switching...")
+		if err := selector.SwitchToNext(); err != nil {
+			log.Printf("Switch failed: %v", err)
+		}
+	}
+}
+</file>
+
+<file path="v2proxy/selector.go">
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+const xraySocksPort = "27019"
+
+type ProxySelector struct {
+	mu            sync.Mutex
+	configs       []ProxyConfig
+	activeIndex   int
+	xrayCmd       *exec.Cmd
+	xrayDir       string
+	testURL       string
+	checkInterval time.Duration
+	lastCheck     time.Time
+}
+
+func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *ProxySelector {
+	os.MkdirAll(xrayDir, 0755)
+	return &ProxySelector{
+		xrayDir:       xrayDir,
+		testURL:       testURL,
+		checkInterval: checkInterval,
+		activeIndex:   -1,
+	}
+}
+
+func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.configs = configs
+}
+
+func (s *ProxySelector) StartWithBest() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.configs) == 0 {
+		return fmt.Errorf("no configs available")
+	}
+
+	for i := range s.configs {
+		if err := s.startXray(i); err != nil {
+			continue
+		}
+		if waitForPort(":"+xraySocksPort, 2*time.Second) {
+			result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+			if result.Working {
+				s.activeIndex = i
+				log.Printf("Using: %s (latency: %v)", s.configs[i].Name, result.Latency)
+				return nil
+			}
+		}
+		s.stopXray()
+	}
+	return fmt.Errorf("no working config found")
+}
+
+func (s *ProxySelector) HealthCheck() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.activeIndex < 0 || s.activeIndex >= len(s.configs) {
+		return false
+	}
+
+	result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+	s.lastCheck = time.Now()
+
+	if result.Working {
+		log.Printf("Health OK: %s (%v)", s.configs[s.activeIndex].Name, result.Latency)
+		return true
+	}
+
+	log.Printf("Health FAIL: %s - %v", s.configs[s.activeIndex].Name, result.Error)
+	return false
+}
+
+func (s *ProxySelector) SwitchToNext() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stopXray()
+
+	startIdx := s.activeIndex + 1
+	if startIdx >= len(s.configs) {
+		startIdx = 0
+	}
+
+	for i := startIdx; i != s.activeIndex; i = (i + 1) % len(s.configs) {
+		if err := s.startXray(i); err != nil {
+			continue
+		}
+		if waitForPort(":"+xraySocksPort, 2*time.Second) {
+			result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+			if result.Working {
+				s.activeIndex = i
+				log.Printf("Switched: %s (%v)", s.configs[i].Name, result.Latency)
+				return nil
+			}
+		}
+		s.stopXray()
+	}
+	return fmt.Errorf("no working config found")
+}
+
+func (s *ProxySelector) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopXray()
+}
+
+func (s *ProxySelector) GetStatus() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeIndex < 0 || s.activeIndex >= len(s.configs) {
+		return "No active proxy"
+	}
+	return fmt.Sprintf("Active: %s | Total: %d", s.configs[s.activeIndex].Name, len(s.configs))
+}
+
+func (s *ProxySelector) ShouldCheck() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.lastCheck) >= s.checkInterval
+}
+
+func (s *ProxySelector) startXray(index int) error {
+	if index < 0 || index >= len(s.configs) {
+		return fmt.Errorf("invalid index: %d", index)
+	}
+
+	cfg := s.configs[index]
+
+	fullConfig := map[string]interface{}{
+		"log": map[string]interface{}{
+			"loglevel": "warning",
+		},
+		"inbounds": []map[string]interface{}{
+			{
+				"tag":      "socks-in",
+				"port":     27019,
+				"listen":   "0.0.0.0",
+				"protocol": "socks",
+				"settings": map[string]interface{}{
+					"auth": "noauth",
+					"udp":  true,
+				},
+			},
+		},
+		"outbounds": []interface{}{},
+	}
+
+	var outbound map[string]interface{}
+	if err := json.Unmarshal(cfg.XrayCfg, &outbound); err != nil {
+		return fmt.Errorf("bad config: %w", err)
+	}
+
+	fullConfig["outbounds"] = []interface{}{outbound}
+	fullConfig["routing"] = map[string]interface{}{
+		"domainStrategy": "AsIs",
+		"rules": []map[string]interface{}{
+			{
+				"type":        "field",
+				"outboundTag": "proxy",
+				"port":        "0-65535",
+			},
+		},
+	}
+
+	cfgPath := filepath.Join(s.xrayDir, "config.json")
+	cfgData, _ := json.MarshalIndent(fullConfig, "", "  ")
+	if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
+		return err
+	}
+
+	xrayBin := filepath.Join(s.xrayDir, "xray")
+	s.xrayCmd = exec.Command(xrayBin, "run", "-c", cfgPath)
+	s.xrayCmd.Stdout = os.Stdout
+	s.xrayCmd.Stderr = os.Stderr
+
+	if err := s.xrayCmd.Start(); err != nil {
+		return fmt.Errorf("start failed: %w", err)
+	}
+
+	return nil
+}
+
+func (s *ProxySelector) stopXray() {
+	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
+		s.xrayCmd.Process.Kill()
+		s.xrayCmd.Wait()
+		s.xrayCmd = nil
+		// Wait for port to actually release
+		waitForPortFree(":"+xraySocksPort, 3*time.Second)
+		waitForPortFree(":8080", 3*time.Second)
+	}
+}
+
+func waitForPort(addr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+func waitForPortFree(addr string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			return
+		}
+		conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+</file>
+
+<file path="README.md">
+# V2Ray Proxy
+
+Xray-core based proxy client. Parses subscription URLs, health-checks proxies, auto-switches to working ones.
+
+## Quick Start (Ubuntu 24.04 VPS)
+
+```bash
+git clone <your-repo> && cd V2RayInsideDocker
+sudo bash setup.sh
+```
+
+Enter your subscription URL when prompted. The script:
+1. Installs Go if not present
+2. Downloads xray-core for your architecture
+3. Builds the Go binary
+4. Starts the proxy
+
+## Usage
+
+```bash
+# SOCKS5
+curl --socks5 127.0.0.1:27019 https://api.ipify.org
+
+# HTTP
+curl --proxy http://127.0.0.1:27020 https://api.ipify.org
+```
+
+## How It Works
+
+1. Fetches subscription, parses vless/vmess/trojan/ss URLs
+2. Converts to xray-core JSON configs
+3. Starts xray providing SOCKS5 (:27019) + HTTP (:27020)
+4. Health-checks every 60s, auto-switches on failure
+5. Refreshes subscription every 120s
+
+## Deploy to VPS
+
+```bash
+# On your VPS (Ubuntu 24.04)
+sudo apt update && sudo apt install -y git curl unzip
+git clone <your-repo> && cd V2RayInsideDocker
+sudo bash setup.sh
+```
+
+Other apps on the VPS can use the proxy:
+```bash
+export HTTP_PROXY=http://127.0.0.1:27020
+export HTTPS_PROXY=socks5://127.0.0.1:27019
+```
+
+## Supported Protocols
+
+vless (tcp/ws/grpc), vmess, trojan, shadowsocks
+</file>
+
+</files>

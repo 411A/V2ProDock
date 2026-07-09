@@ -1,10 +1,12 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"net"
 	"net/http"
-	"net/url"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 type HealthResult struct {
@@ -16,9 +18,15 @@ type HealthResult struct {
 func TestProxyHealth(proxyAddr string, testURL string, timeout time.Duration) HealthResult {
 	result := HealthResult{}
 
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		result.Error = err
+		return result
+	}
+
 	transport := &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse(fmt.Sprintf("socks5://%s", proxyAddr))
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
 		},
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -41,7 +49,6 @@ func TestProxyHealth(proxyAddr string, testURL string, timeout time.Duration) He
 	}
 	defer resp.Body.Close()
 
-	// Accept any response - the proxy is working if we get a response at all
 	result.Working = true
 	result.Latency = latency
 	return result

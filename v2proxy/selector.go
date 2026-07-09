@@ -144,7 +144,13 @@ func (s *ProxySelector) startXray(index int) error {
 
 	fullConfig := map[string]interface{}{
 		"log": map[string]interface{}{
-			"loglevel": "warning",
+			"loglevel": "info",
+		},
+		"dns": map[string]interface{}{
+			"servers": []string{
+				"https://1.1.1.1/dns-query",
+				"localhost",
+			},
 		},
 		"inbounds": []map[string]interface{}{
 			{
@@ -166,14 +172,25 @@ func (s *ProxySelector) startXray(index int) error {
 		return fmt.Errorf("bad config: %w", err)
 	}
 
-	fullConfig["outbounds"] = []interface{}{outbound}
+	fullConfig["outbounds"] = []interface{}{
+		outbound,
+		map[string]interface{}{
+			"protocol": "freedom",
+			"tag":      "direct",
+		},
+		map[string]interface{}{
+			"protocol": "blackhole",
+			"tag":      "blocked",
+		},
+	}
+
 	fullConfig["routing"] = map[string]interface{}{
 		"domainStrategy": "AsIs",
 		"rules": []map[string]interface{}{
 			{
 				"type":        "field",
-				"outboundTag": "proxy",
-				"port":        "0-65535",
+				"outboundTag": "blocked",
+				"protocol":    []string{"bittorrent"},
 			},
 		},
 	}
@@ -198,12 +215,21 @@ func (s *ProxySelector) startXray(index int) error {
 
 func (s *ProxySelector) stopXray() {
 	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
-		s.xrayCmd.Process.Kill()
-		s.xrayCmd.Wait()
+		// Try graceful shutdown first (SIGTERM), then force kill
+		s.xrayCmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() {
+			s.xrayCmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			s.xrayCmd.Process.Kill()
+			<-done
+		}
 		s.xrayCmd = nil
-		// Wait for port to actually release
 		waitForPortFree(":"+xraySocksPort, 3*time.Second)
-		waitForPortFree(":8080", 3*time.Second)
 	}
 }
 

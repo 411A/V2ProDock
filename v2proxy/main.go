@@ -65,7 +65,7 @@ func main() {
 	log.Println(selector.GetStatus())
 
 	// Start HTTP proxy via Go (forwards through SOCKS5)
-	startHTTPProxy("127.0.0.1:27020", "127.0.0.1:27019")
+	startHTTPProxy("0.0.0.0:27020", "127.0.0.1:27019")
 
 	go subscriptionLoop(subURL, selector)
 	go healthCheckLoop(selector)
