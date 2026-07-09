@@ -6,13 +6,14 @@ Xray-core based proxy client. Parses subscription URLs, health-checks proxies, a
 
 ```bash
 git clone <your-repo> && cd V2RayInsideDocker
-sudo bash setup-v2prodock.sh
+sudo bash setup.sh
 ```
 
 Enter your subscription URL when prompted. The script:
-1. Detects OS/arch, downloads xray-core automatically
-2. Builds the Go binary
-3. Starts the proxy container
+1. Installs Go if not present
+2. Downloads xray-core for your architecture
+3. Builds the Go binary
+4. Starts the proxy
 
 ## Usage
 
@@ -22,15 +23,6 @@ curl --socks5 127.0.0.1:27019 https://api.ipify.org
 
 # HTTP
 curl --proxy http://127.0.0.1:27020 https://api.ipify.org
-```
-
-## Commands
-
-```bash
-sudo bash setup-v2prodock.sh start      # Start
-sudo bash setup-v2prodock.sh stop       # Stop
-sudo bash setup-v2prodock.sh status     # Status
-sudo bash setup-v2prodock.sh uninstall  # Remove
 ```
 
 ## How It Works
@@ -45,9 +37,9 @@ sudo bash setup-v2prodock.sh uninstall  # Remove
 
 ```bash
 # On your VPS (Ubuntu 24.04)
-sudo apt update && sudo apt install -y git docker.io docker-compose-v2
+sudo apt update && sudo apt install -y git curl unzip
 git clone <your-repo> && cd V2RayInsideDocker
-sudo bash setup-v2prodock.sh
+sudo bash setup.sh
 ```
 
 Other apps on the VPS can use the proxy:
