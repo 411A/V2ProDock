@@ -1,7 +1,8 @@
 FROM golang:1.23-alpine AS builder
+ENV GOTOOLCHAIN=auto
 WORKDIR /app
 COPY v2proxy/ .
-RUN GOTOOLCHAIN=auto go mod tidy && GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=linux go build -o v2proxy .
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o v2proxy .
 
 FROM alpine:3.20
 RUN apk --no-cache add ca-certificates curl unzip wget && \
