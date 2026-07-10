@@ -4,7 +4,7 @@ services:
     container_name: v2prodock
     restart: unless-stopped
     networks:
-      - proxy-net
+      - v2prodock-proxy-net
     ports:
       - "27019:27019"   # SOCKS5
       - "27020:27020"   # HTTP
