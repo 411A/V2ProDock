@@ -1,10 +1,12 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.23-alpine AS builder
+ENV GOTOOLCHAIN=auto
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /app
 COPY v2proxy/ .
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o v2proxy .
 
 FROM alpine:3.20
-RUN apk --no-cache add ca-certificates curl unzip wget && \
+RUN apk --no-cache add ca-certificates curl unzip wget procps && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \
       x86_64)  XARCH="64" ;; \
@@ -23,6 +25,6 @@ RUN mkdir -p /root/config
 EXPOSE 27019 27020
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD wget -q --spider http://127.0.0.1:27020 || exit 1
+  CMD pgrep v2proxy > /dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["./v2proxy"]
