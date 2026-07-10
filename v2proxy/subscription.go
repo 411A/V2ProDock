@@ -127,7 +127,8 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 			stream["tlsSettings"] = buildTLS(q, "grpc")
 		}
 	case "tcp":
-		if security == "reality" {
+		switch security {
+		case "reality":
 			stream["realitySettings"] = map[string]interface{}{
 				"serverName":  q.Get("sni"),
 				"fingerprint": q.Get("fp"),
@@ -138,7 +139,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 			if flow != "" {
 				stream["flow"] = flow
 			}
-		} else if security == "tls" {
+		case "tls":
 			stream["tlsSettings"] = buildTLS(q, "tcp")
 		}
 	default:
@@ -356,7 +357,7 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
 }
 
-func parseHy2(u *url.URL, raw, name string) (*ProxyConfig, error) {
+func parseHy2(_ *url.URL, _, _ string) (*ProxyConfig, error) {
 	// Hysteria2 is NOT supported by xray-core - skip it
 	return nil, fmt.Errorf("hysteria2 not supported by xray-core")
 }
