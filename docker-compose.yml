@@ -1,7 +1,7 @@
 services:
-  v2proxy:
+  v2prodock:
     build: .
-    container_name: v2proxy
+    container_name: v2prodock
     restart: unless-stopped
     networks:
       - proxy-net
@@ -36,12 +36,12 @@ services:
   #   container_name: app
   #   restart: unless-stopped
   #   networks:
-  #     - proxy-net
+  #     - v2prodock-proxy-net
   #   environment:
-  #     - HTTP_PROXY=http://v2proxy:27020
-  #     - HTTPS_PROXY=socks5://v2proxy:27019
+  #     - HTTP_PROXY=http://v2prodock:27020
+  #     - HTTPS_PROXY=socks5://v2prodock:27019
   #     - NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
 
 networks:
-  proxy-net:
+  v2prodock-proxy-net:
     driver: bridge
