@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,7 +66,7 @@ func main() {
 	log.Println(selector.GetStatus())
 
 	// Start HTTP proxy via Go (forwards through SOCKS5)
-	httpPort := selector.socksPort + 1
+	httpPort := findAvailablePort(selector.socksPort + 1)
 	startHTTPProxy(fmt.Sprintf("0.0.0.0:%d", httpPort), fmt.Sprintf("127.0.0.1:%d", selector.socksPort))
 
 	go subscriptionLoop(subURL, selector)
@@ -109,4 +110,15 @@ func healthCheckLoop(selector *ProxySelector) {
 			log.Printf("Switch failed: %v", err)
 		}
 	}
+}
+
+func findAvailablePort(start int) int {
+	for port := start; port <= 27999; port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			ln.Close()
+			return port
+		}
+	}
+	return start
 }
