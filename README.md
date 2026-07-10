@@ -2,7 +2,7 @@
 
 Xray-core based proxy client. Parses subscription URLs, health-checks proxies, auto-switches to working ones.
 
-## Quick Start (Ubuntu 24.04 VPS)
+## Quick Start
 
 ```bash
 git clone <your-repo> && cd V2RayInsideDocker
@@ -11,29 +11,29 @@ sudo bash setup.sh
 
 Enter your subscription URL when prompted.
 
-## Docker Bridge Mode (Recommended)
+## Usage
 
-The proxy runs in Docker and provides a bridge for other containers:
+### Direct (from host)
 
 ```bash
-# Start the proxy
-sudo bash setup.sh
-
-# Test it
+# SOCKS5
 curl --socks5 localhost:27019 https://api.ipify.org
+
+# HTTP
 curl --proxy http://localhost:27020 https://api.ipify.org
 ```
 
-### Use from other containers
+### From other Docker containers
 
 ```yaml
 # docker-compose.yml
 services:
-  app:
+  your-app:
     image: your-app
     environment:
       - HTTP_PROXY=http://v2proxy:27020
       - HTTPS_PROXY=socks5://v2proxy:27019
+      - ALL_PROXY=socks5://v2proxy:27019
     networks:
       - proxy-net
 
@@ -43,33 +43,52 @@ networks:
     name: v2docker_proxy-net
 ```
 
-### Or use host network mode
+### From Python
 
-```yaml
-services:
-  app:
-    image: your-app
-    network_mode: service:v2proxy
+```python
+import requests
+
+proxies = {
+    "http": "http://localhost:27020",
+    "https": "socks5://localhost:27019",
+}
+
+r = requests.get("https://api.ipify.org", proxies=proxies)
+print(r.text)  # Shows proxy IP, not your real IP
 ```
 
-## Direct Install (No Docker)
+### From curl
 
 ```bash
-sudo bash setup.sh
-# Select "n" when asked about Docker
+curl --proxy http://localhost:27020 https://api.ipify.org
+curl --socks5 localhost:27019 https://api.ipify.org
+```
 
-# Attach to session
-zellij attach v2proxy
+### System-wide proxy (Linux)
 
-# Detach: Ctrl+O then D
+```bash
+# Add to ~/.bashrc
+export HTTP_PROXY=http://localhost:27020
+export HTTPS_PROXY=socks5://localhost:27019
+export ALL_PROXY=socks5://localhost:27019
 ```
 
 ## Proxies
 
-| Type | Port | Docker Bridge | Host |
-|------|------|---------------|------|
-| SOCKS5 | 27019 | `v2proxy:27019` | `localhost:27019` |
-| HTTP | 27020 | `v2proxy:27020` | `localhost:27020` |
+| Type | Port | Usage |
+|------|------|-------|
+| SOCKS5 | 27019 | `socks5://localhost:27019` |
+| HTTP | 27020 | `http://localhost:27020` |
+
+## Commands
+
+```bash
+sudo bash setup.sh           # Install & start
+sudo bash setup.sh start     # Start
+sudo bash setup.sh stop      # Stop
+sudo bash setup.sh status    # Status
+sudo bash setup.sh logs      # Follow logs
+```
 
 ## How It Works
 
