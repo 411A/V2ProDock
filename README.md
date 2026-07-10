@@ -31,16 +31,16 @@ services:
   your-app:
     image: your-app
     environment:
-      - HTTP_PROXY=http://v2proxy:27020
-      - HTTPS_PROXY=socks5://v2proxy:27019
-      - ALL_PROXY=socks5://v2proxy:27019
+      - HTTP_PROXY=http://v2prodock:27020
+      - HTTPS_PROXY=socks5://v2prodock:27019
+      - ALL_PROXY=socks5://v2prodock:27019
     networks:
       - proxy-net
 
 networks:
   proxy-net:
     external: true
-    name: v2docker_proxy-net
+    name: v2prodock-proxy-net
 ```
 
 ### From Python
