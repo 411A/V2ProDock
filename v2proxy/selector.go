@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const xraySocksPort = "27019"
+const (
+	xraySocksPortStart = 27019
+	xraySocksPortEnd   = 27999
+)
 
 type ProxySelector struct {
 	mu            sync.Mutex
@@ -21,18 +24,32 @@ type ProxySelector struct {
 	xrayCmd       *exec.Cmd
 	xrayDir       string
 	testURL       string
+	socksPort     int
 	checkInterval time.Duration
 	lastCheck     time.Time
 }
 
 func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *ProxySelector {
 	os.MkdirAll(xrayDir, 0755)
+	port := findAvailablePort(xraySocksPortStart, xraySocksPortEnd)
 	return &ProxySelector{
 		xrayDir:       xrayDir,
 		testURL:       testURL,
+		socksPort:     port,
 		checkInterval: checkInterval,
 		activeIndex:   -1,
 	}
+}
+
+func findAvailablePort(start, end int) int {
+	for port := start; port <= end; port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			ln.Close()
+			return port
+		}
+	}
+	return start // fallback
 }
 
 func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
@@ -53,8 +70,8 @@ func (s *ProxySelector) StartWithBest() error {
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(":"+xraySocksPort, 2*time.Second) {
-			result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+		if waitForPort(fmt.Sprintf(":%d", s.socksPort), 2*time.Second) {
+			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
 				log.Printf("Using: %s (latency: %v)", s.configs[i].Name, result.Latency)
@@ -74,7 +91,7 @@ func (s *ProxySelector) HealthCheck() bool {
 		return false
 	}
 
-	result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+	result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 	s.lastCheck = time.Now()
 
 	if result.Working {
@@ -101,8 +118,8 @@ func (s *ProxySelector) SwitchToNext() error {
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(":"+xraySocksPort, 2*time.Second) {
-			result := TestProxyHealth("127.0.0.1:"+xraySocksPort, s.testURL, 8*time.Second)
+		if waitForPort(fmt.Sprintf(":%d", s.socksPort), 2*time.Second) {
+			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
 				log.Printf("Switched: %s (%v)", s.configs[i].Name, result.Latency)
@@ -126,7 +143,9 @@ func (s *ProxySelector) GetStatus() string {
 	if s.activeIndex < 0 || s.activeIndex >= len(s.configs) {
 		return "No active proxy"
 	}
-	return fmt.Sprintf("Active: %s | Total: %d", s.configs[s.activeIndex].Name, len(s.configs))
+	httpPort := s.socksPort + 1
+	return fmt.Sprintf("Active: %s | SOCKS5: :%d | HTTP: :%d | Total: %d",
+		s.configs[s.activeIndex].Name, s.socksPort, httpPort, len(s.configs))
 }
 
 func (s *ProxySelector) ShouldCheck() bool {
@@ -155,7 +174,7 @@ func (s *ProxySelector) startXray(index int) error {
 		"inbounds": []map[string]interface{}{
 			{
 				"tag":      "socks-in",
-				"port":     27019,
+				"port":     s.socksPort,
 				"listen":   "0.0.0.0",
 				"protocol": "socks",
 				"settings": map[string]interface{}{
@@ -229,7 +248,7 @@ func (s *ProxySelector) stopXray() {
 			<-done
 		}
 		s.xrayCmd = nil
-		waitForPortFree(":"+xraySocksPort, 3*time.Second)
+		waitForPortFree(fmt.Sprintf(":%d", s.socksPort), 3*time.Second)
 	}
 }
 
