@@ -6,7 +6,7 @@ ok() { echo -e "${GREEN}[OK] $1${NC}"; }
 err() { echo -e "${RED}[ERROR] $1${NC}"; }
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$DIR"
+cd "$DIR" || exit 1
 
 # Check if Docker is available
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
@@ -71,14 +71,14 @@ if [ "$DOCKER_MODE" = true ]; then
 
             if [ -z "$sub_url" ]; then
                 echo "Enter subscription URL:"
-                read -p "URL: " sub_url
+                read -r -p "URL: " sub_url
                 [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
                 echo "$sub_url" > "$DIR/config/subscription.txt"
             fi
 
             health_url="http://api.ipify.org"
             echo "Health check URL (default: $health_url):"
-            read -p "URL: " input; health_url=${input:-$health_url}
+            read -r -p "URL: " input; health_url=${input:-$health_url}
 
             echo -e "SUBSCRIPTION_URL=$sub_url\nHEALTH_CHECK_URL=$health_url" > .env
             ok "Config ready"
@@ -106,7 +106,7 @@ else
     if ! command -v go &>/dev/null; then
         echo "Installing Go..."
         curl -sL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
-        echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+        echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
         export PATH=$PATH:/usr/local/go/bin
         ok "Go installed"
     fi
@@ -138,9 +138,9 @@ else
 
     if [ ! -f "$DIR/v2proxy" ] || [ -n "$(find v2proxy/ -newer v2proxy -maxdepth 0 2>/dev/null)" ]; then
         echo "Building v2proxy..."
-        cd "$DIR/v2proxy"
+        cd "$DIR/v2proxy" || exit 1
         go build -o "$DIR/v2proxy" .
-        cd "$DIR"
+        cd "$DIR" || exit 1
         ok "Built"
     fi
 
@@ -149,20 +149,20 @@ else
     if [ -f "$DIR/config/subscription.txt" ]; then
         sub_url=$(cat "$DIR/config/subscription.txt")
         echo "Current subscription: $sub_url"
-        read -p "Keep? [Y/n]: " -n 1 -r; echo
+        read -r -p "Keep? [Y/n]: " -n 1 -r; echo
         [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
     fi
 
     if [ -z "$sub_url" ]; then
         echo "Enter subscription URL:"
-        read -p "URL: " sub_url
+        read -r -p "URL: " sub_url
         [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
         echo "$sub_url" > "$DIR/config/subscription.txt"
     fi
 
     health_url="http://api.ipify.org"
     echo "Health check URL (default: $health_url):"
-    read -p "URL: " input; health_url=${input:-$health_url}
+    read -r -p "URL: " input; health_url=${input:-$health_url}
 
     ok "Config ready"
 
