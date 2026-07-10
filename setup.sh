@@ -15,10 +15,10 @@ if command -v docker &>/dev/null && docker compose version &>/dev/null; then
 
     # Configure Docker mirror for Iran (bypass Docker Hub block)
     MIRROR_CONFIG="/etc/docker/daemon.json"
-    if ! grep -q "registry-mirrors" "$MIRROR_CONFIG" 2>/dev/null; then
+    if ! sudo grep -q "registry-mirrors" "$MIRROR_CONFIG" 2>/dev/null; then
         echo "Configuring Docker mirror for Iran..."
         sudo mkdir -p /etc/docker
-        sudo tee "$MIRROR_CONFIG" > /dev/null <<-'EOF'
+        sudo bash -c 'cat > /etc/docker/daemon.json << EOF
 {
   "registry-mirrors": [
     "https://docker.m.daocloud.io",
@@ -26,7 +26,7 @@ if command -v docker &>/dev/null && docker compose version &>/dev/null; then
     "https://docker.1panel.live"
   ]
 }
-EOF
+EOF'
         sudo systemctl daemon-reload
         sudo systemctl restart docker
         ok "Docker mirror configured"
