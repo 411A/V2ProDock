@@ -43,25 +43,23 @@ func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *Pro
 }
 
 func resolvePort() int {
-	// Check if 27019 is free
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:27019", 200*time.Millisecond)
+	// Check if start port is free
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", xraySocksPortStart), 200*time.Millisecond)
 	if err != nil {
-		// Port is free, use it
-		return 27019
+		return xraySocksPortStart
 	}
 	conn.Close()
 
 	// Port is taken - check if it's our own xray process
-	if isOursOnPort(27019) {
-		// Kill our old process and reuse 27019
-		killProcessOnPort(27019)
+	if isOursOnPort(xraySocksPortStart) {
+		killProcessOnPort(xraySocksPortStart)
 		time.Sleep(500 * time.Millisecond)
-		return 27019
+		return xraySocksPortStart
 	}
 
 	// Port is taken by something else - find next available
-	log.Printf("Port 27019 occupied by another process, finding alternative...")
-	for port := 27020; port <= xraySocksPortEnd; port++ {
+	log.Printf("Port %d occupied by another process, finding alternative...", xraySocksPortStart)
+	for port := xraySocksPortStart + 1; port <= xraySocksPortEnd; port++ {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
 			ln.Close()
@@ -71,7 +69,7 @@ func resolvePort() int {
 	}
 
 	// Fallback
-	return 27019
+	return xraySocksPortStart
 }
 
 func isOursOnPort(port int) bool {
