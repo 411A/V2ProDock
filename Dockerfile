@@ -1,5 +1,4 @@
-FROM golang:1.23-alpine AS builder
-ENV GOTOOLCHAIN=auto
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY v2proxy/ .
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o v2proxy .
