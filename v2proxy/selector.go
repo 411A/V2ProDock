@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,7 +32,7 @@ type ProxySelector struct {
 
 func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *ProxySelector {
 	os.MkdirAll(xrayDir, 0755)
-	port := findAvailablePort(xraySocksPortStart, xraySocksPortEnd)
+	port := resolvePort()
 	return &ProxySelector{
 		xrayDir:       xrayDir,
 		testURL:       testURL,
@@ -41,15 +42,74 @@ func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *Pro
 	}
 }
 
-func findAvailablePort(start, end int) int {
-	for port := start; port <= end; port++ {
+func resolvePort() int {
+	// Check if 27019 is free
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:27019", 200*time.Millisecond)
+	if err != nil {
+		// Port is free, use it
+		return 27019
+	}
+	conn.Close()
+
+	// Port is taken - check if it's our own xray process
+	if isOursOnPort(27019) {
+		// Kill our old process and reuse 27019
+		killProcessOnPort(27019)
+		time.Sleep(500 * time.Millisecond)
+		return 27019
+	}
+
+	// Port is taken by something else - find next available
+	log.Printf("Port 27019 occupied by another process, finding alternative...")
+	for port := 27020; port <= xraySocksPortEnd; port++ {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
 			ln.Close()
+			log.Printf("Using port %d instead", port)
 			return port
 		}
 	}
-	return start // fallback
+
+	// Fallback
+	return 27019
+}
+
+func isOursOnPort(port int) bool {
+	// Check if an xray or v2proxy process owns this port
+	cmd := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-t")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	pids := strings.Fields(strings.TrimSpace(string(out)))
+	for _, pid := range pids {
+		// Check process name
+		cmd2 := exec.Command("ps", "-p", pid, "-o", "comm=")
+		name, err := cmd2.Output()
+		if err != nil {
+			continue
+		}
+		procName := strings.TrimSpace(string(name))
+		if strings.Contains(procName, "xray") || strings.Contains(procName, "v2proxy") {
+			return true
+		}
+	}
+	return false
+}
+
+func killProcessOnPort(port int) {
+	cmd := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-t")
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	pids := strings.Fields(strings.TrimSpace(string(out)))
+	for _, pid := range pids {
+		exec.Command("kill", "-9", pid).Run()
+		log.Printf("Killed old process %s on port %d", pid, port)
+	}
 }
 
 func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
