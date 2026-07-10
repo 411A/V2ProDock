@@ -1,15 +1,18 @@
 # Binaries
 *.exe
 v2proxy/v2proxy
+v2proxy/v2proxy-linux
 v2proxy/*.test
+
+# Xray (downloaded at runtime)
+xray/
+
+# Config (user data)
+config/
 
 # Go
 vendor/
 *.sum
-
-# Xray
-xray/
-config/
 
 # Logs
 *.log
@@ -32,6 +35,7 @@ Thumbs.db
 # Build
 dist/
 build/
+repomix-output.xml
 
-# Old files
-OLD_*
+# Internal
+.mimocode/
