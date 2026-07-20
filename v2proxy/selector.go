@@ -64,7 +64,7 @@ func (s *ProxySelector) StartWithBest() error {
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(fmt.Sprintf(":%d", s.socksPort), 2*time.Second) {
+		if waitForPort(s.socksPort, 2*time.Second) {
 			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
@@ -113,7 +113,7 @@ func (s *ProxySelector) SwitchToNext() error {
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(fmt.Sprintf(":%d", s.socksPort), 2*time.Second) {
+		if waitForPort(s.socksPort, 2*time.Second) {
 			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
@@ -158,7 +158,7 @@ func (s *ProxySelector) startXray(index int) error {
 
 	fullConfig := map[string]interface{}{
 		"log": map[string]interface{}{
-			"loglevel": "info",
+			"loglevel": "warning",
 		},
 		"dns": map[string]interface{}{
 			"servers": []string{
@@ -210,7 +210,7 @@ func (s *ProxySelector) startXray(index int) error {
 	}
 
 	cfgPath := filepath.Join(s.xrayDir, fmt.Sprintf("config-%d.json", s.socksPort))
-	cfgData, _ := json.MarshalIndent(fullConfig, "", "  ")
+	cfgData, _ := json.Marshal(fullConfig)
 	if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
 		return err
 	}
@@ -242,11 +242,12 @@ func (s *ProxySelector) stopXray() {
 			<-done
 		}
 		s.xrayCmd = nil
-		waitForPortFree(fmt.Sprintf(":%d", s.socksPort), 3*time.Second)
+		waitForPortFree(s.socksPort, 3*time.Second)
 	}
 }
 
-func waitForPort(addr string, timeout time.Duration) bool {
+func waitForPort(port int, timeout time.Duration) bool {
+	addr := fmt.Sprintf(":%d", port)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
@@ -259,7 +260,8 @@ func waitForPort(addr string, timeout time.Duration) bool {
 	return false
 }
 
-func waitForPortFree(addr string, timeout time.Duration) {
+func waitForPortFree(port int, timeout time.Duration) {
+	addr := fmt.Sprintf(":%d", port)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)

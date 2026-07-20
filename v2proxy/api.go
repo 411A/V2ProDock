@@ -27,12 +27,14 @@ func startAPI(manager *ProxyManager, basePort int) int {
 
 	mux.HandleFunc("/proxies", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
 		proxies := manager.GetAliveStatuses()
 		json.NewEncoder(w).Encode(proxies)
 	})
 
 	mux.HandleFunc("/all", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
 		statuses := manager.GetStatuses()
 		json.NewEncoder(w).Encode(statuses)
 	})
@@ -63,10 +65,13 @@ func startAPI(manager *ProxyManager, basePort int) int {
 	})
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    2048,
 	}
 
 	go func() {

@@ -7,12 +7,40 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
 
+const (
+	maxConcurrentConns = 256
+	relayBufSize       = 32 * 1024
+)
+
+var relayBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, relayBufSize)
+		return &b
+	},
+}
+
+var (
+	connSem  = make(chan struct{}, maxConcurrentConns)
+	onceInit sync.Once
+)
+
+func initConnSem() {
+	onceInit.Do(func() {
+		for i := 0; i < maxConcurrentConns; i++ {
+			connSem <- struct{}{}
+		}
+	})
+}
+
 func startHTTPProxy(addr, socksAddr string) {
+	initConnSem()
+
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
 		log.Printf("HTTP proxy dialer failed: %v", err)
@@ -20,7 +48,10 @@ func startHTTPProxy(addr, socksAddr string) {
 	}
 
 	server := &http.Server{
-		Addr: addr,
+		Addr:              addr,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    4096,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
 				handleConnect(w, r, dialer)
@@ -32,7 +63,7 @@ func startHTTPProxy(addr, socksAddr string) {
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("HTTP proxy bind failed on %s: %v (SOCKS5 on :27019)", addr, err)
+		log.Printf("HTTP proxy bind failed on %s: %v", addr, err)
 		return
 	}
 
@@ -60,18 +91,15 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	}
 	defer conn.Close()
 
-	// Remove proxy headers
 	r.Header.Del("Proxy-Connection")
 	r.Header.Del("Proxy-Authorization")
 
-	// Write request
 	if err := r.Write(conn); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	// Read response
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, relayBufSize)
 	resp, err := http.ReadResponse(reader, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -79,7 +107,6 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	}
 	defer resp.Body.Close()
 
-	// Forward response
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -88,7 +115,6 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	// If there's buffered data, send it
 	if reader.Buffered() > 0 {
 		io.Copy(w, reader)
 	}
@@ -99,6 +125,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 	if !strings.Contains(target, ":") {
 		target += ":443"
 	}
+
+	// Acquire connection slot
+	select {
+	case <-connSem:
+	case <-time.After(5 * time.Second):
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() { connSem <- struct{}{} }()
 
 	destConn, err := dialer.Dial("tcp", target)
 	if err != nil {
@@ -119,7 +154,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 		return
 	}
 
-	// Send proper CONNECT response
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	go relay(destConn, clientConn)
@@ -130,10 +164,23 @@ func relay(dst, src net.Conn) {
 	defer dst.Close()
 	defer src.Close()
 
-	// Set deadlines to prevent hanging connections
 	deadline := time.Now().Add(5 * time.Minute)
 	dst.SetDeadline(deadline)
 	src.SetDeadline(deadline)
 
-	io.Copy(dst, src)
+	bufp := relayBufPool.Get().(*[]byte)
+	defer relayBufPool.Put(bufp)
+
+	buf := *bufp
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
