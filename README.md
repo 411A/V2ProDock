@@ -138,7 +138,7 @@ Environment variables (set in `.env` or via docker-compose):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SUBSCRIPTION_URL` | — | Single v2ray subscription URL |
+| `SUBSCRIPTION_URL` | — | Single v2ray subscription URL (see [V2RayDAR](https://github.com/411A/V2RayDAR) to self-host one) |
 | `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
 | `PROXY_INSTANCES` | `1` | Number of xray instances to run |
 | `PORT_BASE` | `27019` | Base port for proxy allocation |
@@ -148,6 +148,16 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
+
+### Subscription URL
+
+You need a v2ray subscription URL to get started. [V2RayDAR](https://github.com/411A/V2RayDAR) fetches configs from public repos and serves them as a single subscription endpoint — run it on your server and point to:
+
+```
+http://127.0.0.1:27141/subscription
+```
+
+You can also add more public subscription URLs directly via `SUBSCRIPTION_URLS` in `.env` — comma-separated, one per instance.
 
 ### Tuning for Low-End Devices
 
