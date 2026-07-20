@@ -8,14 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
-)
-
-const (
-	xraySocksPortStart = 27019
-	xraySocksPortEnd   = 27999
 )
 
 type ProxySelector struct {
@@ -26,88 +20,30 @@ type ProxySelector struct {
 	xrayDir       string
 	testURL       string
 	socksPort     int
+	httpPort      int
 	checkInterval time.Duration
 	lastCheck     time.Time
+	lastLatency   time.Duration
 }
 
-func NewProxySelector(xrayDir, testURL string, checkInterval time.Duration) *ProxySelector {
+func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
 	os.MkdirAll(xrayDir, 0755)
-	port := resolvePort()
 	return &ProxySelector{
 		xrayDir:       xrayDir,
 		testURL:       testURL,
-		socksPort:     port,
+		socksPort:     socksPort,
+		httpPort:      httpPort,
 		checkInterval: checkInterval,
 		activeIndex:   -1,
 	}
 }
 
-func resolvePort() int {
-	// Check if start port is free
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", xraySocksPortStart), 200*time.Millisecond)
-	if err != nil {
-		return xraySocksPortStart
-	}
-	conn.Close()
-
-	// Port is taken - check if it's our own xray process
-	if isOursOnPort(xraySocksPortStart) {
-		killProcessOnPort(xraySocksPortStart)
-		time.Sleep(500 * time.Millisecond)
-		return xraySocksPortStart
-	}
-
-	// Port is taken by something else - find next available
-	log.Printf("Port %d occupied by another process, finding alternative...", xraySocksPortStart)
-	for port := xraySocksPortStart + 1; port <= xraySocksPortEnd; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err == nil {
-			ln.Close()
-			log.Printf("Using port %d instead", port)
-			return port
-		}
-	}
-
-	// Fallback
-	return xraySocksPortStart
-}
-
-func isOursOnPort(port int) bool {
-	// Check if an xray or v2proxy process owns this port
-	cmd := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-t")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	pids := strings.Fields(strings.TrimSpace(string(out)))
-	for _, pid := range pids {
-		// Check process name
-		cmd2 := exec.Command("ps", "-p", pid, "-o", "comm=")
-		name, err := cmd2.Output()
-		if err != nil {
-			continue
-		}
-		procName := strings.TrimSpace(string(name))
-		if strings.Contains(procName, "xray") || strings.Contains(procName, "v2proxy") {
-			return true
-		}
-	}
-	return false
-}
-
-func killProcessOnPort(port int) {
-	cmd := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-t")
-	out, err := cmd.Output()
-	if err != nil {
-		return
-	}
-
-	pids := strings.Fields(strings.TrimSpace(string(out)))
-	for _, pid := range pids {
-		exec.Command("kill", "-9", pid).Run()
-		log.Printf("Killed old process %s on port %d", pid, port)
-	}
+func (s *ProxySelector) SOCKSPort() int { return s.socksPort }
+func (s *ProxySelector) HTTPPort() int  { return s.httpPort }
+func (s *ProxySelector) LastLatency() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastLatency
 }
 
 func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
@@ -132,6 +68,7 @@ func (s *ProxySelector) StartWithBest() error {
 			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
+				s.lastLatency = result.Latency
 				log.Printf("Using: %s (latency: %v)", s.configs[i].Name, result.Latency)
 				return nil
 			}
@@ -151,9 +88,9 @@ func (s *ProxySelector) HealthCheck() bool {
 
 	result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 	s.lastCheck = time.Now()
+	s.lastLatency = result.Latency
 
 	if result.Working {
-		log.Printf("Health OK: %s (%v)", s.configs[s.activeIndex].Name, result.Latency)
 		return true
 	}
 
@@ -180,6 +117,7 @@ func (s *ProxySelector) SwitchToNext() error {
 			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
 			if result.Working {
 				s.activeIndex = i
+				s.lastLatency = result.Latency
 				log.Printf("Switched: %s (%v)", s.configs[i].Name, result.Latency)
 				return nil
 			}
@@ -195,15 +133,14 @@ func (s *ProxySelector) Stop() {
 	s.stopXray()
 }
 
-func (s *ProxySelector) GetStatus() string {
+func (s *ProxySelector) ActiveConfig() *ProxyConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.activeIndex < 0 || s.activeIndex >= len(s.configs) {
-		return "No active proxy"
+		return nil
 	}
-	httpPort := s.socksPort + 1
-	return fmt.Sprintf("Active: %s | SOCKS5: :%d | HTTP: :%d | Total: %d",
-		s.configs[s.activeIndex].Name, s.socksPort, httpPort, len(s.configs))
+	c := s.configs[s.activeIndex]
+	return &c
 }
 
 func (s *ProxySelector) ShouldCheck() bool {
@@ -272,7 +209,7 @@ func (s *ProxySelector) startXray(index int) error {
 		},
 	}
 
-	cfgPath := filepath.Join(s.xrayDir, "config.json")
+	cfgPath := filepath.Join(s.xrayDir, fmt.Sprintf("config-%d.json", s.socksPort))
 	cfgData, _ := json.MarshalIndent(fullConfig, "", "  ")
 	if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
 		return err
@@ -292,7 +229,6 @@ func (s *ProxySelector) startXray(index int) error {
 
 func (s *ProxySelector) stopXray() {
 	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
-		// Try graceful shutdown first (SIGTERM), then force kill
 		s.xrayCmd.Process.Signal(os.Interrupt)
 		done := make(chan struct{})
 		go func() {
