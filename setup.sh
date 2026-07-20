@@ -12,25 +12,6 @@ cd "$DIR" || exit 1
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
     DOCKER_MODE=true
     ok "Docker detected"
-
-    # Configure Docker mirror for Iran (bypass Docker Hub block)
-    MIRROR_CONFIG="/etc/docker/daemon.json"
-    if ! sudo grep -q "registry-mirrors" "$MIRROR_CONFIG" 2>/dev/null; then
-        echo "Configuring Docker mirror for Iran..."
-        sudo mkdir -p /etc/docker
-        sudo bash -c 'cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-    "https://docker.m.daocloud.io",
-    "https://docker.registry.cyou",
-    "https://docker.1panel.live"
-  ]
-}
-EOF'
-        sudo systemctl daemon-reload
-        sudo systemctl restart docker
-        ok "Docker mirror configured"
-    fi
 else
     DOCKER_MODE=false
     echo "Docker not found, installing dependencies..."
@@ -80,6 +61,7 @@ if [ "$DOCKER_MODE" = true ]; then
         *)
             # Install mode
             mkdir -p config
+            sub_url=""
 
             if [ -f "$DIR/config/subscription.txt" ]; then
                 sub_url=$(cat "$DIR/config/subscription.txt")
@@ -164,6 +146,7 @@ else
     fi
 
     mkdir -p "$DIR/config"
+    sub_url=""
 
     if [ -f "$DIR/config/subscription.txt" ]; then
         sub_url=$(cat "$DIR/config/subscription.txt")
