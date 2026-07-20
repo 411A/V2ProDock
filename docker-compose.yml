@@ -10,9 +10,12 @@ services:
       - "27020:27020"   # HTTP
     volumes:
       - ./config:/root/config
+    env_file:
+      - .env
     environment:
       - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
       - HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://api.ipify.org}
+      - XRAY_DIR=${XRAY_DIR:-/root/xray}
     healthcheck:
       test: ["CMD-SHELL", "pgrep v2proxy > /dev/null 2>&1 || exit 1"]
       interval: 30s
