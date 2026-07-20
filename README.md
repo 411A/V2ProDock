@@ -12,11 +12,12 @@ A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle —
 - **Dynamic ports** — all ports are auto-assigned, no hardcoded ranges
 - **Docker bridge** — other containers connect through the Docker network without port mapping
 - **Multi-platform** — auto-detects OS/arch and downloads the right xray-core binary
+- **Low-end friendly** — tunable memory limits, connection caps, and GC tuning for constrained devices
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USER/V2ProDock.git && cd V2ProDock
+git clone https://github.com/411A/V2ProDock.git && cd V2ProDock
 cp .env.example .env
 # Edit .env with your subscription URL(s)
 sudo bash setup.sh
@@ -133,6 +134,30 @@ Environment variables (set in `.env` or via docker-compose):
 | `PORT_BASE` | `27019` | Base port for proxy allocation |
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `http://api.ipify.org` | URL used to test proxy connectivity |
+| `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
+| `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
+| `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
+| `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
+
+### Tuning for Low-End Devices
+
+For devices with limited RAM (256MB-512MB):
+
+```bash
+# .env — conservative defaults that won't OOM
+GOGC=100
+GOMEMLIMIT=128MiB
+MAX_CONNS=64
+PROXY_INSTANCES=1
+```
+
+```bash
+# .env — aggressive for VPS with 1GB+ RAM
+GOGC=50
+GOMEMLIMIT=256MiB
+MAX_CONNS=256
+PROXY_INSTANCES=3
+```
 
 ## License
 
