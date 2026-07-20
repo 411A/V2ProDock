@@ -8,7 +8,7 @@ err() { echo -e "${RED}[ERROR] $1${NC}"; }
 REPO="https://github.com/411A/V2ProDock.git"
 INSTALL_DIR="$HOME/V2ProDock"
 
-# If piped from curl, clone/pull the repo first
+# If piped from curl or not inside repo, clone/pull first
 if [ ! -f "v2proxy/main.go" ] || [ ! -f "docker-compose.yml" ]; then
     echo "Not inside V2ProDock repo. Setting up..."
     if [ -d "$INSTALL_DIR" ]; then
@@ -22,7 +22,34 @@ if [ ! -f "v2proxy/main.go" ] || [ ! -f "docker-compose.yml" ]; then
     fi
 fi
 
+# Always resolve DIR after possible cd
 DIR="$(pwd)"
+
+# Read subscription URL from a source, stripping CRLF and whitespace
+read_sub_url() {
+    local url=""
+    # Source 1: config/subscription.txt
+    if [ -f "$DIR/config/subscription.txt" ]; then
+        url=$(tr -d '\r' < "$DIR/config/subscription.txt" | tr -d '[:space:]')
+        if [ -n "$url" ]; then
+            echo "$url"
+            return
+        fi
+    fi
+    # Source 2: .env file
+    if [ -f "$DIR/.env" ]; then
+        url=$(tr -d '\r' < "$DIR/.env" | grep -E '^SUBSCRIPTION_URL=' | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
+        if [ -n "$url" ]; then
+            echo "$url"
+            return
+        fi
+    fi
+    # Source 3: env var
+    if [ -n "${SUBSCRIPTION_URL:-}" ]; then
+        echo "$SUBSCRIPTION_URL"
+        return
+    fi
+}
 
 # Check if Docker is available
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
@@ -76,35 +103,30 @@ if [ "$DOCKER_MODE" = true ]; then
             ;;
         *)
             # Install / update mode
-            mkdir -p config
+            mkdir -p "$DIR/config"
 
-            # Subscription URL — preserve existing
-            sub_url=""
-            if [ -f "$DIR/config/subscription.txt" ]; then
-                sub_url=$(cat "$DIR/config/subscription.txt")
-                echo "Current subscription: $sub_url"
-                read -p "Keep? [Y/n]: " -n 1 -r; echo
-                [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
-            fi
+            # Get subscription URL from any available source
+            sub_url=$(read_sub_url)
 
-            # Fallback: read from .env
-            if [ -z "$sub_url" ] && [ -f .env ]; then
-                sub_url=$(sed -n 's/^SUBSCRIPTION_URL=//p' .env | head -1)
-            fi
-
-            if [ -z "$sub_url" ]; then
+            if [ -n "$sub_url" ]; then
+                ok "Found subscription: $sub_url"
+            else
                 echo "Enter subscription URL:"
                 read -r -p "URL: " sub_url
                 [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
                 echo "$sub_url" > "$DIR/config/subscription.txt"
+                ok "Subscription saved"
             fi
 
             # .env — preserve existing, only create if missing
-            if [ ! -f .env ]; then
+            if [ ! -f "$DIR/.env" ]; then
                 health_url="http://api.ipify.org"
                 echo "Health check URL (default: $health_url):"
                 read -r -p "URL: " input; health_url=${input:-$health_url}
-                echo -e "SUBSCRIPTION_URL=$sub_url\nHEALTH_CHECK_URL=$health_url" > .env
+                cat > "$DIR/.env" <<ENVEOF
+SUBSCRIPTION_URL=$sub_url
+HEALTH_CHECK_URL=$health_url
+ENVEOF
                 ok ".env created"
             else
                 ok ".env exists, skipping"
@@ -171,25 +193,18 @@ else
     fi
 
     mkdir -p "$DIR/config"
-    sub_url=""
 
-    if [ -f "$DIR/config/subscription.txt" ]; then
-        sub_url=$(cat "$DIR/config/subscription.txt")
-        echo "Current subscription: $sub_url"
-        read -r -p "Keep? [Y/n]: " -n 1 -r; echo
-        [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
-    fi
+    # Get subscription URL from any available source
+    sub_url=$(read_sub_url)
 
-    # Fallback: read from .env
-    if [ -z "$sub_url" ] && [ -f .env ]; then
-        sub_url=$(sed -n 's/^SUBSCRIPTION_URL=//p' .env | head -1)
-    fi
-
-    if [ -z "$sub_url" ]; then
+    if [ -n "$sub_url" ]; then
+        ok "Found subscription: $sub_url"
+    else
         echo "Enter subscription URL:"
         read -r -p "URL: " sub_url
         [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
         echo "$sub_url" > "$DIR/config/subscription.txt"
+        ok "Subscription saved"
     fi
 
     health_url="http://api.ipify.org"
