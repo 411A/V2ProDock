@@ -17,10 +17,16 @@ A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle —
 ## Quick Start
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/411A/V2ProDock/main/install.sh | bash
+```
+
+Or clone manually:
+
+```bash
 git clone https://github.com/411A/V2ProDock.git && cd V2ProDock
-cp .env.example .env
+[ -f .env ] || cp .env.example .env
 # Edit .env with your subscription URL(s)
-sudo bash setup.sh
+sudo bash install.sh
 ```
 
 ## Multi-Instance Setup
@@ -95,12 +101,12 @@ networks:
 ## Commands
 
 ```bash
-sudo bash setup.sh           # Install & start
-sudo bash setup.sh start     # Start
-sudo bash setup.sh stop      # Stop
-sudo bash setup.sh status    # Show status
-sudo bash setup.sh logs      # Follow logs
-sudo bash setup.sh uninstall # Remove everything
+sudo bash install.sh           # Install & start
+sudo bash install.sh start     # Start
+sudo bash install.sh stop      # Stop
+sudo bash install.sh status    # Show status
+sudo bash install.sh logs      # Follow logs
+sudo bash install.sh uninstall # Remove everything
 ```
 
 ## How It Works

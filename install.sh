@@ -5,8 +5,24 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok() { echo -e "${GREEN}[OK] $1${NC}"; }
 err() { echo -e "${RED}[ERROR] $1${NC}"; }
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$DIR" || exit 1
+REPO="https://github.com/411A/V2ProDock.git"
+INSTALL_DIR="$HOME/V2ProDock"
+
+# If piped from curl, clone/pull the repo first
+if [ ! -f "v2proxy/main.go" ] || [ ! -f "docker-compose.yml" ]; then
+    echo "Not inside V2ProDock repo. Setting up..."
+    if [ -d "$INSTALL_DIR" ]; then
+        cd "$INSTALL_DIR" || exit 1
+        git pull --ff-only || { err "git pull failed"; exit 1; }
+        ok "Updated $INSTALL_DIR"
+    else
+        git clone "$REPO" "$INSTALL_DIR" || { err "git clone failed"; exit 1; }
+        cd "$INSTALL_DIR" || exit 1
+        ok "Cloned to $INSTALL_DIR"
+    fi
+fi
+
+DIR="$(pwd)"
 
 # Check if Docker is available
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
@@ -25,19 +41,19 @@ if [ "$DOCKER_MODE" = true ]; then
             ok "Started"
             echo ""
             echo -e "${CYAN}Proxies (Docker bridge):${NC}"
-            echo "  SOCKS5: v2proxy:27019 (from other containers)"
-            echo "  HTTP:   v2proxy:27020 (from other containers)"
+            echo "  SOCKS5: v2prodock:27019 (from other containers)"
+            echo "  HTTP:   v2prodock:27020 (from other containers)"
             echo ""
             echo -e "${CYAN}Proxies (host):${NC}"
             echo "  SOCKS5: localhost:27019"
             echo "  HTTP:   localhost:27020"
             echo ""
             echo "Usage in other containers:"
-            echo "  network_mode: service:v2proxy"
+            echo "  network_mode: service:v2prodock"
             echo "  OR"
             echo "  environment:"
-            echo "    - HTTP_PROXY=http://v2proxy:27020"
-            echo "    - HTTPS_PROXY=socks5://v2proxy:27019"
+            echo "    - HTTP_PROXY=http://v2prodock:27020"
+            echo "    - HTTPS_PROXY=socks5://v2prodock:27019"
             ;;
         stop)
             docker compose stop
@@ -46,10 +62,10 @@ if [ "$DOCKER_MODE" = true ]; then
         status)
             docker compose ps
             echo ""
-            docker logs --tail 10 v2proxy 2>&1
+            docker logs --tail 10 v2prodock 2>&1
             ;;
         logs)
-            docker compose logs -f v2proxy
+            docker compose logs -f v2prodock
             ;;
         uninstall)
             read -p "Remove everything? [y/N]: " -n 1 -r; echo
@@ -59,10 +75,11 @@ if [ "$DOCKER_MODE" = true ]; then
             ok "Removed"
             ;;
         *)
-            # Install mode
+            # Install / update mode
             mkdir -p config
-            sub_url=""
 
+            # Subscription URL — preserve existing
+            sub_url=""
             if [ -f "$DIR/config/subscription.txt" ]; then
                 sub_url=$(cat "$DIR/config/subscription.txt")
                 echo "Current subscription: $sub_url"
@@ -77,12 +94,16 @@ if [ "$DOCKER_MODE" = true ]; then
                 echo "$sub_url" > "$DIR/config/subscription.txt"
             fi
 
-            health_url="http://api.ipify.org"
-            echo "Health check URL (default: $health_url):"
-            read -r -p "URL: " input; health_url=${input:-$health_url}
-
-            echo -e "SUBSCRIPTION_URL=$sub_url\nHEALTH_CHECK_URL=$health_url" > .env
-            ok "Config ready"
+            # .env — preserve existing, only create if missing
+            if [ ! -f .env ]; then
+                health_url="http://api.ipify.org"
+                echo "Health check URL (default: $health_url):"
+                read -r -p "URL: " input; health_url=${input:-$health_url}
+                echo -e "SUBSCRIPTION_URL=$sub_url\nHEALTH_CHECK_URL=$health_url" > .env
+                ok ".env created"
+            else
+                ok ".env exists, skipping"
+            fi
 
             docker compose build 2>&1
             docker compose up -d 2>&1
@@ -97,13 +118,12 @@ if [ "$DOCKER_MODE" = true ]; then
             echo "  curl --proxy http://localhost:27020 https://api.ipify.org"
             echo ""
             echo "Other containers use:"
-            echo "  HTTP_PROXY=http://v2proxy:27020"
-            echo "  HTTPS_PROXY=socks5://v2proxy:27019"
+            echo "  HTTP_PROXY=http://v2prodock:27020"
+            echo "  HTTPS_PROXY=socks5://v2prodock:27019"
             ;;
     esac
 else
     # Direct install mode (no Docker)
-    # Install Go if not present
     if ! command -v go &>/dev/null; then
         echo "Installing Go..."
         curl -sL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
