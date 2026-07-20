@@ -116,36 +116,27 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 			"path": path,
 			"host": host,
 		}
-		if security == "tls" {
-			stream["tlsSettings"] = buildTLS(q, "ws")
-		}
 	case "grpc":
 		stream["grpcSettings"] = map[string]interface{}{
 			"serviceName": q.Get("serviceName"),
 		}
-		if security == "tls" {
-			stream["tlsSettings"] = buildTLS(q, "grpc")
+	}
+
+	// Security settings are transport-independent (REALITY/TLS work with any transport)
+	switch security {
+	case "reality":
+		stream["realitySettings"] = map[string]interface{}{
+			"serverName":  q.Get("sni"),
+			"fingerprint": q.Get("fp"),
+			"publicKey":   q.Get("pbk"),
+			"shortId":     q.Get("sid"),
+			"spiderX":     q.Get("spx"),
 		}
-	case "tcp":
-		switch security {
-		case "reality":
-			stream["realitySettings"] = map[string]interface{}{
-				"serverName":  q.Get("sni"),
-				"fingerprint": q.Get("fp"),
-				"publicKey":   q.Get("pbk"),
-				"shortId":     q.Get("sid"),
-				"spiderX":     q.Get("spx"),
-			}
-			if flow != "" {
-				stream["flow"] = flow
-			}
-		case "tls":
-			stream["tlsSettings"] = buildTLS(q, "tcp")
+		if flow != "" {
+			stream["flow"] = flow
 		}
-	default:
-		if security == "tls" {
-			stream["tlsSettings"] = buildTLS(q, transport)
-		}
+	case "tls":
+		stream["tlsSettings"] = buildTLS(q, transport)
 	}
 
 	outbound := map[string]interface{}{
