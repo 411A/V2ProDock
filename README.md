@@ -1,5 +1,9 @@
 # V2ProDock
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/82685dd3-b43b-4e27-a7c8-02f3ea5edc67" alt="V2ProDock logo" width="150" height="150">
+</p>
+
 A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle — from subscription parsing to automatic failover. Feed it a subscription URL, and it handles the rest: parses protocols, health-checks servers, and provides stable SOCKS5 + HTTP proxies for your other apps and containers.
 
 ## Features
