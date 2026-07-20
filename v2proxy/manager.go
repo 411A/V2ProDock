@@ -220,13 +220,19 @@ func (m *ProxyManager) GetStatuses() []InstanceStatus {
 }
 
 func (m *ProxyManager) GetAliveStatuses() []InstanceStatus {
-	all := m.GetStatuses()
-	alive := make([]InstanceStatus, 0, len(all))
-	for _, s := range all {
+	m.mu.Lock()
+	alive := make([]InstanceStatus, 0, len(m.statuses))
+	for _, s := range m.statuses {
 		if s.Status == "ok" {
 			alive = append(alive, s)
 		}
 	}
+	m.mu.Unlock()
+
+	sort.Slice(alive, func(i, j int) bool {
+		return alive[i].LatMs < alive[j].LatMs
+	})
+
 	return alive
 }
 

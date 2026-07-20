@@ -74,7 +74,8 @@ func downloadXray(xrayDir, xrayBin string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(out, resp.Body)
+	buf := make([]byte, 32*1024)
+	_, err = io.CopyBuffer(out, resp.Body, buf)
 	out.Close()
 	if err != nil {
 		return err
