@@ -87,6 +87,11 @@ if [ "$DOCKER_MODE" = true ]; then
                 [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
             fi
 
+            # Fallback: read from .env
+            if [ -z "$sub_url" ] && [ -f .env ]; then
+                sub_url=$(sed -n 's/^SUBSCRIPTION_URL=//p' .env | head -1)
+            fi
+
             if [ -z "$sub_url" ]; then
                 echo "Enter subscription URL:"
                 read -r -p "URL: " sub_url
@@ -173,6 +178,11 @@ else
         echo "Current subscription: $sub_url"
         read -r -p "Keep? [Y/n]: " -n 1 -r; echo
         [[ $REPLY =~ ^[Nn]$ ]] && sub_url=""
+    fi
+
+    # Fallback: read from .env
+    if [ -z "$sub_url" ] && [ -f .env ]; then
+        sub_url=$(sed -n 's/^SUBSCRIPTION_URL=//p' .env | head -1)
     fi
 
     if [ -z "$sub_url" ]; then
