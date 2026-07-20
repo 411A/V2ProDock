@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +16,8 @@ import (
 )
 
 const (
-	maxConcurrentConns = 256
-	relayBufSize       = 32 * 1024
+	defaultMaxConns = 128
+	relayBufSize    = 32 * 1024
 )
 
 var relayBufPool = sync.Pool{
@@ -26,13 +28,24 @@ var relayBufPool = sync.Pool{
 }
 
 var (
-	connSem  = make(chan struct{}, maxConcurrentConns)
+	connSem  chan struct{}
 	onceInit sync.Once
 )
 
+func getMaxConns() int {
+	if v := os.Getenv("MAX_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxConns
+}
+
 func initConnSem() {
 	onceInit.Do(func() {
-		for i := 0; i < maxConcurrentConns; i++ {
+		max := getMaxConns()
+		connSem = make(chan struct{}, max)
+		for i := 0; i < max; i++ {
 			connSem <- struct{}{}
 		}
 	})

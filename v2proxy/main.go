@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,6 +14,18 @@ import (
 )
 
 func main() {
+	// Apply memory tuning before anything else
+	if v := os.Getenv("GOGC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			debug.SetGCPercent(n)
+		}
+	}
+	if v := os.Getenv("GOMEMLIMIT"); v != "" {
+		if limit, err := parseBytes(v); err == nil {
+			debug.SetMemoryLimit(limit)
+		}
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting V2Ray Proxy...")
 
@@ -132,4 +145,27 @@ func healthCheckLoop(manager *ProxyManager) {
 	for range ticker.C {
 		manager.HealthCheckAll()
 	}
+}
+
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	multiplier := int64(1)
+	if strings.HasSuffix(s, "MIB") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MIB")
+	} else if strings.HasSuffix(s, "MB") {
+		multiplier = 1000 * 1000
+		s = strings.TrimSuffix(s, "MB")
+	} else if strings.HasSuffix(s, "GIB") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GIB")
+	} else if strings.HasSuffix(s, "GB") {
+		multiplier = 1000 * 1000 * 1000
+		s = strings.TrimSuffix(s, "GB")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n * multiplier, nil
 }
