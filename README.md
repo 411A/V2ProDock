@@ -5,32 +5,71 @@ A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle —
 ## Features
 
 - **Subscription-based** — paste a v2ray subscription URL, it parses vless/vmess/trojan/shadowsocks configs automatically
+- **Multi-instance** — run N independent xray processes, each with its own proxy pair and failover
 - **Auto-failover** — health-checks every 60s, switches to the next working server on failure
 - **Auto-refresh** — re-fetches subscription every 120s for updated server lists
-- **Dual proxies** — exposes SOCKS5 (port 27019) and HTTP (port 27020) for any app
+- **HTTP API** — query live proxies sorted by latency at `GET /proxies`
+- **Dynamic ports** — all ports are auto-assigned, no hardcoded ranges
 - **Docker bridge** — other containers connect through the Docker network without port mapping
 - **Multi-platform** — auto-detects OS/arch and downloads the right xray-core binary
-- **Dynamic ports** — if the default port is occupied, automatically finds the next available one
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/YOUR_USER/V2ProDock.git && cd V2ProDock
+cp .env.example .env
+# Edit .env with your subscription URL(s)
 sudo bash setup.sh
 ```
 
-Enter your subscription URL when prompted. Done.
+## Multi-Instance Setup
+
+Run multiple independent proxy instances in a single container:
+
+```bash
+# .env
+SUBSCRIPTION_URLS=https://sub1.example,https://sub2.example,https://sub3.example
+PROXY_INSTANCES=3
+```
+
+Each instance gets its own dynamically assigned SOCKS5 + HTTP port pair. Query them via the API:
+
+```bash
+# Returns alive proxies sorted by lowest latency
+curl http://localhost:27018/proxies
+```
+
+```json
+[
+  {"index":1, "socks5":"0.0.0.0:27021", "http":"0.0.0.0:27022", "status":"ok", "latency_ms":85, "name":"server-1"},
+  {"index":0, "socks5":"0.0.0.0:27019", "http":"0.0.0.0:27020", "status":"ok", "latency_ms":120, "name":"server-2"}
+]
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/proxies` | GET | Alive proxies sorted by latency (lowest first) |
+| `/all` | GET | All instances including down ones |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2}` |
+| `/refresh` | POST | Force subscription re-fetch |
 
 ## Usage
 
-### From the host machine
+### From Python (multi-instance)
 
-```bash
-# SOCKS5
-curl --socks5 localhost:27019 https://api.ipify.org
+```python
+import requests
 
-# HTTP
-curl --proxy http://localhost:27020 https://api.ipify.org
+proxies = requests.get("http://localhost:27018/proxies").json()
+proxy = proxies[0]  # Fastest proxy
+
+r = requests.get("https://api.ipify.org", proxies={
+    "http": f"http://{proxy['http']}",
+    "https": f"socks5://{proxy['socks5']}",
+})
+print(r.text)
 ```
 
 ### From other Docker containers
@@ -42,7 +81,7 @@ services:
     environment:
       - HTTP_PROXY=http://v2prodock:27020
       - HTTPS_PROXY=socks5://v2prodock:27019
-      - ALL_PROXY=socks5://v2prodock:27019
+      - NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
     networks:
       - proxy-net
 
@@ -50,28 +89,6 @@ networks:
   proxy-net:
     external: true
     name: v2prodock_v2prodock-proxy-net
-```
-
-### From Python
-
-```python
-import requests
-
-proxies = {
-    "http": "http://localhost:27020",
-    "https": "socks5://localhost:27019",
-}
-
-r = requests.get("https://api.ipify.org", proxies=proxies)
-print(r.text)  # Shows proxy IP, not your real IP
-```
-
-### System-wide (Linux)
-
-```bash
-export HTTP_PROXY=http://localhost:27020
-export HTTPS_PROXY=socks5://localhost:27019
-export ALL_PROXY=socks5://localhost:27019
 ```
 
 ## Commands
@@ -87,12 +104,13 @@ sudo bash setup.sh uninstall # Remove everything
 
 ## How It Works
 
-1. Fetches subscription URL and parses vless/vmess/trojan/shadowsocks links
+1. Fetches subscription URL(s) and parses vless/vmess/trojan/shadowsocks links
 2. Converts each to an xray-core JSON outbound config
-3. Tests each config against a health-check URL via the SOCKS5 proxy
-4. Starts xray with the first working config, exposing SOCKS5 + HTTP proxies
-5. Runs periodic health checks (60s) — on failure, switches to the next working server
-6. Re-fetches the subscription periodically (120s) for updated server lists
+3. Distributes configs across N instances (round-robin)
+4. Each instance: starts xray, tests configs, keeps the first working one
+5. Health checks run every 60s per instance — on failure, switches to next config
+6. API returns alive proxies sorted by latency — dead ones excluded
+7. Subscriptions re-fetched every 120s for updated server lists
 
 ## Supported Protocols
 
@@ -109,7 +127,11 @@ Environment variables (set in `.env` or via docker-compose):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SUBSCRIPTION_URL` | — | Your v2ray subscription URL |
+| `SUBSCRIPTION_URL` | — | Single v2ray subscription URL |
+| `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
+| `PROXY_INSTANCES` | `1` | Number of xray instances to run |
+| `PORT_BASE` | `27019` | Base port for proxy allocation |
+| `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `http://api.ipify.org` | URL used to test proxy connectivity |
 
 ## License

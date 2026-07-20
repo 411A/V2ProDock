@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,9 @@ func main() {
 	xrayDir := "/root/xray"
 	testURL := "http://httpbin.org/ip"
 	subURL := ""
+	portBase := defaultPortBase
+	instanceCount := 1
+	apiPort := 27018
 
 	if v := os.Getenv("SUBSCRIPTION_URL"); v != "" {
 		subURL = v
@@ -28,14 +32,41 @@ func main() {
 	if v := os.Getenv("XRAY_DIR"); v != "" {
 		xrayDir = v
 	}
-
-	if subURL == "" {
-		subFile := filepath.Join("/root/config", "subscription.txt")
-		if data, err := os.ReadFile(subFile); err == nil {
-			subURL = string(data)
+	if v := os.Getenv("PORT_BASE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			portBase = n
 		}
 	}
-	if subURL == "" {
+	if v := os.Getenv("PROXY_INSTANCES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			instanceCount = n
+		}
+	}
+	if v := os.Getenv("API_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			apiPort = n
+		}
+	}
+
+	// Subscription URL resolution: SUBSCRIPTION_URLS > SUBSCRIPTION_URL > file > stdin
+	var subURLs []string
+	if v := os.Getenv("SUBSCRIPTION_URLS"); v != "" {
+		subURLs = strings.Split(v, ",")
+		for i := range subURLs {
+			subURLs[i] = strings.TrimSpace(subURLs[i])
+		}
+	} else if subURL != "" {
+		// Single URL, will be shared across all instances
+		subURLs = []string{subURL}
+	} else {
+		subFile := filepath.Join("/root/config", "subscription.txt")
+		if data, err := os.ReadFile(subFile); err == nil {
+			subURL = strings.TrimSpace(string(data))
+			subURLs = []string{subURL}
+		}
+	}
+
+	if len(subURLs) == 0 || subURLs[0] == "" {
 		fmt.Print("Enter subscription URL: ")
 		fmt.Scanln(&subURL)
 		if subURL == "" {
@@ -43,82 +74,62 @@ func main() {
 		}
 		os.MkdirAll("/root/config", 0755)
 		os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644)
+		subURLs = []string{subURL}
 	}
 
 	if err := EnsureXray(xrayDir); err != nil {
 		log.Fatalf("Xray setup failed: %v", err)
 	}
 
-	selector := NewProxySelector(xrayDir, testURL, 60*time.Second)
+	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, 60*time.Second)
 
-	log.Printf("Fetching: %s", subURL)
-	configs, err := FetchSubscription(subURL)
-	if err != nil {
-		log.Fatalf("Subscription fetch failed: %v", err)
+	log.Printf("Starting %d instance(s)...", manager.InstanceCount())
+	if err := manager.Start(); err != nil {
+		log.Fatalf("Manager start failed: %v", err)
 	}
-	log.Printf("Parsed %d configs", len(configs))
-	selector.UpdateConfigs(configs)
 
-	log.Println("Finding working proxy...")
-	if err := selector.StartWithBest(); err != nil {
-		log.Fatalf("No working proxy: %v", err)
+	// Start HTTP proxy for each instance (SOCKS5 -> HTTP bridge)
+	for _, inst := range manager.instances {
+		startHTTPProxy(
+			fmt.Sprintf("0.0.0.0:%d", inst.HTTPPort()),
+			fmt.Sprintf("127.0.0.1:%d", inst.SOCKSPort()),
+		)
 	}
-	log.Println(selector.GetStatus())
 
-	// Start HTTP proxy via Go (forwards through SOCKS5)
-	httpPort := findAvailablePort(selector.socksPort + 1)
-	startHTTPProxy(fmt.Sprintf("0.0.0.0:%d", httpPort), fmt.Sprintf("127.0.0.1:%d", selector.socksPort))
+	// Start API server
+	apiActualPort := startAPI(manager, apiPort)
+	log.Printf("API available at http://0.0.0.0:%d/proxies", apiActualPort)
 
-	go subscriptionLoop(subURL, selector)
-	go healthCheckLoop(selector)
+	// Print summary
+	for _, s := range manager.GetStatuses() {
+		log.Printf("Instance %d: %s | SOCKS5=%s HTTP=%s | status=%s latency=%dms",
+			s.Index, s.Name, s.SOCKS, s.HTTP, s.Status, s.LatMs)
+	}
+
+	go subscriptionLoop(manager)
+	go healthCheckLoop(manager)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	log.Println("Shutting down...")
-	selector.Stop()
+	manager.Stop()
 }
 
-func subscriptionLoop(subURL string, selector *ProxySelector) {
+func subscriptionLoop(manager *ProxyManager) {
 	ticker := time.NewTicker(120 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		log.Println("Refreshing subscription...")
-		configs, err := FetchSubscription(subURL)
-		if err != nil {
-			log.Printf("Refresh failed: %v", err)
-			continue
-		}
-		log.Printf("Refreshed: %d configs", len(configs))
-		selector.UpdateConfigs(configs)
+		log.Println("Refreshing subscriptions...")
+		manager.RefreshSubscriptions()
 	}
 }
 
-func healthCheckLoop(selector *ProxySelector) {
+func healthCheckLoop(manager *ProxyManager) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if !selector.ShouldCheck() {
-			continue
-		}
-		if selector.HealthCheck() {
-			continue
-		}
-		log.Println("Proxy failed, switching...")
-		if err := selector.SwitchToNext(); err != nil {
-			log.Printf("Switch failed: %v", err)
-		}
+		manager.HealthCheckAll()
 	}
-}
-
-func findAvailablePort(start int) int {
-	for port := start; port <= 27999; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err == nil {
-			ln.Close()
-			return port
-		}
-	}
-	return start
 }
