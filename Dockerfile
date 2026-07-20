@@ -23,9 +23,6 @@ WORKDIR /root/
 COPY --from=builder /app/v2proxy .
 RUN mkdir -p /root/config
 
-ENV GOGC=50
-ENV GOMEMLIMIT=64MiB
-
 EXPOSE 27018-27100
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
