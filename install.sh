@@ -13,7 +13,12 @@ if [ ! -f "v2proxy/main.go" ] || [ ! -f "docker-compose.yml" ]; then
     echo "Not inside V2ProDock repo. Setting up..."
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR" || exit 1
-        git pull --ff-only || { err "git pull failed"; exit 1; }
+        git pull --ff-only || {
+            echo "Fast-forward failed (force push?), resetting..."
+            git stash --include-untracked 2>/dev/null
+            git fetch origin && git reset --hard origin/main
+            git stash pop 2>/dev/null || true
+        }
         ok "Updated $INSTALL_DIR"
     else
         git clone "$REPO" "$INSTALL_DIR" || { err "git clone failed"; exit 1; }
