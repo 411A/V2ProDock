@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     networks:
       - v2prodock-proxy-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "27000-27100:27000-27100"   # Dynamic proxy ports (SOCKS5 + HTTP)
       - "27018:27018"               # API

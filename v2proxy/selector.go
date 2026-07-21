@@ -102,6 +102,10 @@ func (s *ProxySelector) SwitchToNext() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if len(s.configs) == 0 {
+		return fmt.Errorf("no configs available")
+	}
+
 	s.stopXray()
 
 	startIdx := s.activeIndex + 1
