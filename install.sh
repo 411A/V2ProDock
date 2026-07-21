@@ -118,16 +118,25 @@ if [ "$DOCKER_MODE" = true ]; then
                 ok "Subscription saved"
             fi
 
-            # .env — preserve existing, only create if missing
+            # .env — copy from .env.example as template, then fill in user values
             if [ ! -f "$DIR/.env" ]; then
+                cp "$DIR/.env.example" "$DIR/.env"
+
+                # Fill in the subscription URL the user provided
+                sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$sub_url|" "$DIR/.env"
+
+                echo ""
+                echo -e "${CYAN}Configure additional settings (press Enter to keep defaults):${NC}"
+
                 health_url="http://api.ipify.org"
-                echo "Health check URL (default: $health_url):"
-                read -r -p "URL: " input; health_url=${input:-$health_url}
-                cat > "$DIR/.env" <<ENVEOF
-SUBSCRIPTION_URL=$sub_url
-HEALTH_CHECK_URL=$health_url
-ENVEOF
-                ok ".env created"
+                read -r -p "  Health check URL [$health_url]: " input; health_url=${input:-$health_url}
+                sed -i "s|^HEALTH_CHECK_URL=.*|HEALTH_CHECK_URL=$health_url|" "$DIR/.env"
+
+                read -r -p "  Number of proxy instances [1]: " input
+                [ -n "$input" ] && sed -i "s|^PROXY_INSTANCES=.*|PROXY_INSTANCES=$input|" "$DIR/.env"
+
+                ok ".env created from .env.example"
+                echo "  Edit $DIR/.env to customize further."
             else
                 ok ".env exists, skipping"
             fi

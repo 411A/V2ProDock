@@ -154,8 +154,10 @@ Environment variables (set in `.env` or via docker-compose):
 You need a v2ray subscription URL to get started. [V2RayDAR](https://github.com/411A/V2RayDAR) fetches configs from public repos and serves them as a single subscription endpoint — run it on your server and point to:
 
 ```
-http://127.0.0.1:27141/subscription
+http://192.168.x.x:27141/subscription
 ```
+
+> **Docker note:** Inside a container, `127.0.0.1` refers to the container itself, not your host. Use `host.docker.internal` (Docker 20.10+) or your host's LAN IP instead. The compose file already includes `extra_hosts` for `host.docker.internal` support on Linux.
 
 You can also add more public subscription URLs directly via `SUBSCRIPTION_URLS` in `.env` — comma-separated, one per instance.
 
