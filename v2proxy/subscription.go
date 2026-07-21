@@ -323,6 +323,21 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		password = userInfo
 	}
 
+	// Xray-supported Shadowsocks ciphers (AEAD only — stream ciphers removed in Xray 26+)
+	supportedSS := map[string]bool{
+		"aes-128-gcm":                  true,
+		"aes-256-gcm":                  true,
+		"chacha20-poly1305":            true,
+		"chacha20-ietf-poly1305":       true,
+		"xchacha20-ietf-poly1305":      true,
+		"2022-blake3-aes-128-gcm":      true,
+		"2022-blake3-aes-256-gcm":      true,
+		"2022-blake3-chacha20-poly1305": true,
+	}
+	if !supportedSS[method] {
+		return nil, fmt.Errorf("unsupported SS cipher: %s", method)
+	}
+
 	outbound := map[string]interface{}{
 		"protocol": "shadowsocks",
 		"settings": map[string]interface{}{
