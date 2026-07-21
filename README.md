@@ -159,6 +159,13 @@ http://192.168.x.x:27141/subscription
 
 > **Docker note:** Inside a container, `127.0.0.1` refers to the container itself, not your host. Use `host.docker.internal` (Docker 20.10+) or your host's LAN IP instead. The compose file already includes `extra_hosts` for `host.docker.internal` support on Linux.
 
+> **WSL2 note:** If V2RayDAR runs on Windows and V2ProDock runs in WSL2/Docker, `host.docker.internal` won't reach the Windows host. The install script auto-detects WSL2 and replaces it with the correct Windows IP. To fix manually:
+> ```bash
+> WIN_HOST=$(ip route show default | awk '/default/ {print $3}')
+> sed -i "s|host.docker.internal|$WIN_HOST|g" .env
+> bash install.sh restart
+> ```
+
 You can also add more public subscription URLs directly via `SUBSCRIPTION_URLS` in `.env` — comma-separated, one per instance.
 
 ### Tuning for Low-End Devices

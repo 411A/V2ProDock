@@ -87,6 +87,35 @@ fi
 # Always resolve DIR after possible cd
 DIR="$(pwd)"
 
+# Detect WSL2 and get Windows host IP
+get_wsl_host_ip() {
+    if grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null; then
+        # Use default gateway — always the Windows host in WSL2
+        local ip
+        ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return
+        fi
+    fi
+}
+
+# Fix subscription URL for WSL2 (host.docker.internal doesn't reach Windows host)
+fix_wsl_url() {
+    local url="$1"
+    if [[ "$url" == *"host.docker.internal"* ]] || [[ "$url" == *"127.0.0.1"* ]]; then
+        local win_ip
+        win_ip=$(get_wsl_host_ip)
+        if [ -n "$win_ip" ]; then
+            local fixed
+            fixed=$(echo "$url" | sed "s|host.docker.internal|$win_ip|g; s|127.0.0.1|$win_ip|g")
+            echo "$fixed"
+            return
+        fi
+    fi
+    echo "$url"
+}
+
 # Read subscription URL from a source, stripping CRLF and whitespace
 read_sub_url() {
     local url=""
@@ -156,6 +185,14 @@ if [ "$DOCKER_MODE" = true ]; then
             # Get subscription URL from any available source
             sub_url=$(read_sub_url)
 
+            # Auto-fix WSL2 networking: replace host.docker.internal with Windows host IP
+            fixed_url=$(fix_wsl_url "$sub_url")
+            if [ "$fixed_url" != "$sub_url" ]; then
+                win_ip=$(get_wsl_host_ip)
+                ok "WSL2 detected — replacing host.docker.internal with $win_ip"
+                sub_url="$fixed_url"
+            fi
+
             if [ -n "$sub_url" ]; then
                 ok "Found subscription: $sub_url"
             else
@@ -187,6 +224,11 @@ if [ "$DOCKER_MODE" = true ]; then
                 echo "  Edit $DIR/.env to customize further."
             else
                 ok ".env exists, skipping"
+                # Fix WSL2 URL in existing .env
+                if [ "$fixed_url" != "$(read_sub_url)" ]; then
+                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$fixed_url|" "$DIR/.env"
+                    ok "Updated SUBSCRIPTION_URL in .env for WSL2"
+                fi
             fi
 
             docker compose build 2>&1
