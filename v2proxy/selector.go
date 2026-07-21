@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -226,6 +227,12 @@ func (s *ProxySelector) startXray(index int) error {
 
 	if err := s.xrayCmd.Start(); err != nil {
 		return fmt.Errorf("start failed: %w", err)
+	}
+
+	// Detect immediate crashes (bad config, missing binary, etc.)
+	time.Sleep(500 * time.Millisecond)
+	if s.xrayCmd.Process != nil && s.xrayCmd.Process.Signal(syscall.Signal(0)) != nil {
+		return fmt.Errorf("xray crashed on start")
 	}
 
 	return nil
