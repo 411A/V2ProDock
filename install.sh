@@ -8,6 +8,63 @@ err() { echo -e "${RED}[ERROR] $1${NC}"; }
 REPO="https://github.com/411A/V2ProDock.git"
 INSTALL_DIR="$HOME/V2ProDock"
 
+# Read a value from .env, returns default if missing
+env_val() {
+    local key="$1" default="$2"
+    if [ -f "$DIR/.env" ]; then
+        local v
+        v=$(grep -E "^${key}=" "$DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
+        [ -n "$v" ] && echo "$v" && return
+    fi
+    echo "$default"
+}
+
+# Print proxy info and health status after starting
+show_status() {
+    local port_base instances api_port
+    port_base=$(env_val PORT_BASE 27019)
+    instances=$(env_val PROXY_INSTANCES 1)
+    api_port=$(env_val API_PORT 27018)
+
+    echo ""
+    echo -e "${CYAN}Proxies:${NC}"
+    local i=0
+    while [ "$i" -lt "$instances" ]; do
+        local socks=$((port_base + i * 2))
+        local http=$((socks + 1))
+        echo "  SOCKS5: localhost:$socks   HTTP: localhost:$http"
+        i=$((i + 1))
+    done
+    echo ""
+    echo -e "${CYAN}Test (first proxy):${NC}"
+    echo "  curl --socks5 localhost:$port_base https://api.ipify.org"
+    echo "  curl --proxy http://localhost:$((port_base + 1)) https://api.ipify.org"
+    echo ""
+
+    # Check API health after a brief wait
+    sleep 3
+    local health
+    health=$(curl -sf "http://localhost:$api_port/health" 2>/dev/null)
+    if [ -n "$health" ]; then
+        local alive total
+        alive=$(echo "$health" | grep -o '"alive":[0-9]*' | cut -d: -f2)
+        total=$(echo "$health" | grep -o '"instances":[0-9]*' | cut -d: -f2)
+        if [ "${alive:-0}" -gt 0 ]; then
+            ok "Proxy healthy: $alive/$total instances alive"
+        else
+            err "All $total instances are DOWN — check subscription URL in .env"
+            echo "  Edit: $DIR/.env"
+            echo "  Logs: docker logs v2prodock"
+        fi
+    else
+        echo -e "${CYAN}API not ready yet — run 'docker logs v2prodock' to check status${NC}"
+    fi
+    echo ""
+    echo "Other containers use:"
+    echo "  HTTP_PROXY=http://v2prodock:$((port_base + 1))"
+    echo "  HTTPS_PROXY=socks5://v2prodock:$port_base"
+}
+
 # If piped from curl or not inside repo, clone/pull first
 if [ ! -f "v2proxy/main.go" ] || [ ! -f "docker-compose.yml" ]; then
     echo "Not inside V2ProDock repo. Setting up..."
@@ -71,21 +128,7 @@ if [ "$DOCKER_MODE" = true ]; then
         start)
             docker compose up -d
             ok "Started"
-            echo ""
-            echo -e "${CYAN}Proxies (Docker bridge):${NC}"
-            echo "  SOCKS5: v2prodock:27019 (from other containers)"
-            echo "  HTTP:   v2prodock:27020 (from other containers)"
-            echo ""
-            echo -e "${CYAN}Proxies (host):${NC}"
-            echo "  SOCKS5: localhost:27019"
-            echo "  HTTP:   localhost:27020"
-            echo ""
-            echo "Usage in other containers:"
-            echo "  network_mode: service:v2prodock"
-            echo "  OR"
-            echo "  environment:"
-            echo "    - HTTP_PROXY=http://v2prodock:27020"
-            echo "    - HTTPS_PROXY=socks5://v2prodock:27019"
+            show_status
             ;;
         stop)
             docker compose stop
@@ -149,18 +192,7 @@ if [ "$DOCKER_MODE" = true ]; then
             docker compose build 2>&1
             docker compose up -d 2>&1
             ok "Started"
-            echo ""
-            echo -e "${CYAN}Proxies:${NC}"
-            echo "  SOCKS5: localhost:27019"
-            echo "  HTTP:   localhost:27020"
-            echo ""
-            echo "Test:"
-            echo "  curl --socks5 localhost:27019 https://api.ipify.org"
-            echo "  curl --proxy http://localhost:27020 https://api.ipify.org"
-            echo ""
-            echo "Other containers use:"
-            echo "  HTTP_PROXY=http://v2prodock:27020"
-            echo "  HTTPS_PROXY=socks5://v2prodock:27019"
+            show_status
             ;;
     esac
 else
@@ -229,11 +261,20 @@ else
 
     zellij kill-session v2proxy 2>/dev/null || true
 
+    local_port_base=$(env_val PORT_BASE 27019)
+    local_instances=$(env_val PROXY_INSTANCES 1)
+
     echo ""
     echo -e "${CYAN}Starting V2Ray Proxy in zellij session 'v2proxy'...${NC}"
     echo ""
-    echo "  SOCKS5: localhost:27019"
-    echo "  HTTP:   localhost:27020"
+    echo -e "${CYAN}Proxies:${NC}"
+    i=0
+    while [ "$i" -lt "$local_instances" ]; do
+        s=$((local_port_base + i * 2))
+        h=$((s + 1))
+        echo "  SOCKS5: localhost:$s   HTTP: localhost:$h"
+        i=$((i + 1))
+    done
     echo ""
     echo "  Attach:  zellij attach v2proxy"
     echo "  Detach:  Ctrl+O then D"
