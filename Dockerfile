@@ -1,9 +1,21 @@
 FROM golang:1.23-alpine AS builder
-ENV GOTOOLCHAIN=auto
+ENV GOTOOLCHAIN=local
 ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /app
+
+# Copy dependency definition files first to leverage Docker layer caching
+COPY v2proxy/go.mod v2proxy/go.sum ./
+RUN sed -i 's/^go 1\.25.*/go 1.23.0/' go.mod && \
+    go mod download
+
+# Copy rest of source code
 COPY v2proxy/ .
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o v2proxy .
+
+# Build application using BuildKit caches for Go build and module cache
+RUN sed -i 's/^go 1\.25.*/go 1.23.0/' go.mod && \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o v2proxy .
 
 FROM alpine:3.20
 RUN apk --no-cache add ca-certificates curl unzip && \
