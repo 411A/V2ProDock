@@ -17,6 +17,7 @@ type ProxySelector struct {
 	mu            sync.Mutex
 	configs       []ProxyConfig
 	activeIndex   int
+	failCount     int
 	xrayCmd       *exec.Cmd
 	xrayDir       string
 	testURL       string
@@ -70,6 +71,7 @@ func (s *ProxySelector) StartWithBest() error {
 			if result.Working {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
+				s.failCount = 0
 				log.Printf("Using: %s (latency: %v)", s.configs[i].Name, result.Latency)
 				return nil
 			}
@@ -92,10 +94,18 @@ func (s *ProxySelector) HealthCheck() bool {
 	s.lastLatency = result.Latency
 
 	if result.Working {
+		s.failCount = 0
 		return true
 	}
 
-	log.Printf("Health FAIL: %s - %v", s.configs[s.activeIndex].Name, result.Error)
+	s.failCount++
+	log.Printf("Health FAIL (%d/3): %s - %v", s.failCount, s.configs[s.activeIndex].Name, result.Error)
+
+	if s.failCount < 3 {
+		// Consider still healthy until threshold is met
+		return true
+	}
+
 	return false
 }
 
@@ -107,14 +117,26 @@ func (s *ProxySelector) SwitchToNext() error {
 		return fmt.Errorf("no configs available")
 	}
 
-	s.stopXray()
-
 	startIdx := s.activeIndex + 1
 	if startIdx >= len(s.configs) {
 		startIdx = 0
 	}
 
-	for i := startIdx; i != s.activeIndex; i = (i + 1) % len(s.configs) {
+	oldCmd := s.xrayCmd
+	oldIndex := s.activeIndex
+
+	for i := startIdx; i != oldIndex; i = (i + 1) % len(s.configs) {
+		if i < 0 || i >= len(s.configs) {
+			continue
+		}
+
+		// Try starting candidate xray on candidate port or temporarily test it
+		// In order to avoid port conflict with running xray, if we are keeping oldCmd running,
+		// we must test candidate. But s.socksPort is the port that clients connect to.
+		// So we stop the old process only when testing candidate, but if candidate fails, we can fallback or quickly try next.
+		s.stopXrayCmd(oldCmd)
+		oldCmd = nil
+
 		if err := s.startXray(i); err != nil {
 			continue
 		}
@@ -123,12 +145,23 @@ func (s *ProxySelector) SwitchToNext() error {
 			if result.Working {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
+				s.failCount = 0
 				log.Printf("Switched: %s (%v)", s.configs[i].Name, result.Latency)
 				return nil
 			}
 		}
 		s.stopXray()
 	}
+
+	// If no replacement worked, try restarting original config as fallback if possible
+	if oldIndex >= 0 && oldIndex < len(s.configs) {
+		log.Printf("All alternative configs failed. Attempting to restore original config %s", s.configs[oldIndex].Name)
+		if err := s.startXray(oldIndex); err == nil {
+			s.activeIndex = oldIndex
+			s.failCount = 0
+		}
+	}
+
 	return fmt.Errorf("no working config found")
 }
 
@@ -239,20 +272,24 @@ func (s *ProxySelector) startXray(index int) error {
 }
 
 func (s *ProxySelector) stopXray() {
-	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
-		s.xrayCmd.Process.Signal(os.Interrupt)
+	s.stopXrayCmd(s.xrayCmd)
+	s.xrayCmd = nil
+}
+
+func (s *ProxySelector) stopXrayCmd(cmd *exec.Cmd) {
+	if cmd != nil && cmd.Process != nil {
+		cmd.Process.Signal(os.Interrupt)
 		done := make(chan struct{})
 		go func() {
-			s.xrayCmd.Wait()
+			cmd.Wait()
 			close(done)
 		}()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			s.xrayCmd.Process.Kill()
+			cmd.Process.Kill()
 			<-done
 		}
-		s.xrayCmd = nil
 		waitForPortFree(s.socksPort, 3*time.Second)
 	}
 }
