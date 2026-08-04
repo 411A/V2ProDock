@@ -196,6 +196,20 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		}
 		log.Printf("Instance %d: refreshed %d configs", i, len(configs))
 		inst.UpdateConfigs(configs)
+
+		// If current instance is marked down or activeIndex is invalid, attempt to start
+		if m.statuses[i].Status != "ok" {
+			if err := inst.StartWithBest(); err == nil {
+				cfg := inst.ActiveConfig()
+				m.statuses[i].Status = "ok"
+				m.statuses[i].Error = ""
+				if cfg != nil {
+					m.statuses[i].Name = cfg.Name
+				}
+				m.statuses[i].Latency = inst.LastLatency()
+				m.statuses[i].LatMs = m.statuses[i].Latency.Milliseconds()
+			}
+		}
 	}
 }
 

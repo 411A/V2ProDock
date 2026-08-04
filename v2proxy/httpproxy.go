@@ -89,6 +89,15 @@ func startHTTPProxy(addr, socksAddr string) {
 }
 
 func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) {
+	// Acquire connection slot to prevent unbounded HTTP request goroutines
+	select {
+	case <-connSem:
+	case <-time.After(5 * time.Second):
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() { connSem <- struct{}{} }()
+
 	host := r.URL.Host
 	if host == "" {
 		host = r.Host

@@ -19,7 +19,12 @@ type ProxyConfig struct {
 }
 
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil, // Do not route subscription fetches through ambient HTTP_PROXY
+		},
+	}
 	resp, err := client.Get(subURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch subscription: %w", err)
@@ -33,21 +38,15 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 
 	content := strings.TrimSpace(string(body))
 
-	// Try multiple base64 decodings
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	} {
-		if decoded, err := enc.DecodeString(content); err == nil {
-			content = string(decoded)
-			break
-		}
-	}
+	// Clean up content: strip trailing/leading whitespace and carriage returns
+	content = strings.ReplaceAll(content, "\r", "")
+	content = strings.TrimSpace(content)
+
+	// Try decoding base64 if needed
+	decodedContent := decodeBase64Content(content)
 
 	var proxies []ProxyConfig
-	for _, line := range strings.Split(content, "\n") {
+	for _, line := range strings.Split(decodedContent, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -61,7 +60,51 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	return proxies, nil
 }
 
+func decodeBase64Content(s string) string {
+	// If it already looks like a list of URLs (e.g. starts with vless://, vmess://, etc.), return as is
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 {
+		firstLine := strings.TrimSpace(lines[0])
+		if strings.HasPrefix(firstLine, "vless://") ||
+			strings.HasPrefix(firstLine, "vmess://") ||
+			strings.HasPrefix(firstLine, "trojan://") ||
+			strings.HasPrefix(firstLine, "ss://") {
+			return s
+		}
+	}
+
+	// Sanitize base64 string: remove all whitespace and newlines
+	cleanB64 := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+
+	// Add missing padding if needed
+	if mod := len(cleanB64) % 4; mod != 0 {
+		cleanB64 += strings.Repeat("=", 4-mod)
+	}
+
+	// Try multiple base64 encodings
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(cleanB64); err == nil {
+			return string(decoded)
+		}
+	}
+
+	return s
+}
+
 func parseToXrayConfig(raw string) (*ProxyConfig, error) {
+	if strings.HasPrefix(raw, "vmess://") {
+		return parseVmess(raw, "")
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, err
@@ -97,6 +140,9 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	flow := q.Get("flow")
 	transport := q.Get("type")
 	if transport == "" {
+		transport = q.Get("headerType")
+	}
+	if transport == "" {
 		transport = "tcp"
 	}
 
@@ -112,14 +158,53 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		if path == "" {
 			path = "/"
 		}
-		stream["wsSettings"] = map[string]interface{}{
+		wsSettings := map[string]interface{}{
 			"path": path,
-			"host": host,
 		}
+		if host != "" {
+			wsSettings["headers"] = map[string]string{"Host": host}
+		}
+		stream["wsSettings"] = wsSettings
 	case "grpc":
-		stream["grpcSettings"] = map[string]interface{}{
-			"serviceName": q.Get("serviceName"),
+		serviceName := q.Get("serviceName")
+		if serviceName == "" {
+			serviceName = q.Get("path")
 		}
+		grpcSettings := map[string]interface{}{
+			"serviceName": serviceName,
+		}
+		if q.Get("mode") == "multi" {
+			grpcSettings["multiMode"] = true
+		}
+		stream["grpcSettings"] = grpcSettings
+	case "http", "h2":
+		stream["network"] = "http"
+		path := q.Get("path")
+		if path == "" {
+			path = "/"
+		}
+		host := q.Get("host")
+		httpSettings := map[string]interface{}{
+			"path": path,
+		}
+		if host != "" {
+			httpSettings["host"] = strings.Split(host, ",")
+		}
+		stream["httpSettings"] = httpSettings
+	case "splithttp", "httpupgrade":
+		path := q.Get("path")
+		if path == "" {
+			path = "/"
+		}
+		host := q.Get("host")
+		settingsKey := transport + "Settings"
+		settings := map[string]interface{}{
+			"path": path,
+		}
+		if host != "" {
+			settings["host"] = host
+		}
+		stream[settingsKey] = settings
 	}
 
 	// Security settings are transport-independent (REALITY/TLS work with any transport)
@@ -151,7 +236,6 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 							"id":         uuid,
 							"encryption": "none",
 							"flow":       flow,
-							"password":   "",
 						},
 					},
 				},
@@ -167,6 +251,18 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 
 func parseVmess(raw, name string) (*ProxyConfig, error) {
 	b64 := strings.TrimPrefix(raw, "vmess://")
+
+	// Sanitize base64 string
+	b64 = strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, b64)
+
+	if mod := len(b64) % 4; mod != 0 {
+		b64 += strings.Repeat("=", 4-mod)
+	}
 
 	// Try multiple base64 decodings
 	var jsonData []byte
@@ -205,17 +301,48 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 		"network":  net,
 		"security": tls,
 	}
-	if net == "ws" {
-		stream["wsSettings"] = map[string]interface{}{
-			"path": m["path"],
-			"host": m["host"],
+	switch net {
+	case "ws":
+		wsSettings := map[string]interface{}{}
+		if path, ok := m["path"].(string); ok && path != "" {
+			wsSettings["path"] = path
 		}
+		if host, ok := m["host"].(string); ok && host != "" {
+			wsSettings["headers"] = map[string]string{"Host": host}
+		}
+		stream["wsSettings"] = wsSettings
+	case "grpc":
+		grpcSettings := map[string]interface{}{}
+		if path, ok := m["path"].(string); ok && path != "" {
+			grpcSettings["serviceName"] = path
+		}
+		stream["grpcSettings"] = grpcSettings
+	case "http", "h2":
+		stream["network"] = "http"
+		httpSettings := map[string]interface{}{}
+		if path, ok := m["path"].(string); ok && path != "" {
+			httpSettings["path"] = path
+		}
+		if host, ok := m["host"].(string); ok && host != "" {
+			httpSettings["host"] = strings.Split(host, ",")
+		}
+		stream["httpSettings"] = httpSettings
 	}
+
 	if tls == "tls" {
-		stream["tlsSettings"] = map[string]interface{}{
-			"serverName":  m["sni"],
-			"fingerprint": m["fp"],
+		tlsSettings := map[string]interface{}{}
+		if sni, ok := m["sni"].(string); ok && sni != "" {
+			tlsSettings["serverName"] = sni
 		}
+		if fp, ok := m["fp"].(string); ok && fp != "" {
+			tlsSettings["fingerprint"] = fp
+		}
+		stream["tlsSettings"] = tlsSettings
+	}
+
+	scy, _ := m["scy"].(string)
+	if scy == "" {
+		scy = "auto"
 	}
 
 	outbound := map[string]interface{}{
@@ -229,7 +356,7 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 						{
 							"id":       id,
 							"alterId":  aid,
-							"security": "auto",
+							"security": scy,
 						},
 					},
 				},
@@ -241,7 +368,11 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 
 	cfgBytes, _ := json.Marshal(outbound)
 	if name == "" {
-		name = server
+		if ps, ok := m["ps"].(string); ok && ps != "" {
+			name = ps
+		} else {
+			name = server
+		}
 	}
 	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
 }

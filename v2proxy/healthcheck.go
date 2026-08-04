@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -16,47 +15,29 @@ type HealthResult struct {
 	Error   error
 }
 
-var (
-	transportCacheMu sync.Mutex
-	transportCache   = make(map[string]*http.Transport)
-)
+var fallbackHealthURLs = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://cp.cloudflare.com",
+	"http://api.ipify.org",
+}
 
-func getCachedTransport(proxyAddr string) (*http.Transport, error) {
-	transportCacheMu.Lock()
-	defer transportCacheMu.Unlock()
-
-	if t, ok := transportCache[proxyAddr]; ok {
-		return t, nil
-	}
-
+func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResult {
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
-		return nil, err
+		return HealthResult{Error: err}
 	}
 
-	t := &http.Transport{
+	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		},
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-		MaxIdleConns:          2,
-		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		MaxIdleConns:          1,
+		IdleConnTimeout:       5 * time.Second,
 		DisableKeepAlives:     true,
 	}
-
-	transportCache[proxyAddr] = t
-	return t, nil
-}
-
-func TestProxyHealth(proxyAddr string, testURL string, timeout time.Duration) HealthResult {
-	result := HealthResult{}
-
-	transport, err := getCachedTransport(proxyAddr)
-	if err != nil {
-		result.Error = err
-		return result
-	}
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: transport,
@@ -68,13 +49,39 @@ func TestProxyHealth(proxyAddr string, testURL string, timeout time.Duration) He
 	latency := time.Since(start)
 
 	if err != nil {
-		result.Error = err
-		result.Latency = latency
-		return result
+		return HealthResult{Error: err, Latency: latency}
 	}
 	resp.Body.Close()
 
-	result.Working = true
-	result.Latency = latency
-	return result
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return HealthResult{Working: true, Latency: latency}
+	}
+
+	return HealthResult{Working: false, Latency: latency}
+}
+
+func TestProxyHealth(proxyAddr string, primaryURL string, timeout time.Duration) HealthResult {
+	// 1. Try primary URL
+	urlsToTry := []string{}
+	if primaryURL != "" {
+		urlsToTry = append(urlsToTry, primaryURL)
+	}
+
+	// Add fallbacks if not already present
+	for _, fb := range fallbackHealthURLs {
+		if fb != primaryURL {
+			urlsToTry = append(urlsToTry, fb)
+		}
+	}
+
+	var lastRes HealthResult
+	for _, url := range urlsToTry {
+		res := testSingleURL(proxyAddr, url, timeout)
+		if res.Working {
+			return res
+		}
+		lastRes = res
+	}
+
+	return lastRes
 }
