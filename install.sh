@@ -213,7 +213,7 @@ if [ "$DOCKER_MODE" = true ]; then
                 echo ""
                 echo -e "${CYAN}Configure additional settings (press Enter to keep defaults):${NC}"
 
-                health_url="http://api.ipify.org"
+                health_url="https://www.gstatic.com/generate_204"
                 read -r -p "  Health check URL [$health_url]: " input; health_url=${input:-$health_url}
                 sed -i "s|^HEALTH_CHECK_URL=.*|HEALTH_CHECK_URL=$health_url|" "$DIR/.env"
 
@@ -295,7 +295,7 @@ else
         ok "Subscription saved"
     fi
 
-    health_url="http://api.ipify.org"
+    health_url="https://www.gstatic.com/generate_204"
     echo "Health check URL (default: $health_url):"
     read -r -p "URL: " input; health_url=${input:-$health_url}
 
