@@ -29,14 +29,18 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-cache")
 		proxies := manager.GetAliveStatuses()
-		json.NewEncoder(w).Encode(proxies)
+		if err := json.NewEncoder(w).Encode(proxies); err != nil {
+			log.Printf("encode /proxies failed: %v", err)
+		}
 	})
 
 	mux.HandleFunc("/all", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-cache")
 		statuses := manager.GetStatuses()
-		json.NewEncoder(w).Encode(statuses)
+		if err := json.NewEncoder(w).Encode(statuses); err != nil {
+			log.Printf("encode /all failed: %v", err)
+		}
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -47,11 +51,13 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		if alive == 0 {
 			status = "degraded"
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":    status,
 			"instances": total,
 			"alive":     alive,
-		})
+		}); err != nil {
+			log.Printf("encode /health failed: %v", err)
+		}
 	})
 
 	mux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +67,9 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		}
 		go manager.RefreshSubscriptions()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "refreshing"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "refreshing"}); err != nil {
+			log.Printf("encode /refresh failed: %v", err)
+		}
 	})
 
 	server := &http.Server{

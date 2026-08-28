@@ -33,7 +33,6 @@ type ProxyManager struct {
 	xrayDir       string
 	testURL       string
 	portBase      int
-	apiPort       int
 	checkInterval time.Duration
 }
 
@@ -99,6 +98,26 @@ func findAvailablePorts(start int) (socksPort, httpPort int, err error) {
 	return 0, 0, fmt.Errorf("no available port pair found starting from %d", start)
 }
 
+func fetchWithRetry(subURL string) ([]ProxyConfig, error) {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		cfgs, err := FetchSubscription(subURL)
+		if err == nil && len(cfgs) > 0 {
+			return cfgs, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("empty subscription (0 proxies)")
+		}
+		log.Printf("Fetch retry %d/4 for %s: %v", attempt+1, subURL, lastErr)
+	}
+	return nil, lastErr
+}
+
 func (m *ProxyManager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -108,7 +127,7 @@ func (m *ProxyManager) Start() error {
 	}
 
 	for i, inst := range m.instances {
-		configs, err := FetchSubscription(m.subURLs[i%len(m.subURLs)])
+		configs, err := fetchWithRetry(m.subURLs[i%len(m.subURLs)])
 		if err != nil {
 			log.Printf("Instance %d: subscription fetch failed: %v", i, err)
 			m.statuses[i].Status = "down"
@@ -194,10 +213,13 @@ func (m *ProxyManager) RefreshSubscriptions() {
 			log.Printf("Instance %d: refresh failed: %v", i, err)
 			continue
 		}
+		if len(configs) == 0 {
+			log.Printf("Instance %d: refresh got 0 configs, keeping old", i)
+			continue
+		}
 		log.Printf("Instance %d: refreshed %d configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
-		// If current instance is marked down or activeIndex is invalid, attempt to start
 		if m.statuses[i].Status != "ok" {
 			if err := inst.StartWithBest(); err == nil {
 				cfg := inst.ActiveConfig()

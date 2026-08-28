@@ -111,7 +111,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	r.Header.Del("Proxy-Connection")
 	r.Header.Del("Proxy-Authorization")
@@ -135,10 +135,14 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("copy response body failed: %v", err)
+	}
 
 	if reader.Buffered() > 0 {
-		io.Copy(w, reader)
+		if _, err := io.Copy(w, reader); err != nil {
+			log.Printf("copy buffered failed: %v", err)
+		}
 	}
 }
 
@@ -165,30 +169,35 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		destConn.Close()
+		_ = destConn.Close()
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		destConn.Close()
+		_ = destConn.Close()
 		return
 	}
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		_ = destConn.Close()
+		_ = clientConn.Close()
+		log.Printf("hijack write failed: %v", err)
+		return
+	}
 
 	go relay(destConn, clientConn)
 	go relay(clientConn, destConn)
 }
 
 func relay(dst, src net.Conn) {
-	defer dst.Close()
-	defer src.Close()
+	defer func() { _ = dst.Close() }()
+	defer func() { _ = src.Close() }()
 
 	deadline := time.Now().Add(5 * time.Minute)
-	dst.SetDeadline(deadline)
-	src.SetDeadline(deadline)
+	_ = dst.SetDeadline(deadline)
+	_ = src.SetDeadline(deadline)
 
 	bufp := relayBufPool.Get().(*[]byte)
 	defer relayBufPool.Put(bufp)

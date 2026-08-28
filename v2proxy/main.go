@@ -81,12 +81,18 @@ func main() {
 
 	if len(subURLs) == 0 || subURLs[0] == "" {
 		fmt.Print("Enter subscription URL: ")
-		fmt.Scanln(&subURL)
+		if _, err := fmt.Scanln(&subURL); err != nil {
+			log.Printf("scan failed: %v", err)
+		}
 		if subURL == "" {
 			log.Fatal("Subscription URL is required")
 		}
-		os.MkdirAll("/root/config", 0755)
-		os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644)
+		if err := os.MkdirAll("/root/config", 0755); err != nil {
+			log.Fatalf("mkdir failed: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644); err != nil {
+			log.Fatalf("write subscription failed: %v", err)
+		}
 		subURLs = []string{subURL}
 	}
 

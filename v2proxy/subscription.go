@@ -18,25 +18,96 @@ type ProxyConfig struct {
 	XrayCfg json.RawMessage
 }
 
+func subscriptionCandidates(raw string) []string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return []string{raw}
+	}
+	host := strings.ToLower(u.Hostname())
+	isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "0.0.0.0"
+	if !isLoopback {
+		return []string{raw}
+	}
+	seen := map[string]bool{raw: true}
+	var out []string
+	out = append(out, raw)
+	add := func(h string) {
+		uu := *u
+		uu.Host = h
+		if p := u.Port(); p != "" {
+			uu.Host = h + ":" + p
+		}
+		s := uu.String()
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add("host.docker.internal")
+	add("172.17.0.1")
+	add("172.18.0.1")
+	add("10.0.2.2")
+	return out
+}
+
+func fetchOneURL(client *http.Client, subURL string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(500*(1<<attempt)) * time.Millisecond)
+		}
+		req, _ := http.NewRequest("GET", subURL, nil)
+		req.Header.Set("User-Agent", "V2ProDock/1.0")
+		req.Header.Set("Accept", "text/plain,*/*")
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("http %d", resp.StatusCode)
+			continue
+		}
+		if len(strings.TrimSpace(string(body))) == 0 {
+			lastErr = fmt.Errorf("empty response (http %d)", resp.StatusCode)
+			continue
+		}
+		return string(body), nil
+	}
+	return "", lastErr
+}
+
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			Proxy: nil, // Do not route subscription fetches through ambient HTTP_PROXY
+			Proxy: nil,
 		},
 	}
-	resp, err := client.Get(subURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch subscription: %w", err)
+	var lastErr error
+	var content string
+	for _, cand := range subscriptionCandidates(subURL) {
+		body, err := fetchOneURL(client, cand)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		content = strings.TrimSpace(body)
+		lastErr = nil
+		if cand != subURL {
+			subURL = cand
+		}
+		break
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to fetch subscription %s (tried %v): %w — hint: inside Docker 127.0.0.1 is the container itself, use host.docker.internal or host LAN IP", subURL, subscriptionCandidates(subURL), lastErr)
 	}
-
-	content := strings.TrimSpace(string(body))
 
 	// Clean up content: strip trailing/leading whitespace and carriage returns
 	content = strings.ReplaceAll(content, "\r", "")
@@ -456,13 +527,13 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 
 	// Xray-supported Shadowsocks ciphers (AEAD only — stream ciphers removed in Xray 26+)
 	supportedSS := map[string]bool{
-		"aes-128-gcm":                  true,
-		"aes-256-gcm":                  true,
-		"chacha20-poly1305":            true,
-		"chacha20-ietf-poly1305":       true,
-		"xchacha20-ietf-poly1305":      true,
-		"2022-blake3-aes-128-gcm":      true,
-		"2022-blake3-aes-256-gcm":      true,
+		"aes-128-gcm":                   true,
+		"aes-256-gcm":                   true,
+		"chacha20-poly1305":             true,
+		"chacha20-ietf-poly1305":        true,
+		"xchacha20-ietf-poly1305":       true,
+		"2022-blake3-aes-128-gcm":       true,
+		"2022-blake3-aes-256-gcm":       true,
 		"2022-blake3-chacha20-poly1305": true,
 	}
 	if !supportedSS[method] {

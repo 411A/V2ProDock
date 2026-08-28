@@ -27,7 +27,9 @@ func EnsureXray(xrayDir string) error {
 }
 
 func downloadXray(xrayDir, xrayBin string) error {
-	os.MkdirAll(xrayDir, 0755)
+	if err := os.MkdirAll(xrayDir, 0755); err != nil {
+		return fmt.Errorf("mkdir failed: %w", err)
+	}
 
 	arch := runtime.GOARCH
 	osName := runtime.GOOS
@@ -84,10 +86,12 @@ func downloadXray(xrayDir, xrayBin string) error {
 	if err := extractZip(tmpFile, xrayDir); err != nil {
 		return fmt.Errorf("extract failed: %w", err)
 	}
-	os.Remove(tmpFile)
+	_ = os.Remove(tmpFile)
 
 	if runtime.GOOS != "windows" {
-		os.Chmod(xrayBin, 0755)
+		if err := os.Chmod(xrayBin, 0755); err != nil {
+			return fmt.Errorf("chmod failed: %w", err)
+		}
 	}
 
 	if _, err := os.Stat(xrayBin); err != nil {
