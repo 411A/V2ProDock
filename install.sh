@@ -87,29 +87,57 @@ fi
 # Always resolve DIR after possible cd
 DIR="$(pwd)"
 
-# Detect WSL2 and get Windows host IP
+get_host_gateway_ip() {
+    local ip
+    ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+    ip=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+}
+
 get_wsl_host_ip() {
     if grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null; then
-        # Use default gateway — always the Windows host in WSL2
-        local ip
-        ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
-        if [ -n "$ip" ]; then
-            echo "$ip"
+        get_host_gateway_ip
+    fi
+}
+
+fix_wsl_url() {
+    local url="$1"
+    if [[ "$url" == *"host.docker.internal"* ]] || [[ "$url" == *"127.0.0.1"* ]] || [[ "$url" == *"localhost"* ]]; then
+        local gw
+        gw=$(get_wsl_host_ip)
+        if [ -n "$gw" ]; then
+            echo "$url" | sed "s|host.docker.internal|$gw|g; s|127\.0\.0\.1|$gw|g; s|localhost|$gw|g"
             return
+        fi
+    fi
+    echo "$url"
+}
+
+check_subscription_reachable() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        if ! curl -sf --max-time 5 "$url" >/dev/null 2>&1; then
+            echo -e "${RED}[WARN] Cannot reach $url from host${NC}"
+            echo "  Inside Docker 127.0.0.1 = container, not host. Use:"
+            echo "    http://host.docker.internal:27141/subscription  (compose has host-gateway)"
+            echo "    http://$(hostname -I 2>/dev/null | awk '{print $1}'):27141/subscription  (LAN IP)"
+            local gw; gw=$(get_host_gateway_ip)
+            [ -n "$gw" ] && echo "    http://$gw:27141/subscription  (gateway IP)"
         fi
     fi
 }
 
-# Fix subscription URL for WSL2 (host.docker.internal doesn't reach Windows host)
-fix_wsl_url() {
+fix_vm_url() {
     local url="$1"
-    if [[ "$url" == *"host.docker.internal"* ]] || [[ "$url" == *"127.0.0.1"* ]]; then
-        local win_ip
-        win_ip=$(get_wsl_host_ip)
-        if [ -n "$win_ip" ]; then
-            local fixed
-            fixed=$(echo "$url" | sed "s|host.docker.internal|$win_ip|g; s|127.0.0.1|$win_ip|g")
-            echo "$fixed"
+    if [[ "$url" == *"127.0.0.1"* ]] || [[ "$url" == *"localhost"* ]]; then
+        if docker info 2>/dev/null | grep -q "host-gateway"; then
+            echo "$url" | sed "s|127\.0\.0\.1|host.docker.internal|g; s|localhost|host.docker.internal|g"
+            return
+        fi
+        local gw; gw=$(get_host_gateway_ip)
+        if [ -n "$gw" ]; then
+            echo "$url" | sed "s|127\.0\.0\.1|$gw|g; s|localhost|$gw|g"
             return
         fi
     fi
@@ -182,16 +210,19 @@ if [ "$DOCKER_MODE" = true ]; then
             # Install / update mode
             mkdir -p "$DIR/config"
 
-            # Get subscription URL from any available source
             sub_url=$(read_sub_url)
-
-            # Auto-fix WSL2 networking: replace host.docker.internal with Windows host IP
             fixed_url=$(fix_wsl_url "$sub_url")
             if [ "$fixed_url" != "$sub_url" ]; then
-                win_ip=$(get_wsl_host_ip)
-                ok "WSL2 detected — replacing host.docker.internal with $win_ip"
+                ok "WSL2 detected — rewriting $sub_url -> $fixed_url"
                 sub_url="$fixed_url"
+            else
+                vm_fixed=$(fix_vm_url "$sub_url")
+                if [ "$vm_fixed" != "$sub_url" ]; then
+                    ok "VM/Docker detected — rewriting 127.0.0.1 -> $vm_fixed (use LAN IP for production)"
+                    sub_url="$vm_fixed"
+                fi
             fi
+            [ -n "$sub_url" ] && check_subscription_reachable "$sub_url"
 
             if [ -n "$sub_url" ]; then
                 ok "Found subscription: $sub_url"
@@ -224,10 +255,17 @@ if [ "$DOCKER_MODE" = true ]; then
                 echo "  Edit $DIR/.env to customize further."
             else
                 ok ".env exists, skipping"
-                # Fix WSL2 URL in existing .env
-                if [ "$fixed_url" != "$(read_sub_url)" ]; then
-                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$fixed_url|" "$DIR/.env"
-                    ok "Updated SUBSCRIPTION_URL in .env for WSL2"
+                cur_url=$(read_sub_url)
+                vm_fixed2=$(fix_vm_url "$cur_url")
+                wsl_fixed2=$(fix_wsl_url "$cur_url")
+                if [ "$wsl_fixed2" != "$cur_url" ]; then
+                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$wsl_fixed2|" "$DIR/.env"
+                    ok "Updated SUBSCRIPTION_URL in .env for WSL2 -> $wsl_fixed2"
+                elif [ "$vm_fixed2" != "$cur_url" ]; then
+                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$vm_fixed2|" "$DIR/.env"
+                    ok "Updated SUBSCRIPTION_URL in .env for VM/Docker -> $vm_fixed2"
+                elif [[ "$cur_url" == *"127.0.0.1"* ]] || [[ "$cur_url" == *"localhost"* ]]; then
+                    echo -e "${RED}[WARN] .env still uses $cur_url — inside Docker this fails. Use host.docker.internal or LAN IP${NC}"
                 fi
             fi
 

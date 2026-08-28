@@ -29,7 +29,9 @@ type ProxySelector struct {
 }
 
 func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
-	os.MkdirAll(xrayDir, 0755)
+	if err := os.MkdirAll(xrayDir, 0755); err != nil {
+		log.Printf("mkdir %s failed: %v", xrayDir, err)
+	}
 	return &ProxySelector{
 		xrayDir:       xrayDir,
 		testURL:       testURL,
@@ -278,16 +280,16 @@ func (s *ProxySelector) stopXray() {
 
 func (s *ProxySelector) stopXrayCmd(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Signal(os.Interrupt)
+		_ = cmd.Process.Signal(os.Interrupt)
 		done := make(chan struct{})
 		go func() {
-			cmd.Wait()
+			_ = cmd.Wait()
 			close(done)
 		}()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 			<-done
 		}
 		waitForPortFree(s.socksPort, 3*time.Second)
