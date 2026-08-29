@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"sort"
 	"sync"
@@ -131,9 +130,18 @@ func dedupConfigs(in []ProxyConfig) []ProxyConfig {
 	return out
 }
 
-func shuffleConfigs(in []ProxyConfig, seed int64) {
-	r := rand.New(rand.NewSource(seed))
-	r.Shuffle(len(in), func(a, b int) { in[a], in[b] = in[b], in[a] })
+func rotateConfigs(in []ProxyConfig, offset int) {
+	if len(in) <= 1 || offset == 0 {
+		return
+	}
+	offset %= len(in)
+	if offset < 0 {
+		offset += len(in)
+	}
+	tmp := make([]ProxyConfig, len(in))
+	copy(tmp, in)
+	copy(in, tmp[offset:])
+	copy(in[len(in)-offset:], tmp[:offset])
 }
 
 func (m *ProxyManager) Start() error {
@@ -154,17 +162,19 @@ func (m *ProxyManager) Start() error {
 			continue
 		}
 		configs = dedupConfigs(configs)
-		shuffleConfigs(configs, int64(i+1)*9973+int64(time.Now().UnixNano()%1000))
+		rotateConfigs(configs, i*3)
 		rawLists[i] = configs
 		log.Printf("Instance %d: parsed %d unique configs", i, len(configs))
 		m.instances[i].UpdateConfigs(configs)
 	}
 
+	log.Printf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(m.instances))
 	used := make(map[string]int)
 	for i, inst := range m.instances {
 		if rawLists[i] == nil {
 			continue
 		}
+		log.Printf("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
 		if err := inst.StartWithBestExcluding(used); err != nil {
 			log.Printf("Instance %d: no working unique config: %v", i, err)
 			m.statuses[i].Status = "down"
@@ -254,7 +264,7 @@ func (m *ProxyManager) RefreshSubscriptions() {
 			continue
 		}
 		configs = dedupConfigs(configs)
-		shuffleConfigs(configs, int64(i+1)*9973+int64(time.Now().UnixNano()%1000))
+		rotateConfigs(configs, i*3)
 		log.Printf("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
