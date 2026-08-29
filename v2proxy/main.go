@@ -26,7 +26,11 @@ func main() {
 		}
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	if isDebug() {
+		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	} else {
+		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	}
 	log.Println("Starting V2Ray Proxy...")
 
 	xrayDir := "/root/xray"
@@ -122,7 +126,7 @@ func main() {
 	// Print summary
 	for _, s := range manager.GetStatuses() {
 		log.Printf("Instance %d: %s | SOCKS5=%s HTTP=%s | status=%s latency=%dms",
-			s.Index, s.Name, s.SOCKS, s.HTTP, s.Status, s.LatMs)
+			s.Index, shortName(s.Name), s.SOCKS, s.HTTP, s.Status, s.LatMs)
 	}
 
 	go subscriptionLoop(manager)
