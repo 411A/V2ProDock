@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -30,7 +31,7 @@ type ProxySelector struct {
 
 func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
 	if err := os.MkdirAll(xrayDir, 0755); err != nil {
-		log.Printf("mkdir %s failed: %v", xrayDir, err)
+		debugLog("mkdir %s failed: %v", xrayDir, err)
 	}
 	return &ProxySelector{
 		xrayDir:       xrayDir,
@@ -169,7 +170,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	}
 
 	if oldIndex >= 0 && oldIndex < len(s.configs) {
-		log.Printf("All alternative configs failed. Attempting to restore original config %s", s.configs[oldIndex].Name)
+		debugLog("All alternative configs failed. Attempting to restore original config %s", s.configs[oldIndex].Name)
 		if err := s.startXray(oldIndex); err == nil {
 			s.activeIndex = oldIndex
 			s.failCount = 0
@@ -208,9 +209,13 @@ func (s *ProxySelector) startXray(index int) error {
 
 	cfg := s.configs[index]
 
+	logLevel := "none"
+	if isDebug() {
+		logLevel = "warning"
+	}
 	fullConfig := map[string]interface{}{
 		"log": map[string]interface{}{
-			"loglevel": "warning",
+			"loglevel": logLevel,
 		},
 		"dns": map[string]interface{}{
 			"servers": []string{
@@ -269,8 +274,13 @@ func (s *ProxySelector) startXray(index int) error {
 
 	xrayBin := filepath.Join(s.xrayDir, "xray")
 	s.xrayCmd = exec.Command(xrayBin, "run", "-c", cfgPath)
-	s.xrayCmd.Stdout = os.Stdout
-	s.xrayCmd.Stderr = os.Stderr
+	if isDebug() {
+		s.xrayCmd.Stdout = os.Stdout
+		s.xrayCmd.Stderr = os.Stderr
+	} else {
+		s.xrayCmd.Stdout = io.Discard
+		s.xrayCmd.Stderr = io.Discard
+	}
 
 	if err := s.xrayCmd.Start(); err != nil {
 		return fmt.Errorf("start failed: %w", err)

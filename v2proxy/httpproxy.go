@@ -81,7 +81,7 @@ func startHTTPProxy(addr, socksAddr string) {
 	}
 
 	go func() {
-		log.Printf("HTTP proxy on %s (via %s)", addr, socksAddr)
+		debugLog("HTTP proxy on %s (via %s)", addr, socksAddr)
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP proxy error: %v", err)
 		}

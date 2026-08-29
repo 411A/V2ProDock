@@ -73,7 +73,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 			Status: "starting",
 		}
 
-		log.Printf("Instance %d: SOCKS5=:%d HTTP=:%d", i, socksPort, httpPort)
+		debugLog("Instance %d: SOCKS5=:%d HTTP=:%d", i, socksPort, httpPort)
 	}
 
 	return m
@@ -113,7 +113,7 @@ func fetchWithRetry(subURL string) ([]ProxyConfig, error) {
 		} else {
 			lastErr = fmt.Errorf("empty subscription (0 proxies)")
 		}
-		log.Printf("Fetch retry %d/4 for %s: %v", attempt+1, subURL, lastErr)
+		debugLog("Fetch retry %d/4 for %s: %v", attempt+1, subURL, lastErr)
 	}
 	return nil, lastErr
 }
@@ -164,7 +164,7 @@ func (m *ProxyManager) Start() error {
 		configs = dedupConfigs(configs)
 		rotateConfigs(configs, i*3)
 		rawLists[i] = configs
-		log.Printf("Instance %d: parsed %d unique configs", i, len(configs))
+		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
 		m.instances[i].UpdateConfigs(configs)
 	}
 
@@ -174,7 +174,7 @@ func (m *ProxyManager) Start() error {
 		if rawLists[i] == nil {
 			continue
 		}
-		log.Printf("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
+		debugLog("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
 		if err := inst.StartWithBestExcluding(used); err != nil {
 			log.Printf("Instance %d: no working unique config: %v", i, err)
 			m.statuses[i].Status = "down"
@@ -260,12 +260,12 @@ func (m *ProxyManager) RefreshSubscriptions() {
 			continue
 		}
 		if len(configs) == 0 {
-			log.Printf("Instance %d: refresh got 0 configs, keeping old", i)
+			debugLog("Instance %d: refresh got 0 configs, keeping old", i)
 			continue
 		}
 		configs = dedupConfigs(configs)
 		rotateConfigs(configs, i*3)
-		log.Printf("Instance %d: refreshed %d unique configs", i, len(configs))
+		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
 		if m.statuses[i].Status != "ok" {

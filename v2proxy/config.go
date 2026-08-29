@@ -19,7 +19,7 @@ func EnsureXray(xrayDir string) error {
 	}
 
 	if _, err := os.Stat(xrayBin); err == nil {
-		log.Printf("Xray ready at %s", xrayBin)
+		debugLog("Xray ready at %s", xrayBin)
 		return nil
 	}
 
