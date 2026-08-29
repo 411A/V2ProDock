@@ -279,7 +279,7 @@ else
     # Direct install mode (no Docker)
     if ! command -v go &>/dev/null; then
         echo "Installing Go..."
-        curl -sL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
+        curl -sL https://go.dev/dl/go1.25.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
         echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
         export PATH=$PATH:/usr/local/go/bin
         ok "Go installed"
