@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -84,7 +83,7 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
 				s.failCount = 0
-				log.Printf("Ready: %s [%dms]", shortName(s.configs[i].Name), result.Latency.Milliseconds())
+				readyLog(s.configs[i].Name, result.Latency.Milliseconds())
 				return nil
 			}
 		}
@@ -111,7 +110,7 @@ func (s *ProxySelector) HealthCheck() bool {
 	}
 
 	s.failCount++
-	log.Printf("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
+	warnLog("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
 
 	if s.failCount < 3 {
 		// Consider still healthy until threshold is met
@@ -162,7 +161,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
 				s.failCount = 0
-				log.Printf("Switched: %s [%dms]", shortName(s.configs[i].Name), result.Latency.Milliseconds())
+				switchedLog(s.configs[i].Name, result.Latency.Milliseconds())
 				return nil
 			}
 		}

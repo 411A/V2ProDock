@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"time"
@@ -30,7 +29,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Cache-Control", "no-cache")
 		proxies := manager.GetAliveStatuses()
 		if err := json.NewEncoder(w).Encode(proxies); err != nil {
-			log.Printf("encode /proxies failed: %v", err)
+			debugLog("encode /proxies failed: %v", err)
 		}
 	})
 
@@ -39,7 +38,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Cache-Control", "no-cache")
 		statuses := manager.GetStatuses()
 		if err := json.NewEncoder(w).Encode(statuses); err != nil {
-			log.Printf("encode /all failed: %v", err)
+			debugLog("encode /all failed: %v", err)
 		}
 	})
 
@@ -56,7 +55,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"instances": total,
 			"alive":     alive,
 		}); err != nil {
-			log.Printf("encode /health failed: %v", err)
+			debugLog("encode /health failed: %v", err)
 		}
 	})
 
@@ -68,7 +67,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		go manager.RefreshSubscriptions()
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "refreshing"}); err != nil {
-			log.Printf("encode /refresh failed: %v", err)
+			debugLog("encode /refresh failed: %v", err)
 		}
 	})
 
@@ -85,7 +84,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 	go func() {
 		debugLog("API server on :%d", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("API server error: %v", err)
+			errLog("API server error: %v", err)
 		}
 	}()
 
