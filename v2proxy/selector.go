@@ -57,6 +57,10 @@ func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
 }
 
 func (s *ProxySelector) StartWithBest() error {
+	return s.StartWithBestExcluding(nil)
+}
+
+func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -65,6 +69,11 @@ func (s *ProxySelector) StartWithBest() error {
 	}
 
 	for i := range s.configs {
+		if exclude != nil {
+			if _, ok := exclude[s.configs[i].Raw]; ok {
+				continue
+			}
+		}
 		if err := s.startXray(i); err != nil {
 			continue
 		}
@@ -112,6 +121,10 @@ func (s *ProxySelector) HealthCheck() bool {
 }
 
 func (s *ProxySelector) SwitchToNext() error {
+	return s.SwitchToNextExcluding(nil)
+}
+
+func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -131,11 +144,11 @@ func (s *ProxySelector) SwitchToNext() error {
 		if i < 0 || i >= len(s.configs) {
 			continue
 		}
-
-		// Try starting candidate xray on candidate port or temporarily test it
-		// In order to avoid port conflict with running xray, if we are keeping oldCmd running,
-		// we must test candidate. But s.socksPort is the port that clients connect to.
-		// So we stop the old process only when testing candidate, but if candidate fails, we can fallback or quickly try next.
+		if exclude != nil {
+			if _, ok := exclude[s.configs[i].Raw]; ok {
+				continue
+			}
+		}
 		s.stopXrayCmd(oldCmd)
 		oldCmd = nil
 
@@ -155,7 +168,6 @@ func (s *ProxySelector) SwitchToNext() error {
 		s.stopXray()
 	}
 
-	// If no replacement worked, try restarting original config as fallback if possible
 	if oldIndex >= 0 && oldIndex < len(s.configs) {
 		log.Printf("All alternative configs failed. Attempting to restore original config %s", s.configs[oldIndex].Name)
 		if err := s.startXray(oldIndex); err == nil {
