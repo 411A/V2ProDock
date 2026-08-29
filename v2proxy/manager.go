@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"sync"
@@ -58,7 +57,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 			var err error
 			socksPort, httpPort, err = findAvailablePorts(portBase + i*2)
 			if err != nil {
-				log.Printf("Instance %d: no available ports starting from %d: %v", i, portBase+i*2, err)
+				errLog("Instance %d: no available ports starting from %d: %v", i, portBase+i*2, err)
 				continue
 			}
 		}
@@ -156,7 +155,7 @@ func (m *ProxyManager) Start() error {
 	for i := range m.instances {
 		configs, err := fetchWithRetry(m.subURLs[i%len(m.subURLs)])
 		if err != nil {
-			log.Printf("Instance %d: subscription fetch failed: %v", i, err)
+			errLog("Instance %d: subscription fetch failed: %v", i, err)
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = err.Error()
 			continue
@@ -168,7 +167,7 @@ func (m *ProxyManager) Start() error {
 		m.instances[i].UpdateConfigs(configs)
 	}
 
-	log.Printf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(m.instances))
+	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(m.instances)))
 	used := make(map[string]int)
 	for i, inst := range m.instances {
 		if rawLists[i] == nil {
@@ -176,7 +175,7 @@ func (m *ProxyManager) Start() error {
 		}
 		debugLog("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
 		if err := inst.StartWithBestExcluding(used); err != nil {
-			log.Printf("Instance %d: no working unique config: %v", i, err)
+			errLog("Instance %d: no working unique config: %v", i, err)
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = err.Error()
 			continue
@@ -222,7 +221,7 @@ func (m *ProxyManager) HealthCheckAll() {
 		} else {
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = "health check failed"
-			log.Printf("Instance %d: proxy failed, switching...", i)
+			warnLog("Instance %d: proxy failed, switching...", i)
 			used := make(map[string]int)
 			for j, o := range m.instances {
 				if j == i {
@@ -233,7 +232,7 @@ func (m *ProxyManager) HealthCheckAll() {
 				}
 			}
 			if err := inst.SwitchToNextExcluding(used); err != nil {
-				log.Printf("Instance %d: switch failed: %v", i, err)
+				errLog("Instance %d: switch failed: %v", i, err)
 				m.statuses[i].Error = err.Error()
 			} else {
 				cfg := inst.ActiveConfig()
@@ -256,7 +255,7 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	for i, inst := range m.instances {
 		configs, err := FetchSubscription(m.subURLs[i%len(m.subURLs)])
 		if err != nil {
-			log.Printf("Instance %d: refresh failed: %v", i, err)
+			warnLog("Instance %d: refresh failed: %v", i, err)
 			continue
 		}
 		if len(configs) == 0 {

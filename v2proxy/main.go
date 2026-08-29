@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,12 +25,7 @@ func main() {
 		}
 	}
 
-	if isDebug() {
-		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
-	} else {
-		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	}
-	log.Println("Starting V2Ray Proxy...")
+	bannerLog("▸ Starting V2Ray Proxy...")
 
 	xrayDir := "/root/xray"
 	testURL := "http://httpbin.org/ip"
@@ -86,29 +80,34 @@ func main() {
 	if len(subURLs) == 0 || subURLs[0] == "" {
 		fmt.Print("Enter subscription URL: ")
 		if _, err := fmt.Scanln(&subURL); err != nil {
-			log.Printf("scan failed: %v", err)
+			errLog("scan failed: %v", err)
 		}
 		if subURL == "" {
-			log.Fatal("Subscription URL is required")
+			errLog("Subscription URL is required")
+			os.Exit(1)
 		}
 		if err := os.MkdirAll("/root/config", 0755); err != nil {
-			log.Fatalf("mkdir failed: %v", err)
+			errLog("mkdir failed: %v", err)
+			os.Exit(1)
 		}
 		if err := os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644); err != nil {
-			log.Fatalf("write subscription failed: %v", err)
+			errLog("write subscription failed: %v", err)
+			os.Exit(1)
 		}
 		subURLs = []string{subURL}
 	}
 
 	if err := EnsureXray(xrayDir); err != nil {
-		log.Fatalf("Xray setup failed: %v", err)
+		errLog("Xray setup failed: %v", err)
+		os.Exit(1)
 	}
 
 	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, 60*time.Second)
 
 	debugLog("Starting %d instance(s)...", manager.InstanceCount())
 	if err := manager.Start(); err != nil {
-		log.Fatalf("Manager start failed: %v", err)
+		errLog("Manager start failed: %v", err)
+		os.Exit(1)
 	}
 
 	// Start HTTP proxy for each instance (SOCKS5 -> HTTP bridge)
@@ -121,13 +120,9 @@ func main() {
 
 	// Start API server
 	apiActualPort := startAPI(manager, apiPort)
-	log.Printf("API available at http://0.0.0.0:%d/proxies", apiActualPort)
+	infoLog("API available at http://0.0.0.0:%d/proxies", apiActualPort)
 
-	// Print summary
-	for _, s := range manager.GetStatuses() {
-		log.Printf("Instance %d: %s | SOCKS5=%s HTTP=%s | status=%s latency=%dms",
-			s.Index, shortName(s.Name), s.SOCKS, s.HTTP, s.Status, s.LatMs)
-	}
+	printSummaryTable(manager.GetStatuses())
 
 	go subscriptionLoop(manager)
 	go healthCheckLoop(manager)
@@ -136,7 +131,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Shutting down...")
+	infoLog("Shutting down...")
 	manager.Stop()
 }
 

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -59,7 +58,7 @@ func downloadXray(xrayDir, xrayBin string) error {
 	}
 
 	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/latest/download/Xray-%s-%s.zip", osName2, archName)
-	log.Printf("Downloading xray: %s", url)
+	infoLog("Downloading xray: %s", url)
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -98,7 +97,7 @@ func downloadXray(xrayDir, xrayBin string) error {
 		return fmt.Errorf("xray binary not found after extraction at %s", xrayBin)
 	}
 
-	log.Printf("Xray installed: %s", xrayBin)
+	infoLog("Xray installed: %s", xrayBin)
 	return nil
 }
 

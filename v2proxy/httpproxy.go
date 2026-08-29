@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -56,7 +55,7 @@ func startHTTPProxy(addr, socksAddr string) {
 
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
-		log.Printf("HTTP proxy dialer failed: %v", err)
+		errLog("HTTP proxy dialer failed: %v", err)
 		return
 	}
 
@@ -76,14 +75,14 @@ func startHTTPProxy(addr, socksAddr string) {
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("HTTP proxy bind failed on %s: %v", addr, err)
+		errLog("HTTP proxy bind failed on %s: %v", addr, err)
 		return
 	}
 
 	go func() {
 		debugLog("HTTP proxy on %s (via %s)", addr, socksAddr)
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("HTTP proxy error: %v", err)
+			errLog("HTTP proxy error: %v", err)
 		}
 	}()
 }
@@ -136,12 +135,12 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("copy response body failed: %v", err)
+		debugLog("copy response body failed: %v", err)
 	}
 
 	if reader.Buffered() > 0 {
 		if _, err := io.Copy(w, reader); err != nil {
-			log.Printf("copy buffered failed: %v", err)
+			debugLog("copy buffered failed: %v", err)
 		}
 	}
 }
@@ -183,7 +182,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		_ = destConn.Close()
 		_ = clientConn.Close()
-		log.Printf("hijack write failed: %v", err)
+		debugLog("hijack write failed: %v", err)
 		return
 	}
 
