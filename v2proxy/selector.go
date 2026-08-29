@@ -84,7 +84,7 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
 				s.failCount = 0
-				log.Printf("Using: %s (latency: %v)", s.configs[i].Name, result.Latency)
+				log.Printf("Ready: %s [%dms]", shortName(s.configs[i].Name), result.Latency.Milliseconds())
 				return nil
 			}
 		}
@@ -111,7 +111,7 @@ func (s *ProxySelector) HealthCheck() bool {
 	}
 
 	s.failCount++
-	log.Printf("Health FAIL (%d/3): %s - %v", s.failCount, s.configs[s.activeIndex].Name, result.Error)
+	log.Printf("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
 
 	if s.failCount < 3 {
 		// Consider still healthy until threshold is met
@@ -162,7 +162,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
 				s.failCount = 0
-				log.Printf("Switched: %s (%v)", s.configs[i].Name, result.Latency)
+				log.Printf("Switched: %s [%dms]", shortName(s.configs[i].Name), result.Latency.Milliseconds())
 				return nil
 			}
 		}
@@ -170,7 +170,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	}
 
 	if oldIndex >= 0 && oldIndex < len(s.configs) {
-		debugLog("All alternative configs failed. Attempting to restore original config %s", s.configs[oldIndex].Name)
+		debugLog("All alternative configs failed. Attempting to restore original config %s", shortName(s.configs[oldIndex].Name))
 		if err := s.startXray(oldIndex); err == nil {
 			s.activeIndex = oldIndex
 			s.failCount = 0
