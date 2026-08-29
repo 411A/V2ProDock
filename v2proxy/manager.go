@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sort"
 	"sync"
@@ -118,6 +119,23 @@ func fetchWithRetry(subURL string) ([]ProxyConfig, error) {
 	return nil, lastErr
 }
 
+func dedupConfigs(in []ProxyConfig) []ProxyConfig {
+	seen := make(map[string]bool, len(in))
+	out := make([]ProxyConfig, 0, len(in))
+	for _, c := range in {
+		if !seen[c.Raw] {
+			seen[c.Raw] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func shuffleConfigs(in []ProxyConfig, seed int64) {
+	r := rand.New(rand.NewSource(seed))
+	r.Shuffle(len(in), func(a, b int) { in[a], in[b] = in[b], in[a] })
+}
+
 func (m *ProxyManager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -126,7 +144,8 @@ func (m *ProxyManager) Start() error {
 		return fmt.Errorf("no instances configured")
 	}
 
-	for i, inst := range m.instances {
+	rawLists := make([][]ProxyConfig, len(m.instances))
+	for i := range m.instances {
 		configs, err := fetchWithRetry(m.subURLs[i%len(m.subURLs)])
 		if err != nil {
 			log.Printf("Instance %d: subscription fetch failed: %v", i, err)
@@ -134,19 +153,27 @@ func (m *ProxyManager) Start() error {
 			m.statuses[i].Error = err.Error()
 			continue
 		}
-		log.Printf("Instance %d: parsed %d configs", i, len(configs))
-		inst.UpdateConfigs(configs)
+		configs = dedupConfigs(configs)
+		shuffleConfigs(configs, int64(i+1)*9973+int64(time.Now().UnixNano()%1000))
+		rawLists[i] = configs
+		log.Printf("Instance %d: parsed %d unique configs", i, len(configs))
+		m.instances[i].UpdateConfigs(configs)
+	}
 
-		if err := inst.StartWithBest(); err != nil {
-			log.Printf("Instance %d: no working config: %v", i, err)
+	used := make(map[string]int)
+	for i, inst := range m.instances {
+		if rawLists[i] == nil {
+			continue
+		}
+		if err := inst.StartWithBestExcluding(used); err != nil {
+			log.Printf("Instance %d: no working unique config: %v", i, err)
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = err.Error()
 			continue
 		}
-
-		cfg := inst.ActiveConfig()
-		if cfg != nil {
+		if cfg := inst.ActiveConfig(); cfg != nil {
 			m.statuses[i].Name = cfg.Name
+			used[cfg.Raw] = i
 		}
 		m.statuses[i].Status = "ok"
 		m.statuses[i].Latency = inst.LastLatency()
@@ -186,7 +213,16 @@ func (m *ProxyManager) HealthCheckAll() {
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = "health check failed"
 			log.Printf("Instance %d: proxy failed, switching...", i)
-			if err := inst.SwitchToNext(); err != nil {
+			used := make(map[string]int)
+			for j, o := range m.instances {
+				if j == i {
+					continue
+				}
+				if c := o.ActiveConfig(); c != nil {
+					used[c.Raw] = j
+				}
+			}
+			if err := inst.SwitchToNextExcluding(used); err != nil {
 				log.Printf("Instance %d: switch failed: %v", i, err)
 				m.statuses[i].Error = err.Error()
 			} else {
@@ -217,11 +253,22 @@ func (m *ProxyManager) RefreshSubscriptions() {
 			log.Printf("Instance %d: refresh got 0 configs, keeping old", i)
 			continue
 		}
-		log.Printf("Instance %d: refreshed %d configs", i, len(configs))
+		configs = dedupConfigs(configs)
+		shuffleConfigs(configs, int64(i+1)*9973+int64(time.Now().UnixNano()%1000))
+		log.Printf("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
 		if m.statuses[i].Status != "ok" {
-			if err := inst.StartWithBest(); err == nil {
+			used := make(map[string]int)
+			for j, o := range m.instances {
+				if j == i {
+					continue
+				}
+				if c := o.ActiveConfig(); c != nil {
+					used[c.Raw] = j
+				}
+			}
+			if err := inst.StartWithBestExcluding(used); err == nil {
 				cfg := inst.ActiveConfig()
 				m.statuses[i].Status = "ok"
 				m.statuses[i].Error = ""
