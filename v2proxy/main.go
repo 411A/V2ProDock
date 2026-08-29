@@ -102,7 +102,7 @@ func main() {
 
 	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, 60*time.Second)
 
-	log.Printf("Starting %d instance(s)...", manager.InstanceCount())
+	debugLog("Starting %d instance(s)...", manager.InstanceCount())
 	if err := manager.Start(); err != nil {
 		log.Fatalf("Manager start failed: %v", err)
 	}
@@ -140,7 +140,7 @@ func subscriptionLoop(manager *ProxyManager) {
 	ticker := time.NewTicker(120 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		log.Println("Refreshing subscriptions...")
+		debugLog("Refreshing subscriptions...")
 		manager.RefreshSubscriptions()
 	}
 }

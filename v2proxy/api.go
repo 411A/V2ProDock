@@ -83,7 +83,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 	}
 
 	go func() {
-		log.Printf("API server on :%d", port)
+		debugLog("API server on :%d", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("API server error: %v", err)
 		}
