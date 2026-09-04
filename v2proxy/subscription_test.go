@@ -28,6 +28,33 @@ func TestParseToXrayConfigVless(t *testing.T) {
 	}
 }
 
+func TestSplitURLs(t *testing.T) {
+	in := "http://192.168.1.87:27141/subscription.txt,https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/top100.txt"
+	got := splitURLs(in)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 URLs, got %d: %v", len(got), got)
+	}
+	if got[0] != "http://192.168.1.87:27141/subscription.txt" {
+		t.Errorf("first URL wrong: %s", got[0])
+	}
+	dup := splitURLs("https://a.example, https://a.example\nhttps://b.example;https://b.example")
+	if len(dup) != 2 {
+		t.Errorf("expected deduped 2 URLs, got %v", dup)
+	}
+	if len(splitURLs("  , \n ")) != 0 {
+		t.Errorf("expected empty for blank input")
+	}
+}
+
+func TestFetchAnyNoURLs(t *testing.T) {
+	if _, _, err := FetchAnySubscription(nil); err == nil {
+		t.Errorf("expected error for no URLs")
+	}
+	if got := FetchMergedSubscriptions(nil); len(got) != 0 {
+		t.Errorf("expected nil for no URLs, got %d", len(got))
+	}
+}
+
 func TestParseToXrayConfigVmess(t *testing.T) {
 	vmessJSON := `{"add":"1.2.3.4","port":443,"id":"uuid123","aid":0,"net":"ws","path":"/ws","host":"example.com","tls":"tls","ps":"VMess_Test"}`
 	b64 := base64.StdEncoding.EncodeToString([]byte(vmessJSON))

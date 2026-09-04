@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -97,22 +98,26 @@ func findAvailablePorts(start int) (socksPort, httpPort int, err error) {
 	return 0, 0, fmt.Errorf("no available port pair found starting from %d", start)
 }
 
-func fetchWithRetry(subURL string) ([]ProxyConfig, error) {
-	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
+	clean := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if strings.TrimSpace(u) != "" {
+			clean = append(clean, strings.TrimSpace(u))
+		}
+	}
+	if len(clean) == 0 {
+		return nil, fmt.Errorf("no subscription URLs configured")
+	}
+	var lastErr error = fmt.Errorf("all %d subscription URLs failed", len(clean))
+	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			time.Sleep(2 * time.Second)
 		}
-		cfgs, err := FetchSubscription(subURL)
-		if err == nil && len(cfgs) > 0 {
-			return cfgs, nil
+		if merged := FetchMergedSubscriptions(clean); len(merged) > 0 {
+			return merged, nil
 		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("empty subscription (0 proxies)")
-		}
-		debugLog("Fetch retry %d/4 for %s: %v", attempt+1, subURL, lastErr)
+		lastErr = fmt.Errorf("attempt %d/2: all %d subscription URLs failed", attempt+1, len(clean))
+		debugLog("fetch pool retry %d/2: %v", attempt+1, lastErr)
 	}
 	return nil, lastErr
 }
@@ -151,16 +156,22 @@ func (m *ProxyManager) Start() error {
 		return fmt.Errorf("no instances configured")
 	}
 
-	rawLists := make([][]ProxyConfig, len(m.instances))
-	for i := range m.instances {
-		configs, err := fetchWithRetry(m.subURLs[i%len(m.subURLs)])
-		if err != nil {
+	pool, err := fetchPoolWithRetry(m.subURLs)
+	if err != nil {
+		for i := range m.instances {
 			errLog("Instance %d: subscription fetch failed: %v", i, err)
 			m.statuses[i].Status = "down"
 			m.statuses[i].Error = err.Error()
-			continue
 		}
-		configs = dedupConfigs(configs)
+		return nil
+	}
+	pool = dedupConfigs(pool)
+	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(m.subURLs))
+
+	rawLists := make([][]ProxyConfig, len(m.instances))
+	for i := range m.instances {
+		configs := make([]ProxyConfig, len(pool))
+		copy(configs, pool)
 		rotateConfigs(configs, i*3)
 		rawLists[i] = configs
 		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
@@ -252,17 +263,15 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	pool := FetchMergedSubscriptions(m.subURLs)
+	if len(pool) == 0 {
+		warnLog("refresh got 0 configs from all sources, keeping old")
+		return
+	}
+	pool = dedupConfigs(pool)
 	for i, inst := range m.instances {
-		configs, err := FetchSubscription(m.subURLs[i%len(m.subURLs)])
-		if err != nil {
-			warnLog("Instance %d: refresh failed: %v", i, err)
-			continue
-		}
-		if len(configs) == 0 {
-			debugLog("Instance %d: refresh got 0 configs, keeping old", i)
-			continue
-		}
-		configs = dedupConfigs(configs)
+		configs := make([]ProxyConfig, len(pool))
+		copy(configs, pool)
 		rotateConfigs(configs, i*3)
 		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
