@@ -41,10 +41,10 @@ show_status() {
     echo "  curl --proxy http://localhost:$((port_base + instances)) https://api.ipify.org"
     echo ""
 
-    # Check API health after a brief wait
+    # Check API health after a brief wait (bounded: API answers even mid-populate)
     sleep 3
     local health
-    health=$(curl -sf "http://localhost:$api_port/health" 2>/dev/null)
+    health=$(curl -sf --max-time 10 "http://localhost:$api_port/health" 2>/dev/null)
     if [ -n "$health" ]; then
         local alive total
         alive=$(echo "$health" | grep -o '"alive":[0-9]*' | cut -d: -f2)

@@ -142,56 +142,101 @@ func rotateConfigs(in []ProxyConfig, offset int) {
 	copy(in[len(in)-offset:], tmp[:offset])
 }
 
-func (m *ProxyManager) Start() error {
+func (m *ProxyManager) snapshot() (insts []*ProxySelector, subURLs []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	insts = make([]*ProxySelector, len(m.instances))
+	copy(insts, m.instances)
+	subURLs = make([]string, len(m.subURLs))
+	copy(subURLs, m.subURLs)
+	return insts, subURLs
+}
 
-	if len(m.instances) == 0 {
+func (m *ProxyManager) buildExcluding(i int) map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	used := make(map[string]int)
+	for j, o := range m.instances {
+		if j == i {
+			continue
+		}
+		if c := o.ActiveConfig(); c != nil {
+			used[c.Raw] = j
+		}
+	}
+	return used
+}
+
+func (m *ProxyManager) markDown(i int, errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i >= 0 && i < len(m.statuses) {
+		m.statuses[i].Status = "down"
+		m.statuses[i].Error = errMsg
+	}
+}
+
+func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i >= 0 && i < len(m.statuses) {
+		m.statuses[i].Status = "ok"
+		m.statuses[i].Error = ""
+		if name != "" {
+			m.statuses[i].Name = name
+		}
+		m.statuses[i].Latency = lat
+		m.statuses[i].LatMs = lat.Milliseconds()
+	}
+}
+
+// Start fetches subscriptions and probes proxies. The manager lock is only
+// held for short state updates so the API stays responsive during populate.
+func (m *ProxyManager) Start() error {
+	insts, subURLs := m.snapshot()
+	if len(insts) == 0 {
 		return fmt.Errorf("no instances configured")
 	}
 
-	pool, err := fetchPoolWithRetry(m.subURLs)
+	pool, err := fetchPoolWithRetry(subURLs)
 	if err != nil {
-		for i := range m.instances {
+		for i := range insts {
 			errLog("Instance %d: subscription fetch failed: %v", i, err)
-			m.statuses[i].Status = "down"
-			m.statuses[i].Error = err.Error()
+			m.markDown(i, err.Error())
 		}
 		return nil
 	}
 	pool = dedupConfigs(pool)
-	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(m.subURLs))
+	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
 
-	rawLists := make([][]ProxyConfig, len(m.instances))
-	for i := range m.instances {
+	rawLists := make([][]ProxyConfig, len(insts))
+	for i := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
 		rotateConfigs(configs, i*3)
 		rawLists[i] = configs
 		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
-		m.instances[i].UpdateConfigs(configs)
+		insts[i].UpdateConfigs(configs)
 	}
 
-	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(m.instances)))
+	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(insts)))
 	used := make(map[string]int)
-	for i, inst := range m.instances {
+	for i, inst := range insts {
 		if rawLists[i] == nil {
 			continue
 		}
 		debugLog("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
 		if err := inst.StartWithBestExcluding(used); err != nil {
 			errLog("Instance %d: no working unique config: %v", i, err)
-			m.statuses[i].Status = "down"
-			m.statuses[i].Error = err.Error()
+			m.markDown(i, err.Error())
 			continue
 		}
+		name := ""
 		if cfg := inst.ActiveConfig(); cfg != nil {
-			m.statuses[i].Name = cfg.Name
+			name = cfg.Name
 			used[cfg.Raw] = i
 		}
-		m.statuses[i].Status = "ok"
-		m.statuses[i].Latency = inst.LastLatency()
-		m.statuses[i].LatMs = m.statuses[i].Latency.Milliseconds()
+		m.markOK(i, name, inst.LastLatency())
 	}
 
 	return nil
@@ -205,90 +250,71 @@ func (m *ProxyManager) Stop() {
 	}
 }
 
-func (m *ProxyManager) HealthCheckAll() {
+func (m *ProxyManager) statusOf(i int) InstanceStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if i >= 0 && i < len(m.statuses) {
+		return m.statuses[i]
+	}
+	return InstanceStatus{}
+}
 
-	for i, inst := range m.instances {
+func (m *ProxyManager) HealthCheckAll() {
+	insts, _ := m.snapshot()
+
+	for i, inst := range insts {
 		if !inst.ShouldCheck() {
 			continue
 		}
 
 		if inst.HealthCheck() {
-			cfg := inst.ActiveConfig()
-			m.statuses[i].Status = "ok"
-			m.statuses[i].Error = ""
-			if cfg != nil {
-				m.statuses[i].Name = cfg.Name
+			name := ""
+			if cfg := inst.ActiveConfig(); cfg != nil {
+				name = cfg.Name
 			}
-			m.statuses[i].Latency = inst.LastLatency()
-			m.statuses[i].LatMs = m.statuses[i].Latency.Milliseconds()
+			m.markOK(i, name, inst.LastLatency())
 		} else {
-			m.statuses[i].Status = "down"
-			m.statuses[i].Error = "health check failed"
+			m.markDown(i, "health check failed")
 			warnLog("Instance %d: proxy failed, switching...", i)
-			used := make(map[string]int)
-			for j, o := range m.instances {
-				if j == i {
-					continue
-				}
-				if c := o.ActiveConfig(); c != nil {
-					used[c.Raw] = j
-				}
-			}
+			used := m.buildExcluding(i)
 			if err := inst.SwitchToNextExcluding(used); err != nil {
 				errLog("Instance %d: switch failed: %v", i, err)
-				m.statuses[i].Error = err.Error()
+				m.markDown(i, err.Error())
 			} else {
-				cfg := inst.ActiveConfig()
-				m.statuses[i].Status = "ok"
-				m.statuses[i].Error = ""
-				if cfg != nil {
-					m.statuses[i].Name = cfg.Name
+				name := ""
+				if cfg := inst.ActiveConfig(); cfg != nil {
+					name = cfg.Name
 				}
-				m.statuses[i].Latency = inst.LastLatency()
-				m.statuses[i].LatMs = m.statuses[i].Latency.Milliseconds()
+				m.markOK(i, name, inst.LastLatency())
 			}
 		}
 	}
 }
 
 func (m *ProxyManager) RefreshSubscriptions() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	insts, subURLs := m.snapshot()
 
-	pool := FetchMergedSubscriptions(m.subURLs)
+	pool := FetchMergedSubscriptions(subURLs)
 	if len(pool) == 0 {
 		warnLog("refresh got 0 configs from all sources, keeping old")
 		return
 	}
 	pool = dedupConfigs(pool)
-	for i, inst := range m.instances {
+	for i, inst := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
 		rotateConfigs(configs, i*3)
 		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
-		if m.statuses[i].Status != "ok" {
-			used := make(map[string]int)
-			for j, o := range m.instances {
-				if j == i {
-					continue
-				}
-				if c := o.ActiveConfig(); c != nil {
-					used[c.Raw] = j
-				}
-			}
+		if m.statusOf(i).Status != "ok" {
+			used := m.buildExcluding(i)
 			if err := inst.StartWithBestExcluding(used); err == nil {
-				cfg := inst.ActiveConfig()
-				m.statuses[i].Status = "ok"
-				m.statuses[i].Error = ""
-				if cfg != nil {
-					m.statuses[i].Name = cfg.Name
+				name := ""
+				if cfg := inst.ActiveConfig(); cfg != nil {
+					name = cfg.Name
 				}
-				m.statuses[i].Latency = inst.LastLatency()
-				m.statuses[i].LatMs = m.statuses[i].Latency.Milliseconds()
+				m.markOK(i, name, inst.LastLatency())
 			}
 		}
 	}
