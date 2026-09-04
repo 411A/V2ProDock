@@ -116,10 +116,13 @@ func dedupConfigs(in []ProxyConfig) []ProxyConfig {
 	seen := make(map[string]bool, len(in))
 	out := make([]ProxyConfig, 0, len(in))
 	for _, c := range in {
-		if !seen[c.Raw] {
-			seen[c.Raw] = true
+		if !seen[c.Key()] {
+			seen[c.Key()] = true
 			out = append(out, c)
 		}
+	}
+	if dropped := len(in) - len(out); dropped > 0 {
+		debugLog("dedup: dropped %d duplicate line(s)/same-server entries", dropped)
 	}
 	return out
 }
@@ -153,7 +156,7 @@ func (m *ProxyManager) buildExcluding(i int) map[string]int {
 			continue
 		}
 		if c := o.ActiveConfig(); c != nil {
-			used[c.Raw] = j
+			used[c.Key()] = j
 		}
 	}
 	return used
@@ -271,9 +274,9 @@ func (m *ProxyManager) Start() error {
 					return
 				}
 				usedMu.Lock()
-				_, dup := used[cfg.Raw]
+				_, dup := used[cfg.Key()]
 				if !dup {
-					used[cfg.Raw] = idx
+					used[cfg.Key()] = idx
 				}
 				usedMu.Unlock()
 				if dup {

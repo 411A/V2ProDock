@@ -149,23 +149,24 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return skipped, fmt.Errorf("probe timeout")
 		}
+		key := s.configs[i].Key()
 		if exclude != nil {
-			if _, ok := exclude[s.configs[i].Raw]; ok {
+			if _, ok := exclude[s.configs[i].Key()]; ok {
 				continue
 			}
 		}
-		if respectBad && shared.isBad(s.configs[i].Raw) {
+		if respectBad && shared.isBad(key) {
 			skipped++
 			continue
 		}
 		// Reserve before probing so no two workers test the same candidate.
-		if !shared.tryClaim(s.configs[i].Raw) {
+		if !shared.tryClaim(key) {
 			continue
 		}
 		if err := s.startXray(i); err != nil {
 			debugLog("candidate %d/%d %s: xray start failed: %v", i+1, len(s.configs), shortName(s.configs[i].Name), err)
-			shared.markBad(s.configs[i].Raw)
-			shared.unclaim(s.configs[i].Raw)
+			shared.markBad(key)
+			shared.unclaim(key)
 			continue
 		}
 		// Fast probe: skip waitForPort, use single-URL 3s timeout.
@@ -179,8 +180,8 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			return skipped, nil
 		}
 		debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
-		shared.markBad(s.configs[i].Raw)
-		shared.unclaim(s.configs[i].Raw)
+		shared.markBad(key)
+		shared.unclaim(key)
 		s.stopXray()
 	}
 	return skipped, fmt.Errorf("no working config found")
@@ -239,7 +240,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 			continue
 		}
 		if exclude != nil {
-			if _, ok := exclude[s.configs[i].Raw]; ok {
+			if _, ok := exclude[s.configs[i].Key()]; ok {
 				continue
 			}
 		}

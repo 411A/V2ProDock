@@ -14,9 +14,24 @@ import (
 )
 
 type ProxyConfig struct {
-	Name    string
-	Raw     string
-	XrayCfg json.RawMessage
+	Name     string
+	Raw      string
+	Endpoint string // normalized "host:port" identity; same server is never exposed twice
+	XrayCfg  json.RawMessage
+}
+
+// endpointKey normalizes a remote server identity for dedup and claiming.
+func endpointKey(server string, port int) string {
+	return strings.ToLower(strings.TrimSpace(server)) + ":" + strconv.Itoa(port)
+}
+
+// Key is the uniqueness identity: same host:port counts as the same proxy
+// even when subscription lines differ (remark, UUID, source URL).
+func (c ProxyConfig) Key() string {
+	if c.Endpoint != "" {
+		return c.Endpoint
+	}
+	return c.Raw
 }
 
 func subscriptionCandidates(raw string) []string {
@@ -412,7 +427,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	}
 
 	cfgBytes, _ := json.Marshal(outbound)
-	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+	return &ProxyConfig{Name: name, Raw: raw, Endpoint: endpointKey(server, port), XrayCfg: cfgBytes}, nil
 }
 
 func parseVmess(raw, name string) (*ProxyConfig, error) {
@@ -540,7 +555,7 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 			name = server
 		}
 	}
-	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+	return &ProxyConfig{Name: name, Raw: raw, Endpoint: endpointKey(server, port), XrayCfg: cfgBytes}, nil
 }
 
 func parseTrojan(u *url.URL, raw, name string) (*ProxyConfig, error) {
@@ -598,7 +613,7 @@ func parseTrojan(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	if name == "" {
 		name = server
 	}
-	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+	return &ProxyConfig{Name: name, Raw: raw, Endpoint: endpointKey(server, port), XrayCfg: cfgBytes}, nil
 }
 
 func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
@@ -657,7 +672,7 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	if name == "" {
 		name = server
 	}
-	return &ProxyConfig{Name: name, Raw: raw, XrayCfg: cfgBytes}, nil
+	return &ProxyConfig{Name: name, Raw: raw, Endpoint: endpointKey(server, port), XrayCfg: cfgBytes}, nil
 }
 
 func parseHy2(_ *url.URL, _, _ string) (*ProxyConfig, error) {
