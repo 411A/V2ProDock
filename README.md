@@ -63,7 +63,7 @@ curl http://localhost:27018/proxies
 |----------|--------|-------------|
 | `/proxies` | GET | Alive proxies sorted by latency (lowest first) |
 | `/all` | GET | All instances including down ones |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2}` |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` |
 | `/refresh` | POST | Force subscription re-fetch |
 
 ## Usage
