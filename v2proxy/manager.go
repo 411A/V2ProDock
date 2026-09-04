@@ -9,13 +9,6 @@ import (
 	"time"
 )
 
-const (
-	defaultPortBase = 27019
-	maxPort         = 27999
-	probeWorkers    = 6
-	probeTimeout    = 3 * time.Minute
-)
-
 type InstanceStatus struct {
 	Index   int           `json:"index"`
 	SOCKS   string        `json:"socks5"`
@@ -105,9 +98,9 @@ func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
 		return nil, fmt.Errorf("no subscription URLs configured")
 	}
 	var lastErr error = fmt.Errorf("all %d subscription URLs failed", len(clean))
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < fetchPoolAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(fetchPoolRetrySleep)
 		}
 		if merged := FetchMergedSubscriptions(clean); len(merged) > 0 {
 			return merged, nil
@@ -245,7 +238,7 @@ func (m *ProxyManager) Start() error {
 	tickWg.Add(1)
 	go func() {
 		defer tickWg.Done()
-		t := time.NewTicker(20 * time.Second)
+		t := time.NewTicker(populateTick)
 		defer t.Stop()
 		for {
 			select {
@@ -271,7 +264,7 @@ func (m *ProxyManager) Start() error {
 			defer func() { <-sem }()
 			debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
 			deadline := time.Now().Add(probeTimeout)
-			for attempt := 0; attempt < 3 && time.Now().Before(deadline); attempt++ {
+			for attempt := 0; attempt < probeMaxAttempts && time.Now().Before(deadline); attempt++ {
 				if err := sel.startShared(snapUsed(), shared, deadline); err != nil {
 					errLog("Instance %d: no working unique config: %v", idx, err)
 					m.markDown(idx, err.Error())

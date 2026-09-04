@@ -15,15 +15,6 @@ type HealthResult struct {
 	Error   error
 }
 
-var fallbackHealthURLs = []string{
-	"https://www.gstatic.com/generate_204",
-	"https://cp.cloudflare.com",
-	"http://api.ipify.org",
-}
-
-// probeURL is the fastest reliable URL for initial probing — HTTP, no TLS.
-const probeURL = "http://www.gstatic.com/generate_204"
-
 func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResult {
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
@@ -34,8 +25,8 @@ func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResul
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		},
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
+		TLSHandshakeTimeout:   healthTLSHandshakeTimeout,
+		ResponseHeaderTimeout: healthResponseHeaderTimeout,
 		MaxIdleConns:          1,
 		IdleConnTimeout:       5 * time.Second,
 		DisableKeepAlives:     true,
@@ -96,5 +87,5 @@ func TestProxyQuick(proxyAddr, testURL string) HealthResult {
 	if testURL != "" {
 		url = testURL
 	}
-	return testSingleURL(proxyAddr, url, 3*time.Second)
+	return testSingleURL(proxyAddr, url, quickProbeTimeout)
 }

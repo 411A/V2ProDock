@@ -57,7 +57,7 @@ func downloadXray(xrayDir, xrayBin string) error {
 		osName2 = "linux"
 	}
 
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/latest/download/Xray-%s-%s.zip", osName2, archName)
+	url := fmt.Sprintf(xrayDownloadURLTmpl, osName2, archName)
 	infoLog("Downloading xray: %s", url)
 
 	resp, err := http.Get(url)

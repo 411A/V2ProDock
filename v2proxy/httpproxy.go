@@ -14,11 +14,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const (
-	defaultMaxConns = 128
-	relayBufSize    = 32 * 1024
-)
-
 var relayBufPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, relayBufSize)
@@ -61,9 +56,9 @@ func startHTTPProxy(addr, socksAddr string) {
 
 	server := &http.Server{
 		Addr:              addr,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    4096,
+		ReadHeaderTimeout: bridgeReadHeaderTimeout,
+		IdleTimeout:       bridgeIdleTimeout,
+		MaxHeaderBytes:    bridgeMaxHeaderBytes,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
 				handleConnect(w, r, dialer)
@@ -91,7 +86,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	// Acquire connection slot to prevent unbounded HTTP request goroutines
 	select {
 	case <-connSem:
-	case <-time.After(5 * time.Second):
+	case <-time.After(proxySlotWait):
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -154,7 +149,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 	// Acquire connection slot
 	select {
 	case <-connSem:
-	case <-time.After(5 * time.Second):
+	case <-time.After(proxySlotWait):
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -194,7 +189,7 @@ func relay(dst, src net.Conn) {
 	defer func() { _ = dst.Close() }()
 	defer func() { _ = src.Close() }()
 
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(relayIdleDeadline)
 	_ = dst.SetDeadline(deadline)
 	_ = src.SetDeadline(deadline)
 

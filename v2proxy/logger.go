@@ -37,7 +37,7 @@ func init() {
 	}
 	opts := clog.Options{
 		Level:           lvl,
-		TimeFormat:      "2006/01/02 15:04:05.000",
+		TimeFormat:      logTimeFormat,
 		ReportCaller:    currentLogLevel >= levelDebug,
 		CallerOffset:    1,
 		ReportTimestamp: true,
@@ -106,9 +106,9 @@ func readyLog(name string, ms int64) {
 	if useColor {
 		nameSt := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 		latCol := lipgloss.Color("42")
-		if ms >= 3000 {
+		if ms >= latCritMs {
 			latCol = lipgloss.Color("196")
-		} else if ms >= 1500 {
+		} else if ms >= latWarnMs {
 			latCol = lipgloss.Color("214")
 		}
 		latSt := lipgloss.NewStyle().Foreground(latCol).Bold(true)
@@ -155,8 +155,8 @@ func shortName(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
 	r := []rune(s)
-	if len(r) > 48 {
-		s = string(r[:48]) + "…"
+	if len(r) > shortNameMax {
+		s = string(r[:shortNameMax]) + "…"
 	}
 	return s
 }
@@ -210,9 +210,9 @@ func printSummaryTable(statuses []InstanceStatus) {
 				stat = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render(stat)
 			}
 			lc := lipgloss.Color("42")
-			if s.LatMs >= 3000 {
+			if s.LatMs >= latCritMs {
 				lc = lipgloss.Color("196")
-			} else if s.LatMs >= 1500 {
+			} else if s.LatMs >= latWarnMs {
 				lc = lipgloss.Color("214")
 			}
 			lat = lipgloss.NewStyle().Foreground(lc).Render(lat)

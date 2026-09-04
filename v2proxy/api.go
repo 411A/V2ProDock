@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"time"
 )
 
 func findFreePort(start int) int {
@@ -76,11 +75,11 @@ func startAPI(manager *ProxyManager, basePort int) int {
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
 		Handler:           mux,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		ReadHeaderTimeout: 3 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    2048,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		IdleTimeout:       apiIdleTimeout,
+		MaxHeaderBytes:    apiMaxHeaderBytes,
 	}
 
 	go func() {

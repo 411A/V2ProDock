@@ -27,12 +27,12 @@ func main() {
 
 	bannerLog("Starting V2Ray Proxy...")
 
-	xrayDir := "/root/xray"
-	testURL := "http://httpbin.org/ip"
+	xrayDir := defaultXrayDir
+	testURL := defaultHealthCheckURL
 	subURL := ""
 	portBase := defaultPortBase
-	instanceCount := 1
-	apiPort := 27018
+	instanceCount := defaultInstanceCount
+	apiPort := defaultAPIPort
 
 	if v := os.Getenv("SUBSCRIPTION_URL"); v != "" {
 		subURL = v
@@ -66,7 +66,7 @@ func main() {
 	subURLs = append(subURLs, splitURLs(os.Getenv("SUBSCRIPTION_URLS"))...)
 	subURLs = append(subURLs, splitURLs(subURL)...)
 	if len(subURLs) == 0 {
-		subFile := filepath.Join("/root/config", "subscription.txt")
+		subFile := filepath.Join(configDir, subscriptionFile)
 		if data, err := os.ReadFile(subFile); err == nil {
 			subURLs = append(subURLs, splitURLs(string(data))...)
 		}
@@ -82,11 +82,11 @@ func main() {
 			errLog("Subscription URL is required")
 			os.Exit(1)
 		}
-		if err := os.MkdirAll("/root/config", 0755); err != nil {
+		if err := os.MkdirAll(configDir, 0755); err != nil {
 			errLog("mkdir failed: %v", err)
 			os.Exit(1)
 		}
-		if err := os.WriteFile(filepath.Join("/root/config", "subscription.txt"), []byte(subURL), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(configDir, subscriptionFile), []byte(subURL), 0644); err != nil {
 			errLog("write subscription failed: %v", err)
 			os.Exit(1)
 		}
@@ -98,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, 60*time.Second)
+	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, healthCheckInterval)
 
 	// Start API first so /health and /proxies answer even while proxies populate.
 	apiActualPort := startAPI(manager, apiPort)
@@ -140,7 +140,7 @@ func main() {
 }
 
 func subscriptionLoop(manager *ProxyManager) {
-	ticker := time.NewTicker(120 * time.Second)
+	ticker := time.NewTicker(subscriptionRefreshInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		debugLog("Refreshing subscriptions...")
@@ -149,7 +149,7 @@ func subscriptionLoop(manager *ProxyManager) {
 }
 
 func healthCheckLoop(manager *ProxyManager) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		manager.HealthCheckAll()
