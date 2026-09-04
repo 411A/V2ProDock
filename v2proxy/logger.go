@@ -161,6 +161,23 @@ func shortName(s string) string {
 	return s
 }
 
+func portOnly(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
+		return addr[i+1:]
+	}
+	return addr
+}
+
+func shortErr(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	r := []rune(s)
+	if len(r) > shortErrMax {
+		s = string(r[:shortErrMax]) + "…"
+	}
+	return s
+}
+
 func printSummaryTable(statuses []InstanceStatus) {
 	if len(statuses) == 0 {
 		return
@@ -203,6 +220,12 @@ func printSummaryTable(statuses []InstanceStatus) {
 		name := shortName(s.Name)
 		stat := s.Status
 		lat := fmt.Sprintf("%dms", s.LatMs)
+		if s.Status != "ok" {
+			lat = "—"
+			if s.Error != "" {
+				stat = fmt.Sprintf("%s (%s)", s.Status, shortErr(s.Error))
+			}
+		}
 		if useColor {
 			if stat == "ok" {
 				stat = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render(stat)
@@ -220,8 +243,8 @@ func printSummaryTable(statuses []InstanceStatus) {
 		rows = append(rows, []string{
 			fmt.Sprintf("%d", s.Index),
 			name,
-			s.SOCKS,
-			s.HTTP,
+			portOnly(s.SOCKS),
+			portOnly(s.HTTP),
 			stat,
 			lat,
 		})

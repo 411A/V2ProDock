@@ -111,6 +111,7 @@ const (
 	latWarnMs     = 1500 // latency coloring thresholds
 	latCritMs     = 3000
 	shortNameMax  = 48 // proxy-name truncation length
+	shortErrMax   = 30 // error truncation length in the summary table
 )
 
 // ---- xray download ----
