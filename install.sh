@@ -114,17 +114,151 @@ fix_wsl_url() {
     echo "$url"
 }
 
-check_subscription_reachable() {
-    local url="$1"
-    if command -v curl &>/dev/null; then
-        if ! curl -sf --max-time 5 "$url" >/dev/null 2>&1; then
-            echo -e "${RED}[WARN] Cannot reach $url from host${NC}"
-            echo "  Inside Docker 127.0.0.1 = container, not host. Use:"
-            echo "    http://host.docker.internal:27141/subscription  (compose has host-gateway)"
-            echo "    http://$(hostname -I 2>/dev/null | awk '{print $1}'):27141/subscription  (LAN IP)"
-            local gw; gw=$(get_host_gateway_ip)
-            [ -n "$gw" ] && echo "    http://$gw:27141/subscription  (gateway IP)"
+# Split a raw subscription list (comma/semicolon/whitespace/newline separated)
+# into one URL per line, deduped, order preserved.
+split_sub_urls() {
+    printf '%s\n' "$1" | tr ',;' '\n' | awk '{ gsub(/^[ \t\r]+|[ \t\r]+$/, ""); if ($0 != "" && !seen[$0]++) print }'
+}
+
+# Read KEY from .env, supporting double-quoted multiline values.
+dotenv_val() {
+    local key="$1" file="$DIR/.env"
+    [ -f "$file" ] || return 0
+    awk -v k="$key" '
+        !ingot && $0 ~ "^" k "=" {
+            v = substr($0, length(k) + 2)
+            sub(/\r$/, "", v)
+            if (v ~ /^"/) {
+                sub(/^"/, "", v)
+                if (v ~ /"$/) { sub(/"$/, "", v); print v; exit }
+                ingot = 1
+                print v
+                next
+            }
+            print v
+            exit
+        }
+        ingot {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /"$/) { sub(/"$/, "", line); print line; exit }
+            print line
+        }
+    ' "$file"
+}
+
+# Subscription URLs from .env only (both keys), one per line.
+read_env_sub_urls() {
+    local raw=""
+    if [ -f "$DIR/.env" ]; then
+        raw="$(dotenv_val SUBSCRIPTION_URLS)
+$(dotenv_val SUBSCRIPTION_URL)"
+    fi
+    split_sub_urls "$raw"
+}
+
+# Subscription URLs from every source (file + .env + env vars), one per line.
+read_sub_urls() {
+    local raw=""
+    if [ -f "$DIR/config/subscription.txt" ]; then
+        raw="$raw
+$(tr '\r' '\n' < "$DIR/config/subscription.txt")"
+    fi
+    if [ -f "$DIR/.env" ]; then
+        raw="$raw
+$(dotenv_val SUBSCRIPTION_URLS)
+$(dotenv_val SUBSCRIPTION_URL)"
+    fi
+    [ -n "${SUBSCRIPTION_URLS:-}" ] && raw="$raw
+$SUBSCRIPTION_URLS"
+    [ -n "${SUBSCRIPTION_URL:-}" ] && raw="$raw
+$SUBSCRIPTION_URL"
+    split_sub_urls "$raw"
+}
+
+# Join a newline-separated URL list into one comma-separated line.
+join_commas() {
+    awk 'NF { if (n++) printf ","; printf "%s", $0 } END { if (n) printf "\n" }' <<< "$1"
+}
+
+# Rewrite loopback hosts in each URL of a newline-separated list.
+rewrite_sub_urls() {
+    local list="$1" out="" u f
+    [ -z "$list" ] && return 0
+    while IFS= read -r u; do
+        [ -z "$u" ] && continue
+        f=$(fix_wsl_url "$u")
+        if [ "$f" = "$u" ]; then
+            f=$(fix_vm_url "$u")
         fi
+        if [ "$f" != "$u" ]; then
+            ok "Rewriting $u -> $f"
+        fi
+        if [ -z "$out" ]; then out="$f"; else out="$out
+$f"; fi
+    done <<< "$list"
+    printf '%s\n' "$out"
+}
+
+# Check each subscription URL separately; dead ones only warn (app has failover).
+check_subscriptions_reachable() {
+    local total=0 ok_count=0 u
+    while IFS= read -r u; do
+        [ -z "$u" ] && continue
+        total=$((total + 1))
+        if command -v curl &>/dev/null && curl -sf --max-time 5 "$u" >/dev/null 2>&1; then
+            ok_count=$((ok_count + 1))
+        else
+            echo -e "${RED}[WARN] Cannot reach $u from host${NC}"
+        fi
+    done <<< "$1"
+    [ "$total" -eq 0 ] && return 0
+    if [ "$ok_count" -eq 0 ]; then
+        echo "  None of the $total subscription URL(s) reachable from host."
+        echo "  Inside Docker 127.0.0.1 = container, not host. Use:"
+        echo "    http://host.docker.internal:27141/subscription  (compose has host-gateway)"
+        echo "    http://$(hostname -I 2>/dev/null | awk '{print $1}'):27141/subscription  (LAN IP)"
+        local gw; gw=$(get_host_gateway_ip)
+        [ -n "$gw" ] && echo "    http://$gw:27141/subscription  (gateway IP)"
+        echo "  The app skips dead sources at runtime if at least one works."
+    else
+        ok "$ok_count/$total subscription URL(s) reachable"
+    fi
+}
+
+escape_sed_repl() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+
+# Set KEY=VALUE in .env (adds if missing). Safe for URLs containing & | \.
+set_env_key() {
+    local key="$1" val="$2" esc
+    esc=$(escape_sed_repl "$val")
+    if grep -qE "^${key}=" "$DIR/.env" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${esc}|" "$DIR/.env"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$DIR/.env"
+    fi
+}
+
+# Normalize subscription keys in .env: first URL -> SUBSCRIPTION_URL,
+# rest -> quoted multiline SUBSCRIPTION_URLS. Drops stale key lines.
+write_env_subscriptions() {
+    local first="$1" rest="$2" tmp
+    tmp=$(mktemp)
+    awk -v first="$first" '
+        /^SUBSCRIPTION_URL=/ { print "SUBSCRIPTION_URL=" first; replaced = 1; next }
+        /^SUBSCRIPTION_URLS=".*"$/ { next }
+        /^SUBSCRIPTION_URLS="/ { skip = 1; next }
+        skip { if ($0 ~ /"/) skip = 0; next }
+        /^SUBSCRIPTION_URLS=/ { next }
+        { print }
+        END { if (!replaced) print "SUBSCRIPTION_URL=" first }
+    ' "$DIR/.env" > "$tmp" && mv "$tmp" "$DIR/.env"
+    if [ -n "$rest" ]; then
+        {
+            echo 'SUBSCRIPTION_URLS="'
+            printf '%s\n' "$rest"
+            echo '"'
+        } >> "$DIR/.env"
     fi
 }
 
@@ -144,31 +278,7 @@ fix_vm_url() {
     echo "$url"
 }
 
-# Read subscription URL from a source, stripping CRLF and whitespace
-read_sub_url() {
-    local url=""
-    # Source 1: config/subscription.txt
-    if [ -f "$DIR/config/subscription.txt" ]; then
-        url=$(tr -d '\r' < "$DIR/config/subscription.txt" | tr -d '[:space:]')
-        if [ -n "$url" ]; then
-            echo "$url"
-            return
-        fi
-    fi
-    # Source 2: .env file
-    if [ -f "$DIR/.env" ]; then
-        url=$(tr -d '\r' < "$DIR/.env" | grep -E '^SUBSCRIPTION_URL=' | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
-        if [ -n "$url" ]; then
-            echo "$url"
-            return
-        fi
-    fi
-    # Source 3: env var
-    if [ -n "${SUBSCRIPTION_URL:-}" ]; then
-        echo "$SUBSCRIPTION_URL"
-        return
-    fi
-}
+
 
 # Check if Docker is available
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
@@ -210,62 +320,56 @@ if [ "$DOCKER_MODE" = true ]; then
             # Install / update mode
             mkdir -p "$DIR/config"
 
-            sub_url=$(read_sub_url)
-            fixed_url=$(fix_wsl_url "$sub_url")
-            if [ "$fixed_url" != "$sub_url" ]; then
-                ok "WSL2 detected — rewriting $sub_url -> $fixed_url"
-                sub_url="$fixed_url"
-            else
-                vm_fixed=$(fix_vm_url "$sub_url")
-                if [ "$vm_fixed" != "$sub_url" ]; then
-                    ok "VM/Docker detected — rewriting 127.0.0.1 -> $vm_fixed (use LAN IP for production)"
-                    sub_url="$vm_fixed"
-                fi
-            fi
-            [ -n "$sub_url" ] && check_subscription_reachable "$sub_url"
-
-            if [ -n "$sub_url" ]; then
-                ok "Found subscription: $sub_url"
-            else
-                echo "Enter subscription URL:"
-                read -r -p "URL: " sub_url
-                [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
-                echo "$sub_url" > "$DIR/config/subscription.txt"
+            # 1. Gather subscription URLs from all sources (one per line)
+            sub_urls=$(read_sub_urls)
+            if [ -z "$sub_urls" ]; then
+                echo "Enter subscription URL (comma-separated list allowed):"
+                read -r -p "URL: " input
+                [[ -z "$input" ]] && { err "URL required"; exit 1; }
+                echo "$input" > "$DIR/config/subscription.txt"
+                sub_urls=$(split_sub_urls "$input")
                 ok "Subscription saved"
             fi
 
-            # .env — copy from .env.example as template, then fill in user values
+            # 2. Rewrite loopback hosts per URL (WSL2 / VM / Docker)
+            fixed_urls=$(rewrite_sub_urls "$sub_urls")
+            [ -n "$fixed_urls" ] && sub_urls="$fixed_urls"
+
+            # 3. Reachability per URL (dead ones only warn — app has failover)
+            check_subscriptions_reachable "$sub_urls"
+            src_count=$(printf '%s\n' "$sub_urls" | grep -c .)
+            ok "Using $src_count subscription source(s)"
+
+            # 4. .env — copy from .env.example as template, then fill in user values
+            first_url=$(printf '%s\n' "$sub_urls" | head -1)
+            rest_urls=$(printf '%s\n' "$sub_urls" | tail -n +2)
             if [ ! -f "$DIR/.env" ]; then
                 cp "$DIR/.env.example" "$DIR/.env"
-
-                # Fill in the subscription URL the user provided
-                sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$sub_url|" "$DIR/.env"
+                write_env_subscriptions "$first_url" "$rest_urls"
 
                 echo ""
                 echo -e "${CYAN}Configure additional settings (press Enter to keep defaults):${NC}"
 
                 health_url="https://www.gstatic.com/generate_204"
                 read -r -p "  Health check URL [$health_url]: " input; health_url=${input:-$health_url}
-                sed -i "s|^HEALTH_CHECK_URL=.*|HEALTH_CHECK_URL=$health_url|" "$DIR/.env"
+                set_env_key HEALTH_CHECK_URL "$health_url"
 
                 read -r -p "  Number of proxy instances [1]: " input
-                [ -n "$input" ] && sed -i "s|^PROXY_INSTANCES=.*|PROXY_INSTANCES=$input|" "$DIR/.env"
+                [ -n "$input" ] && set_env_key PROXY_INSTANCES "$input"
 
                 ok ".env created from .env.example"
                 echo "  Edit $DIR/.env to customize further."
             else
-                ok ".env exists, skipping"
-                cur_url=$(read_sub_url)
-                vm_fixed2=$(fix_vm_url "$cur_url")
-                wsl_fixed2=$(fix_wsl_url "$cur_url")
-                if [ "$wsl_fixed2" != "$cur_url" ]; then
-                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$wsl_fixed2|" "$DIR/.env"
-                    ok "Updated SUBSCRIPTION_URL in .env for WSL2 -> $wsl_fixed2"
-                elif [ "$vm_fixed2" != "$cur_url" ]; then
-                    sed -i "s|^SUBSCRIPTION_URL=.*|SUBSCRIPTION_URL=$vm_fixed2|" "$DIR/.env"
-                    ok "Updated SUBSCRIPTION_URL in .env for VM/Docker -> $vm_fixed2"
-                elif [[ "$cur_url" == *"127.0.0.1"* ]] || [[ "$cur_url" == *"localhost"* ]]; then
-                    echo -e "${RED}[WARN] .env still uses $cur_url — inside Docker this fails. Use host.docker.internal or LAN IP${NC}"
+                old_joined=$(join_commas "$(read_env_sub_urls)")
+                new_joined=$(join_commas "$sub_urls")
+                if [ "$new_joined" != "$old_joined" ]; then
+                    write_env_subscriptions "$first_url" "$rest_urls"
+                    ok "Updated subscriptions in .env"
+                else
+                    ok ".env subscriptions up to date"
+                fi
+                if [[ "$new_joined" == *"127.0.0.1"* ]] || [[ "$new_joined" == *"localhost"* ]]; then
+                    echo -e "${RED}[WARN] .env still uses 127.0.0.1/localhost — inside Docker this fails. Use host.docker.internal or LAN IP${NC}"
                 fi
             fi
 
@@ -320,18 +424,19 @@ else
 
     mkdir -p "$DIR/config"
 
-    # Get subscription URL from any available source
-    sub_url=$(read_sub_url)
+    # Get subscription URLs from any available source
+    sub_urls=$(read_sub_urls)
 
-    if [ -n "$sub_url" ]; then
-        ok "Found subscription: $sub_url"
-    else
-        echo "Enter subscription URL:"
-        read -r -p "URL: " sub_url
-        [[ -z "$sub_url" ]] && { err "URL required"; exit 1; }
-        echo "$sub_url" > "$DIR/config/subscription.txt"
+    if [ -z "$sub_urls" ]; then
+        echo "Enter subscription URL (comma-separated list allowed):"
+        read -r -p "URL: " input
+        [[ -z "$input" ]] && { err "URL required"; exit 1; }
+        echo "$input" > "$DIR/config/subscription.txt"
+        sub_urls=$(split_sub_urls "$input")
         ok "Subscription saved"
     fi
+    src_count=$(printf '%s\n' "$sub_urls" | grep -c .)
+    ok "Using $src_count subscription source(s)"
 
     health_url="https://www.gstatic.com/generate_204"
     echo "Health check URL (default: $health_url):"
@@ -360,7 +465,7 @@ else
     echo "  Detach:  Ctrl+O then D"
     echo ""
 
-    export SUBSCRIPTION_URL="$sub_url"
+    export SUBSCRIPTION_URL="$(join_commas "$sub_urls")"
     export HEALTH_CHECK_URL="$health_url"
     export XRAY_DIR="$DIR/xray"
 
