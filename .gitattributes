@@ -6,20 +6,21 @@
 go.mod text diff=golang
 go.sum text diff=golang
 
-# Shell scripts
-*.sh text eol=lf
+# Shell scripts (excluded from language stats)
+*.sh text eol=lf linguist-vendored
 
-# Docker
-Dockerfile text diff=dockerfile
-docker-compose.yml text
+# Docker (excluded from language stats)
+Dockerfile text diff=dockerfile linguist-vendored
+docker-compose.yml text linguist-vendored
 
-# Markdown
-*.md text diff=markdown
+# Markdown (excluded from language stats)
+*.md text diff=markdown linguist-vendored
 
-# Config
-*.json text
-*.yml text
-*.yaml text
+# Config (excluded from language stats)
+*.json text linguist-vendored
+*.yml text linguist-vendored
+*.yaml text linguist-vendored
+.env.example text linguist-vendored
 
 # Binary
 *.exe binary
