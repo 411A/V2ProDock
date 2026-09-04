@@ -286,6 +286,7 @@ func (m *ProxyManager) Start() error {
 					continue
 				}
 				m.markOK(idx, cfg.Name, sel.LastLatency())
+				infoLog("Instance %d ready (%d/%d)", idx, m.AliveCount(), len(insts))
 				return
 			}
 			m.markDown(idx, "could not claim a unique working config")

@@ -65,14 +65,17 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 }
 
 // probeShared lets concurrently probing instances share what they learned:
-// configs that already failed elsewhere are skipped instead of re-probed.
+// configs that already failed elsewhere are skipped instead of re-probed,
+// and configs currently being probed (or already owned) are claimed so no
+// two workers waste time testing the same candidate.
 type probeShared struct {
-	mu  sync.Mutex
-	bad map[string]struct{}
+	mu      sync.Mutex
+	bad     map[string]struct{}
+	claimed map[string]struct{}
 }
 
 func newProbeShared() *probeShared {
-	return &probeShared{bad: make(map[string]struct{})}
+	return &probeShared{bad: make(map[string]struct{}), claimed: make(map[string]struct{})}
 }
 
 func (p *probeShared) isBad(raw string) bool {
@@ -92,6 +95,32 @@ func (p *probeShared) markBad(raw string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.bad[raw] = struct{}{}
+}
+
+// tryClaim atomically reserves a config for probing. Returns false if another
+// worker already claimed it, so the same candidate is never tested twice.
+func (p *probeShared) tryClaim(raw string) bool {
+	if p == nil {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.claimed[raw]; ok {
+		return false
+	}
+	p.claimed[raw] = struct{}{}
+	return true
+}
+
+// unclaim releases a reservation after a failed probe. Successful probes keep
+// their claim — the config is now owned by that instance.
+func (p *probeShared) unclaim(raw string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.claimed, raw)
 }
 
 func (s *ProxySelector) startShared(exclude map[string]int, shared *probeShared, deadline time.Time) error {
@@ -129,9 +158,14 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			skipped++
 			continue
 		}
+		// Reserve before probing so no two workers test the same candidate.
+		if !shared.tryClaim(s.configs[i].Raw) {
+			continue
+		}
 		if err := s.startXray(i); err != nil {
 			debugLog("candidate %d/%d %s: xray start failed: %v", i+1, len(s.configs), shortName(s.configs[i].Name), err)
 			shared.markBad(s.configs[i].Raw)
+			shared.unclaim(s.configs[i].Raw)
 			continue
 		}
 		// Fast probe: skip waitForPort, use single-URL 3s timeout.
@@ -146,6 +180,7 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 		}
 		debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
 		shared.markBad(s.configs[i].Raw)
+		shared.unclaim(s.configs[i].Raw)
 		s.stopXray()
 	}
 	return skipped, fmt.Errorf("no working config found")
