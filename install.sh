@@ -317,7 +317,16 @@ if [ "$DOCKER_MODE" = true ]; then
             ok "Removed"
             ;;
         *)
-            # Install / update mode
+            # Install / update mode — always pull latest code first so a
+            # stale checkout (e.g. re-running from inside the repo) can't
+            # rebuild an old binary from Docker layer cache.
+            if [ -d "$DIR/.git" ]; then
+                if git -C "$DIR" pull --ff-only 2>&1; then
+                    ok "Repo updated"
+                else
+                    echo -e "${RED}[WARN] git pull failed (local changes?) — continuing with local code${NC}"
+                fi
+            fi
             mkdir -p "$DIR/config"
 
             # 1. Gather subscription URLs from all sources (one per line)
