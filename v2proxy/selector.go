@@ -61,21 +61,77 @@ func (s *ProxySelector) StartWithBest() error {
 }
 
 func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
+	return s.startShared(exclude, nil, time.Time{})
+}
+
+// probeShared lets concurrently probing instances share what they learned:
+// configs that already failed elsewhere are skipped instead of re-probed.
+type probeShared struct {
+	mu  sync.Mutex
+	bad map[string]struct{}
+}
+
+func newProbeShared() *probeShared {
+	return &probeShared{bad: make(map[string]struct{})}
+}
+
+func (p *probeShared) isBad(raw string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.bad[raw]
+	return ok
+}
+
+func (p *probeShared) markBad(raw string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bad[raw] = struct{}{}
+}
+
+func (s *ProxySelector) startShared(exclude map[string]int, shared *probeShared, deadline time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.configs) == 0 {
 		return fmt.Errorf("no configs available")
 	}
+	skipped, err := s.tryConfigs(exclude, shared, deadline, true)
+	if err == nil {
+		return nil
+	}
+	if skipped == 0 {
+		return err
+	}
+	// Bad marks can come from transient failures — retry them once before giving up.
+	debugLog("retrying %d bad-marked configs (transient failures possible)...", skipped)
+	_, err2 := s.tryConfigs(exclude, shared, deadline, false)
+	return err2
+}
 
+func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, deadline time.Time, respectBad bool) (int, error) {
+	skipped := 0
 	for i := range s.configs {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return skipped, fmt.Errorf("probe timeout")
+		}
 		if exclude != nil {
 			if _, ok := exclude[s.configs[i].Raw]; ok {
 				continue
 			}
 		}
+		if respectBad && shared.isBad(s.configs[i].Raw) {
+			skipped++
+			continue
+		}
 		if err := s.startXray(i); err != nil {
 			debugLog("candidate %d/%d %s: xray start failed: %v", i+1, len(s.configs), shortName(s.configs[i].Name), err)
+			shared.markBad(s.configs[i].Raw)
 			continue
 		}
 		if waitForPort(s.socksPort, 2*time.Second) {
@@ -85,15 +141,16 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 				s.lastLatency = result.Latency
 				s.failCount = 0
 				readyLog(s.configs[i].Name, result.Latency.Milliseconds())
-				return nil
+				return skipped, nil
 			}
 			debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
 		} else {
 			debugLog("candidate %d/%d %s: port %d never opened", i+1, len(s.configs), shortName(s.configs[i].Name), s.socksPort)
 		}
+		shared.markBad(s.configs[i].Raw)
 		s.stopXray()
 	}
-	return fmt.Errorf("no working config found")
+	return skipped, fmt.Errorf("no working config found")
 }
 
 func (s *ProxySelector) HealthCheck() bool {

@@ -13,6 +13,7 @@ const (
 	defaultPortBase = 27019
 	maxPort         = 27999
 	probeWorkers    = 4
+	probeTimeout    = 3 * time.Minute
 )
 
 type InstanceStatus struct {
@@ -210,15 +211,21 @@ func (m *ProxyManager) Start() error {
 	pool = dedupConfigs(pool)
 	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
 
+	// Spread start positions across the pool so workers don't all grind the same prefix.
+	stride := 0
+	if len(insts) > 0 {
+		stride = len(pool) / len(insts)
+	}
 	rawLists := make([][]ProxyConfig, len(insts))
 	for i := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
-		rotateConfigs(configs, i*3)
+		rotateConfigs(configs, i*stride)
 		rawLists[i] = configs
 		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
 		insts[i].UpdateConfigs(configs)
 	}
+	shared := newProbeShared()
 
 	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies (up to %d at a time), please wait 30-60s...", len(insts), probeWorkers))
 	var usedMu sync.Mutex
@@ -263,8 +270,9 @@ func (m *ProxyManager) Start() error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
-			for attempt := 0; attempt < 3; attempt++ {
-				if err := sel.StartWithBestExcluding(snapUsed()); err != nil {
+			deadline := time.Now().Add(probeTimeout)
+			for attempt := 0; attempt < 3 && time.Now().Before(deadline); attempt++ {
+				if err := sel.startShared(snapUsed(), shared, deadline); err != nil {
 					errLog("Instance %d: no working unique config: %v", idx, err)
 					m.markDown(idx, err.Error())
 					return
@@ -355,16 +363,21 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		return
 	}
 	pool = dedupConfigs(pool)
+	stride := 0
+	if len(insts) > 0 {
+		stride = len(pool) / len(insts)
+	}
+	shared := newProbeShared()
 	for i, inst := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
-		rotateConfigs(configs, i*3)
+		rotateConfigs(configs, i*stride)
 		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
 		if m.statusOf(i).Status != "ok" {
 			used := m.buildExcluding(i)
-			if err := inst.StartWithBestExcluding(used); err == nil {
+			if err := inst.startShared(used, shared, time.Now().Add(probeTimeout)); err == nil {
 				name := ""
 				if cfg := inst.ActiveConfig(); cfg != nil {
 					name = cfg.Name
