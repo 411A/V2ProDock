@@ -43,7 +43,7 @@ SUBSCRIPTION_URLS=https://sub1.example,https://sub2.example,https://sub3.example
 PROXY_INSTANCES=3
 ```
 
-Each instance gets its own dynamically assigned SOCKS5 + HTTP port pair. Query them via the API:
+Port layout: all SOCKS5 ports come first, then all HTTP ports. Instance `i` of `N` gets `SOCKS5=PORT_BASE+i` and `HTTP=PORT_BASE+N+i` (e.g. with `N=3`: SOCKS `27019-27021`, HTTP `27022-27024`). Query them via the API:
 
 ```bash
 # Returns alive proxies sorted by lowest latency
@@ -52,8 +52,8 @@ curl http://localhost:27018/proxies
 
 ```json
 [
-  {"index":1, "socks5":"0.0.0.0:27021", "http":"0.0.0.0:27022", "status":"ok", "latency_ms":85, "name":"server-1"},
-  {"index":0, "socks5":"0.0.0.0:27019", "http":"0.0.0.0:27020", "status":"ok", "latency_ms":120, "name":"server-2"}
+  {"index":1, "socks5":"0.0.0.0:27020", "http":"0.0.0.0:27023", "status":"ok", "latency_ms":85, "name":"server-1"},
+  {"index":0, "socks5":"0.0.0.0:27019", "http":"0.0.0.0:27022", "status":"ok", "latency_ms":120, "name":"server-2"}
 ]
 ```
 
@@ -141,7 +141,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `SUBSCRIPTION_URL` | — | Single v2ray subscription URL (see [V2RayDAR](https://github.com/411A/V2RayDAR) to self-host one) |
 | `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
 | `PROXY_INSTANCES` | `1` | Number of xray instances to run |
-| `PORT_BASE` | `27019` | Base port for proxy allocation |
+| `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `http://api.ipify.org` | URL used to test proxy connectivity |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |

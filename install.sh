@@ -30,15 +30,15 @@ show_status() {
     echo -e "${CYAN}Proxies:${NC}"
     local i=0
     while [ "$i" -lt "$instances" ]; do
-        local socks=$((port_base + i * 2))
-        local http=$((socks + 1))
+        local socks=$((port_base + i))
+        local http=$((port_base + instances + i))
         echo "  SOCKS5: localhost:$socks   HTTP: localhost:$http"
         i=$((i + 1))
     done
     echo ""
     echo -e "${CYAN}Test (first proxy):${NC}"
     echo "  curl --socks5 localhost:$port_base https://api.ipify.org"
-    echo "  curl --proxy http://localhost:$((port_base + 1)) https://api.ipify.org"
+    echo "  curl --proxy http://localhost:$((port_base + instances)) https://api.ipify.org"
     echo ""
 
     # Check API health after a brief wait
@@ -61,7 +61,7 @@ show_status() {
     fi
     echo ""
     echo "Other containers use:"
-    echo "  HTTP_PROXY=http://v2prodock:$((port_base + 1))"
+    echo "  HTTP_PROXY=http://v2prodock:$((port_base + instances))"
     echo "  HTTPS_PROXY=socks5://v2prodock:$port_base"
 }
 
@@ -455,8 +455,8 @@ else
     echo -e "${CYAN}Proxies:${NC}"
     i=0
     while [ "$i" -lt "$local_instances" ]; do
-        s=$((local_port_base + i * 2))
-        h=$((s + 1))
+        s=$((local_port_base + i))
+        h=$((local_port_base + local_instances + i))
         echo "  SOCKS5: localhost:$s   HTTP: localhost:$h"
         i=$((i + 1))
     done
