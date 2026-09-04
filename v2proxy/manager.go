@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"sort"
 	"strings"
@@ -123,18 +124,14 @@ func dedupConfigs(in []ProxyConfig) []ProxyConfig {
 	return out
 }
 
-func rotateConfigs(in []ProxyConfig, offset int) {
-	if len(in) <= 1 || offset == 0 {
-		return
-	}
-	offset %= len(in)
-	if offset < 0 {
-		offset += len(in)
-	}
-	tmp := make([]ProxyConfig, len(in))
-	copy(tmp, in)
-	copy(in, tmp[offset:])
-	copy(in[len(in)-offset:], tmp[:offset])
+// shuffleConfigs randomly permutes configs with the given seed. Each probing
+// worker gets its own order so all workers sample the whole pool uniformly
+// instead of grinding the same contiguous block in lockstep (working proxies
+// often cluster in one region of the pool). Uniqueness across instances is
+// still guaranteed by the shared claim set, not by ordering.
+func shuffleConfigs(in []ProxyConfig, seed int64) {
+	r := rand.New(rand.NewSource(seed))
+	r.Shuffle(len(in), func(a, b int) { in[a], in[b] = in[b], in[a] })
 }
 
 func (m *ProxyManager) snapshot() (insts []*ProxySelector, subURLs []string) {
@@ -204,16 +201,14 @@ func (m *ProxyManager) Start() error {
 	pool = dedupConfigs(pool)
 	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
 
-	// Spread start positions across the pool so workers don't all grind the same prefix.
-	stride := 0
-	if len(insts) > 0 {
-		stride = len(pool) / len(insts)
-	}
+	// Each worker shuffles independently so all instances sample the whole pool
+	// uniformly from t=0 instead of grinding one contiguous block each.
+	shuffleBase := time.Now().UnixNano()
 	rawLists := make([][]ProxyConfig, len(insts))
 	for i := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
-		rotateConfigs(configs, i*stride)
+		shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
 		rawLists[i] = configs
 		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
 		insts[i].UpdateConfigs(configs)
@@ -357,15 +352,12 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		return
 	}
 	pool = dedupConfigs(pool)
-	stride := 0
-	if len(insts) > 0 {
-		stride = len(pool) / len(insts)
-	}
+	shuffleBase := time.Now().UnixNano()
 	shared := newProbeShared()
 	for i, inst := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
-		rotateConfigs(configs, i*stride)
+		shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
 		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)
 
