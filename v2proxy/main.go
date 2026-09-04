@@ -25,7 +25,7 @@ func main() {
 		}
 	}
 
-	bannerLog("▸ Starting V2Ray Proxy...")
+	bannerLog("Starting V2Ray Proxy...")
 
 	xrayDir := "/root/xray"
 	testURL := "http://httpbin.org/ip"
