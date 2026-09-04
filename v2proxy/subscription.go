@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,9 +51,26 @@ func subscriptionCandidates(raw string) []string {
 	return out
 }
 
+func splitURLs(s string) []string {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == ';' || r == ' ' || r == '\t'
+	})
+	seen := make(map[string]bool, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
 func fetchOneURL(client *http.Client, subURL string) (string, error) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			time.Sleep(time.Duration(500*(1<<attempt)) * time.Millisecond)
 		}
@@ -85,7 +103,7 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			Proxy: nil,
 		},
@@ -129,6 +147,84 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 		proxies = append(proxies, *proxy)
 	}
 	return proxies, nil
+}
+
+func FetchAnySubscription(urls []string) ([]ProxyConfig, string, error) {
+	var errs []string
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		cfgs, err := FetchSubscription(u)
+		if err == nil && len(cfgs) > 0 {
+			return cfgs, u, nil
+		}
+		if err != nil {
+			errs = append(errs, u+": "+err.Error())
+			debugLog("subscription %s failed, trying next: %v", u, err)
+		} else {
+			errs = append(errs, u+": empty (0 proxies)")
+			debugLog("subscription %s empty, trying next", u)
+		}
+	}
+	if len(errs) == 0 {
+		return nil, "", fmt.Errorf("no subscription URLs configured")
+	}
+	return nil, "", fmt.Errorf("all %d subscription URLs failed: %s", len(errs), strings.Join(errs, " | "))
+}
+
+func FetchMergedSubscriptions(urls []string) []ProxyConfig {
+	clean := make([]string, 0, len(urls))
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			clean = append(clean, u)
+		}
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	if len(clean) == 1 {
+		cfgs, err := FetchSubscription(clean[0])
+		if err != nil {
+			warnLog("subscription fetch failed: %v", err)
+			return nil
+		}
+		if len(cfgs) == 0 {
+			warnLog("subscription %s returned 0 proxies", clean[0])
+			return nil
+		}
+		return cfgs
+	}
+	var mu sync.Mutex
+	var merged []ProxyConfig
+	var wg sync.WaitGroup
+	for _, u := range clean {
+		wg.Add(1)
+		go func(subURL string) {
+			defer wg.Done()
+			cfgs, err := FetchSubscription(subURL)
+			if err != nil {
+				warnLog("subscription %s failed (%v), using other sources", subURL, err)
+				return
+			}
+			if len(cfgs) == 0 {
+				warnLog("subscription %s returned 0 proxies, using other sources", subURL)
+				return
+			}
+			mu.Lock()
+			merged = append(merged, cfgs...)
+			mu.Unlock()
+			debugLog("subscription %s contributed %d configs", subURL, len(cfgs))
+		}(u)
+	}
+	wg.Wait()
+	if len(merged) == 0 {
+		warnLog("all %d subscription URLs failed, keeping existing configs", len(clean))
+		return nil
+	}
+	return dedupConfigs(merged)
 }
 
 func decodeBase64Content(s string) string {

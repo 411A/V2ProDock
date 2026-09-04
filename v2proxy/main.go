@@ -59,30 +59,26 @@ func main() {
 		}
 	}
 
-	// Subscription URL resolution: SUBSCRIPTION_URLS > SUBSCRIPTION_URL > file > stdin
+	// Subscription URL resolution: merge SUBSCRIPTION_URLS + SUBSCRIPTION_URL + file > stdin.
+	// Both env vars accept comma/newline/space-separated lists; dead URLs are
+	// skipped automatically via parallel failover fetch.
 	var subURLs []string
-	if v := os.Getenv("SUBSCRIPTION_URLS"); v != "" {
-		subURLs = strings.Split(v, ",")
-		for i := range subURLs {
-			subURLs[i] = strings.TrimSpace(subURLs[i])
-		}
-	} else if subURL != "" {
-		// Single URL, will be shared across all instances
-		subURLs = []string{subURL}
-	} else {
+	subURLs = append(subURLs, splitURLs(os.Getenv("SUBSCRIPTION_URLS"))...)
+	subURLs = append(subURLs, splitURLs(subURL)...)
+	if len(subURLs) == 0 {
 		subFile := filepath.Join("/root/config", "subscription.txt")
 		if data, err := os.ReadFile(subFile); err == nil {
-			subURL = strings.TrimSpace(string(data))
-			subURLs = []string{subURL}
+			subURLs = append(subURLs, splitURLs(string(data))...)
 		}
 	}
 
-	if len(subURLs) == 0 || subURLs[0] == "" {
+	if len(subURLs) == 0 {
 		fmt.Print("Enter subscription URL: ")
 		if _, err := fmt.Scanln(&subURL); err != nil {
 			errLog("scan failed: %v", err)
 		}
-		if subURL == "" {
+		subURLs = splitURLs(subURL)
+		if len(subURLs) == 0 {
 			errLog("Subscription URL is required")
 			os.Exit(1)
 		}
@@ -94,8 +90,8 @@ func main() {
 			errLog("write subscription failed: %v", err)
 			os.Exit(1)
 		}
-		subURLs = []string{subURL}
 	}
+	infoLog("configured %d subscription source(s)", len(subURLs))
 
 	if err := EnsureXray(xrayDir); err != nil {
 		errLog("Xray setup failed: %v", err)
@@ -103,6 +99,10 @@ func main() {
 	}
 
 	manager := NewProxyManager(xrayDir, testURL, portBase, instanceCount, subURLs, 60*time.Second)
+
+	// Start API first so /health and /proxies answer even while proxies populate.
+	apiActualPort := startAPI(manager, apiPort)
+	infoLog("API available at http://0.0.0.0:%d/proxies", apiActualPort)
 
 	debugLog("Starting %d instance(s)...", manager.InstanceCount())
 	if err := manager.Start(); err != nil {
@@ -117,10 +117,6 @@ func main() {
 			fmt.Sprintf("127.0.0.1:%d", inst.SOCKSPort()),
 		)
 	}
-
-	// Start API server
-	apiActualPort := startAPI(manager, apiPort)
-	infoLog("API available at http://0.0.0.0:%d/proxies", apiActualPort)
 
 	printSummaryTable(manager.GetStatuses())
 
