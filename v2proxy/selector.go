@@ -75,6 +75,7 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 			}
 		}
 		if err := s.startXray(i); err != nil {
+			debugLog("candidate %d/%d %s: xray start failed: %v", i+1, len(s.configs), shortName(s.configs[i].Name), err)
 			continue
 		}
 		if waitForPort(s.socksPort, 2*time.Second) {
@@ -86,6 +87,9 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 				readyLog(s.configs[i].Name, result.Latency.Milliseconds())
 				return nil
 			}
+			debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
+		} else {
+			debugLog("candidate %d/%d %s: port %d never opened", i+1, len(s.configs), shortName(s.configs[i].Name), s.socksPort)
 		}
 		s.stopXray()
 	}

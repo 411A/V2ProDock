@@ -12,6 +12,7 @@ import (
 const (
 	defaultPortBase = 27019
 	maxPort         = 27999
+	probeWorkers    = 4
 )
 
 type InstanceStatus struct {
@@ -219,25 +220,79 @@ func (m *ProxyManager) Start() error {
 		insts[i].UpdateConfigs(configs)
 	}
 
-	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies sequentially, please wait 30-60s...", len(insts)))
+	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies (up to %d at a time), please wait 30-60s...", len(insts), probeWorkers))
+	var usedMu sync.Mutex
 	used := make(map[string]int)
+	snapUsed := func() map[string]int {
+		usedMu.Lock()
+		defer usedMu.Unlock()
+		cp := make(map[string]int, len(used))
+		for k, v := range used {
+			cp[k] = v
+		}
+		return cp
+	}
+
+	stopTick := make(chan struct{})
+	var tickWg sync.WaitGroup
+	tickWg.Add(1)
+	go func() {
+		defer tickWg.Done()
+		t := time.NewTicker(20 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				infoLog("Populating... %d/%d ready", m.AliveCount(), len(insts))
+			case <-stopTick:
+				return
+			}
+		}
+	}()
+
+	sem := make(chan struct{}, probeWorkers)
+	var wg sync.WaitGroup
 	for i, inst := range insts {
 		if rawLists[i] == nil {
+			m.markDown(i, "no configs available")
 			continue
 		}
-		debugLog("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
-		if err := inst.StartWithBestExcluding(used); err != nil {
-			errLog("Instance %d: no working unique config: %v", i, err)
-			m.markDown(i, err.Error())
-			continue
-		}
-		name := ""
-		if cfg := inst.ActiveConfig(); cfg != nil {
-			name = cfg.Name
-			used[cfg.Raw] = i
-		}
-		m.markOK(i, name, inst.LastLatency())
+		wg.Add(1)
+		go func(idx int, sel *ProxySelector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
+			for attempt := 0; attempt < 3; attempt++ {
+				if err := sel.StartWithBestExcluding(snapUsed()); err != nil {
+					errLog("Instance %d: no working unique config: %v", idx, err)
+					m.markDown(idx, err.Error())
+					return
+				}
+				cfg := sel.ActiveConfig()
+				if cfg == nil {
+					m.markDown(idx, "no active config")
+					return
+				}
+				usedMu.Lock()
+				_, dup := used[cfg.Raw]
+				if !dup {
+					used[cfg.Raw] = idx
+				}
+				usedMu.Unlock()
+				if dup {
+					debugLog("Instance %d: %s taken by another instance, retrying...", idx, shortName(cfg.Name))
+					continue
+				}
+				m.markOK(idx, cfg.Name, sel.LastLatency())
+				return
+			}
+			m.markDown(idx, "could not claim a unique working config")
+		}(i, inst)
 	}
+	wg.Wait()
+	close(stopTick)
+	tickWg.Wait()
 
 	return nil
 }
