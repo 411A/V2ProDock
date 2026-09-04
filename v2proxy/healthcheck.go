@@ -21,6 +21,9 @@ var fallbackHealthURLs = []string{
 	"http://api.ipify.org",
 }
 
+// probeURL is the fastest reliable URL for initial probing — HTTP, no TLS.
+const probeURL = "http://www.gstatic.com/generate_204"
+
 func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResult {
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
@@ -84,4 +87,14 @@ func TestProxyHealth(proxyAddr string, primaryURL string, timeout time.Duration)
 	}
 
 	return lastRes
+}
+
+// TestProxyQuick does a single fast probe: one URL, 3s timeout, no fallbacks.
+// Used during initial population to test many candidates quickly.
+func TestProxyQuick(proxyAddr, testURL string) HealthResult {
+	url := probeURL
+	if testURL != "" {
+		url = testURL
+	}
+	return testSingleURL(proxyAddr, url, 3*time.Second)
 }
