@@ -12,7 +12,7 @@ import (
 const (
 	defaultPortBase = 27019
 	maxPort         = 27999
-	probeWorkers    = 4
+	probeWorkers    = 6
 	probeTimeout    = 3 * time.Minute
 )
 

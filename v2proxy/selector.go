@@ -134,19 +134,17 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			shared.markBad(s.configs[i].Raw)
 			continue
 		}
-		if waitForPort(s.socksPort, 2*time.Second) {
-			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
-			if result.Working {
-				s.activeIndex = i
-				s.lastLatency = result.Latency
-				s.failCount = 0
-				readyLog(s.configs[i].Name, result.Latency.Milliseconds())
-				return skipped, nil
-			}
-			debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
-		} else {
-			debugLog("candidate %d/%d %s: port %d never opened", i+1, len(s.configs), shortName(s.configs[i].Name), s.socksPort)
+		// Fast probe: skip waitForPort, use single-URL 3s timeout.
+		// If xray is up, we get a response; if not, connection refused is fast.
+		result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
+		if result.Working {
+			s.activeIndex = i
+			s.lastLatency = result.Latency
+			s.failCount = 0
+			readyLog(s.configs[i].Name, result.Latency.Milliseconds())
+			return skipped, nil
 		}
+		debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
 		shared.markBad(s.configs[i].Raw)
 		s.stopXray()
 	}
@@ -347,7 +345,7 @@ func (s *ProxySelector) startXray(index int) error {
 	}
 
 	// Detect immediate crashes (bad config, missing binary, etc.)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	if s.xrayCmd.Process != nil && s.xrayCmd.Process.Signal(syscall.Signal(0)) != nil {
 		return fmt.Errorf("xray crashed on start")
 	}
