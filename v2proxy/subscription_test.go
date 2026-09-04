@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+func TestDedupEndpointCollision(t *testing.T) {
+	in := []ProxyConfig{
+		{Name: "one", Raw: "vless://u1@1.2.3.4:443#one", Endpoint: endpointKey("1.2.3.4", 443)},
+		{Name: "two", Raw: "vless://u2@1.2.3.4:443#two", Endpoint: endpointKey("1.2.3.4", 443)},
+		{Name: "three", Raw: "vless://u3@5.6.7.8:443#three", Endpoint: endpointKey("5.6.7.8", 443)},
+	}
+	got := dedupConfigs(in)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unique endpoints, got %d", len(got))
+	}
+	if got[0].Name != "one" || got[1].Name != "three" {
+		t.Fatalf("expected first-seen to win, got %+v", got)
+	}
+	if endpointKey("Example.COM", 443) != "example.com:443" {
+		t.Fatalf("endpointKey must lowercase host, got %s", endpointKey("Example.COM", 443))
+	}
+	if (ProxyConfig{Raw: "x"}).Key() != "x" {
+		t.Fatalf("Key must fall back to Raw when Endpoint is empty")
+	}
+}
+
 func TestDecodeBase64Content(t *testing.T) {
 	raw := "vless://uuid@127.0.0.1:443?security=reality#test"
 	if res := decodeBase64Content(raw); res != raw {
