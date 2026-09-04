@@ -120,6 +120,14 @@ func main() {
 
 	printSummaryTable(manager.GetStatuses())
 
+	alive := manager.AliveCount()
+	total := manager.InstanceCount()
+	if alive == 0 {
+		errLog("No working proxies (0/%d) — check subscription URLs, then 'docker logs v2prodock'", total)
+	} else {
+		bannerLog(fmt.Sprintf("Working proxies: %d/%d", alive, total))
+	}
+
 	go subscriptionLoop(manager)
 	go healthCheckLoop(manager)
 
