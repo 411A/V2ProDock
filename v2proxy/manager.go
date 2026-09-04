@@ -381,14 +381,9 @@ func (m *ProxyManager) GetStatuses() []InstanceStatus {
 	result := make([]InstanceStatus, len(m.statuses))
 	copy(result, m.statuses)
 
+	// Human-friendly: always in instance order.
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].Status == "ok" && result[j].Status != "ok" {
-			return true
-		}
-		if result[i].Status != "ok" && result[j].Status == "ok" {
-			return false
-		}
-		return result[i].LatMs < result[j].LatMs
+		return result[i].Index < result[j].Index
 	})
 
 	return result

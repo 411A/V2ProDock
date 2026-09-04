@@ -65,10 +65,7 @@ func (s *ProxySelector) StartWithBestExcluding(exclude map[string]int) error {
 }
 
 // probeShared lets concurrently probing instances share what they learned:
-fix: independent shuffled probe order per instance, 10 workers
-
-- manager.go: shuffleConfigs gives each instance its own random pool order (seeded per run+index); Start and Refresh use it instead of contiguous rotation
-- constants.go: probeWorkers 6->10 so every instance probes from t=0; uniqueness still enforced by shared claim set// configs that already failed elsewhere are skipped instead of re-probed,
+// configs that already failed elsewhere are skipped instead of re-probed,
 // and configs currently being probed (or already owned) are claimed so no
 // two workers waste time testing the same candidate.
 type probeShared struct {
