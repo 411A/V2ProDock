@@ -46,22 +46,17 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		statuses:      make([]InstanceStatus, instanceCount),
 	}
 
-	for i := 0; i < instanceCount; i++ {
-		var socksPort, httpPort int
+	// Port layout: all SOCKS5 ports first, then all HTTP ports.
+	// Instance i -> SOCKS=base+i, HTTP=base+instanceCount+i.
+	block, err := findAvailableBlock(portBase, instanceCount*2)
+	if err != nil {
+		errLog("no available port block: %v", err)
+		return m
+	}
 
-		if i == 0 {
-			// Instance 0 always uses the fixed default port
-			socksPort = defaultPortBase
-			httpPort = defaultPortBase + 1
-		} else {
-			// Additional instances get dynamically assigned ports
-			var err error
-			socksPort, httpPort, err = findAvailablePorts(portBase + i*2)
-			if err != nil {
-				errLog("Instance %d: no available ports starting from %d: %v", i, portBase+i*2, err)
-				continue
-			}
-		}
+	for i := 0; i < instanceCount; i++ {
+		socksPort := block + i
+		httpPort := block + instanceCount + i
 
 		selector := NewProxySelector(xrayDir, testURL, socksPort, httpPort, checkInterval)
 		m.instances = append(m.instances, selector)
@@ -79,23 +74,22 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 	return m
 }
 
-func findAvailablePorts(start int) (socksPort, httpPort int, err error) {
-	for port := start; port <= maxPort-1; port++ {
-		ln1, e1 := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if e1 != nil {
-			continue
+func findAvailableBlock(start, count int) (int, error) {
+	for base := start; base+count-1 <= maxPort; base++ {
+		free := true
+		for port := base; port < base+count; port++ {
+			ln, e := net.Listen("tcp", fmt.Sprintf(":%d", port))
+			if e != nil {
+				free = false
+				break
+			}
+			ln.Close()
 		}
-		ln1.Close()
-
-		ln2, e2 := net.Listen("tcp", fmt.Sprintf(":%d", port+1))
-		if e2 != nil {
-			continue
+		if free {
+			return base, nil
 		}
-		ln2.Close()
-
-		return port, port + 1, nil
 	}
-	return 0, 0, fmt.Errorf("no available port pair found starting from %d", start)
+	return 0, fmt.Errorf("no available block of %d ports starting from %d", count, start)
 }
 
 func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
