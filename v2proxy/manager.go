@@ -374,3 +374,15 @@ func (m *ProxyManager) AliveCount() int {
 	}
 	return n
 }
+
+func (m *ProxyManager) StartingCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, s := range m.statuses {
+		if s.Status == "starting" {
+			n++
+		}
+	}
+	return n
+}

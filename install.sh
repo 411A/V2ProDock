@@ -41,24 +41,49 @@ show_status() {
     echo "  curl --proxy http://localhost:$((port_base + instances)) https://api.ipify.org"
     echo ""
 
-    # Check API health after a brief wait (bounded: API answers even mid-populate)
-    sleep 3
-    local health
-    health=$(curl -sf --max-time 10 "http://localhost:$api_port/health" 2>/dev/null)
-    if [ -n "$health" ]; then
-        local alive total
-        alive=$(echo "$health" | grep -o '"alive":[0-9]*' | cut -d: -f2)
-        total=$(echo "$health" | grep -o '"instances":[0-9]*' | cut -d: -f2)
-        if [ "${alive:-0}" -gt 0 ]; then
+    # Poll for the first alive proxy — populate takes 30-90s on first run,
+    # so zero alive right after start is expected, not a failure.
+    echo -e "${CYAN}Waiting for first working proxy (populate takes 30-90s)...${NC}"
+    local waited=0 max_wait=120 alive=0 total=0 starting="" health state=""
+    while [ "$waited" -lt "$max_wait" ]; do
+        health=$(curl -sf --max-time 5 "http://localhost:$api_port/health" 2>/dev/null)
+        if [ -n "$health" ]; then
+            alive=$(echo "$health" | grep -o '"alive":[0-9]*' | cut -d: -f2)
+            total=$(echo "$health" | grep -o '"instances":[0-9]*' | cut -d: -f2)
+            starting=$(echo "$health" | grep -o '"starting":[0-9]*' | cut -d: -f2)
+            alive=${alive:-0}
+            total=${total:-0}
+            if [ "$alive" -gt 0 ]; then
+                state="healthy"
+                break
+            fi
+            # Confirmed nothing left starting (and past fetch time) = genuinely down
+            if [ -n "$starting" ] && [ "$starting" -eq 0 ] && [ "$waited" -ge 30 ]; then
+                state="down"
+                break
+            fi
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    case "$state" in
+        healthy)
             ok "Proxy healthy: $alive/$total instances alive"
-        else
+            if [ -n "$starting" ] && [ "$starting" -gt 0 ]; then
+                echo -e "${CYAN}Still populating $starting instance(s) — watch 'docker logs -f v2prodock' for Ready lines${NC}"
+            fi
+            ;;
+        down)
             err "All $total instances are DOWN — check subscription URL in .env"
             echo "  Edit: $DIR/.env"
             echo "  Logs: docker logs v2prodock"
-        fi
-    else
-        echo -e "${CYAN}API not ready yet — run 'docker logs v2prodock' to check status${NC}"
-    fi
+            ;;
+        *)
+            echo -e "${CYAN}Proxies still populating — check back in ~30 seconds:${NC}"
+            echo "  Watch progress: docker logs -f v2prodock  (look for Ready lines)"
+            echo "  Live proxy list: curl http://localhost:$api_port/proxies"
+            ;;
+    esac
     echo ""
     echo "Other containers use:"
     echo "  HTTP_PROXY=http://v2prodock:$((port_base + instances))"

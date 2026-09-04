@@ -46,6 +46,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Content-Type", "application/json")
 		total := manager.InstanceCount()
 		alive := manager.AliveCount()
+		starting := manager.StartingCount()
 		status := "ok"
 		if alive == 0 {
 			status = "degraded"
@@ -54,6 +55,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"status":    status,
 			"instances": total,
 			"alive":     alive,
+			"starting":  starting,
 		}); err != nil {
 			debugLog("encode /health failed: %v", err)
 		}
