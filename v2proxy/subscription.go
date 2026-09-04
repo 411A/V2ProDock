@@ -44,10 +44,9 @@ func subscriptionCandidates(raw string) []string {
 			out = append(out, s)
 		}
 	}
-	add("host.docker.internal")
-	add("172.17.0.1")
-	add("172.18.0.1")
-	add("10.0.2.2")
+	for _, h := range loopbackFallbackHosts {
+		add(h)
+	}
 	return out
 }
 
@@ -70,19 +69,19 @@ func splitURLs(s string) []string {
 
 func fetchOneURL(client *http.Client, subURL string) (string, error) {
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < fetchAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(500*(1<<attempt)) * time.Millisecond)
+			time.Sleep(fetchBackoffBase * time.Duration(1<<attempt))
 		}
 		req, _ := http.NewRequest("GET", subURL, nil)
-		req.Header.Set("User-Agent", "V2ProDock/1.0")
+		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "text/plain,*/*")
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, fetchMaxBody))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
@@ -103,7 +102,7 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: fetchTimeout,
 		Transport: &http.Transport{
 			Proxy: nil,
 		},

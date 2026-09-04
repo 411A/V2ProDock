@@ -159,7 +159,7 @@ func (s *ProxySelector) HealthCheck() bool {
 		return false
 	}
 
-	result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
+	result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, healthCheckTimeout)
 	s.lastCheck = time.Now()
 	s.lastLatency = result.Latency
 
@@ -171,7 +171,7 @@ func (s *ProxySelector) HealthCheck() bool {
 	s.failCount++
 	warnLog("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
 
-	if s.failCount < 3 {
+	if s.failCount < healthFailThreshold {
 		// Consider still healthy until threshold is met
 		return true
 	}
@@ -214,8 +214,8 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(s.socksPort, 2*time.Second) {
-			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, 8*time.Second)
+		if waitForPort(s.socksPort, switchPortWait) {
+			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, healthCheckTimeout)
 			if result.Working {
 				s.activeIndex = i
 				s.lastLatency = result.Latency
@@ -345,7 +345,7 @@ func (s *ProxySelector) startXray(index int) error {
 	}
 
 	// Detect immediate crashes (bad config, missing binary, etc.)
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(xrayCrashDetect)
 	if s.xrayCmd.Process != nil && s.xrayCmd.Process.Signal(syscall.Signal(0)) != nil {
 		return fmt.Errorf("xray crashed on start")
 	}
@@ -368,11 +368,11 @@ func (s *ProxySelector) stopXrayCmd(cmd *exec.Cmd) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-time.After(xrayStopWait):
 			_ = cmd.Process.Kill()
 			<-done
 		}
-		waitForPortFree(s.socksPort, 3*time.Second)
+		waitForPortFree(s.socksPort, xrayPortFreeWait)
 	}
 }
 
