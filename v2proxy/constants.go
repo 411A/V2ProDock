@@ -15,10 +15,11 @@ const (
 
 // ---- Initial probing (populate) ----
 const (
-	probeWorkers     = 10              // parallel probers; raises speed, raises concurrent traffic
-	probeTimeout     = 3 * time.Minute // per-instance deadline before it is marked down
-	probeMaxAttempts = 3               // full-pool passes per instance before giving up
-	populateTick     = 20 * time.Second
+	probeWorkers       = 10              // parallel probers; raises speed, raises concurrent traffic
+	probeTimeout       = 3 * time.Minute // per-instance deadline before it is marked down
+	probeMaxAttempts   = 3               // full-pool passes per instance before giving up
+	populateTick       = 20 * time.Second
+	populateRetryDelay = 15 * time.Second // wait between populate rounds for missing instances
 )
 
 // ---- Quick probe: single URL, no fallbacks, used while populating ----

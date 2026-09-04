@@ -104,13 +104,8 @@ func main() {
 	apiActualPort := startAPI(manager, apiPort)
 	infoLog("API available at http://0.0.0.0:%d/proxies", apiActualPort)
 
-	debugLog("Starting %d instance(s)...", manager.InstanceCount())
-	if err := manager.Start(); err != nil {
-		errLog("Manager start failed: %v", err)
-		os.Exit(1)
-	}
-
-	// Start HTTP proxy for each instance (SOCKS5 -> HTTP bridge)
+	// Start HTTP bridges first (fixed ports): claimed instances serve at once,
+	// stragglers start serving the moment they land their proxy.
 	for _, inst := range manager.instances {
 		startHTTPProxy(
 			fmt.Sprintf("0.0.0.0:%d", inst.HTTPPort()),
@@ -118,15 +113,15 @@ func main() {
 		)
 	}
 
+	debugLog("Starting %d instance(s)...", manager.InstanceCount())
+	if err := manager.Start(); err != nil {
+		errLog("Manager start failed: %v", err)
+		os.Exit(1)
+	}
+	// Start only returns when ALL instances hold a working proxy.
 	printSummaryTable(manager.GetStatuses())
 
-	alive := manager.AliveCount()
-	total := manager.InstanceCount()
-	if alive == 0 {
-		errLog("No working proxies (0/%d) — check subscription URLs, then 'docker logs v2prodock'", total)
-	} else {
-		bannerLog(fmt.Sprintf("Working proxies: %d/%d", alive, total))
-	}
+	bannerLog(fmt.Sprintf("Working proxies: %d/%d", manager.AliveCount(), manager.InstanceCount()))
 
 	go subscriptionLoop(manager)
 	go healthCheckLoop(manager)

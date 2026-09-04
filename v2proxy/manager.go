@@ -185,39 +185,19 @@ func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
 	}
 }
 
-// Start fetches subscriptions and probes proxies. The manager lock is only
-// held for short state updates so the API stays responsive during populate.
+// Start fetches subscriptions and probes proxies, retrying in rounds until
+// EVERY instance holds a unique working proxy. It only returns when all are
+// ok, so the final table never shows a down instance. The manager lock is
+// only held for short state updates so the API stays responsive during populate.
 func (m *ProxyManager) Start() error {
 	insts, subURLs := m.snapshot()
 	if len(insts) == 0 {
 		return fmt.Errorf("no instances configured")
 	}
 
-	pool, err := fetchPoolWithRetry(subURLs)
-	if err != nil {
-		for i := range insts {
-			errLog("Instance %d: subscription fetch failed: %v", i, err)
-			m.markDown(i, err.Error())
-		}
-		return nil
-	}
-	pool = dedupConfigs(pool)
-	debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
-
-	// Each worker shuffles independently so all instances sample the whole pool
-	// uniformly from t=0 instead of grinding one contiguous block each.
-	shuffleBase := time.Now().UnixNano()
-	rawLists := make([][]ProxyConfig, len(insts))
-	for i := range insts {
-		configs := make([]ProxyConfig, len(pool))
-		copy(configs, pool)
-		shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
-		rawLists[i] = configs
-		debugLog("Instance %d: parsed %d unique configs", i, len(configs))
-		insts[i].UpdateConfigs(configs)
-	}
-	shared := newProbeShared()
-
+	// Populate until EVERY instance holds a unique working proxy. Rounds refetch
+	// the pool, so a short pool heals itself when sources update. Statuses only
+	// ever go starting -> ok; nothing is marked down here.
 	bannerLog(fmt.Sprintf("Populating %d instances — testing proxies (up to %d at a time), please wait 30-60s...", len(insts), probeWorkers))
 	var usedMu sync.Mutex
 	used := make(map[string]int)
@@ -248,49 +228,84 @@ func (m *ProxyManager) Start() error {
 		}
 	}()
 
-	sem := make(chan struct{}, probeWorkers)
-	var wg sync.WaitGroup
-	for i, inst := range insts {
-		if rawLists[i] == nil {
-			m.markDown(i, "no configs available")
+	round := 0
+	for {
+		round++
+		if round > 1 {
+			infoLog("populate round %d: %d/%d ready, retrying the rest...", round, m.AliveCount(), len(insts))
+			time.Sleep(populateRetryDelay)
+		}
+		pool, err := fetchPoolWithRetry(subURLs)
+		if err != nil {
+			warnLog("populate round %d: fetch failed: %v — retrying...", round, err)
+			time.Sleep(populateRetryDelay)
 			continue
 		}
-		wg.Add(1)
-		go func(idx int, sel *ProxySelector) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
-			deadline := time.Now().Add(probeTimeout)
-			for attempt := 0; attempt < probeMaxAttempts && time.Now().Before(deadline); attempt++ {
-				if err := sel.startShared(snapUsed(), shared, deadline); err != nil {
-					errLog("Instance %d: no working unique config: %v", idx, err)
-					m.markDown(idx, err.Error())
-					return
-				}
-				cfg := sel.ActiveConfig()
-				if cfg == nil {
-					m.markDown(idx, "no active config")
-					return
-				}
-				usedMu.Lock()
-				_, dup := used[cfg.Key()]
-				if !dup {
-					used[cfg.Key()] = idx
-				}
-				usedMu.Unlock()
-				if dup {
-					debugLog("Instance %d: %s taken by another instance, retrying...", idx, shortName(cfg.Name))
-					continue
-				}
-				m.markOK(idx, cfg.Name, sel.LastLatency())
-				infoLog("Instance %d ready (%d/%d)", idx, m.AliveCount(), len(insts))
-				return
+		pool = dedupConfigs(pool)
+		debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
+
+		// Each missing worker shuffles independently so all sample the whole
+		// pool uniformly instead of grinding one contiguous block each.
+		// Already-ok instances keep serving untouched.
+		shuffleBase := time.Now().UnixNano()
+		rawLists := make([][]ProxyConfig, len(insts))
+		for i := range insts {
+			if m.statusOf(i).Status == "ok" {
+				continue
 			}
-			m.markDown(idx, "could not claim a unique working config")
-		}(i, inst)
+			configs := make([]ProxyConfig, len(pool))
+			copy(configs, pool)
+			shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
+			rawLists[i] = configs
+			debugLog("Instance %d: parsed %d unique configs", i, len(configs))
+			insts[i].UpdateConfigs(configs)
+		}
+		shared := newProbeShared()
+
+		sem := make(chan struct{}, probeWorkers)
+		var wg sync.WaitGroup
+		for i, inst := range insts {
+			if m.statusOf(i).Status == "ok" || rawLists[i] == nil {
+				continue
+			}
+			wg.Add(1)
+			go func(idx int, sel *ProxySelector) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
+				deadline := time.Now().Add(probeTimeout)
+				for attempt := 0; attempt < probeMaxAttempts && time.Now().Before(deadline); attempt++ {
+					if err := sel.startShared(snapUsed(), shared, deadline); err != nil {
+						debugLog("Instance %d: %v", idx, err)
+						return
+					}
+					cfg := sel.ActiveConfig()
+					if cfg == nil {
+						debugLog("Instance %d: no active config yet", idx)
+						return
+					}
+					usedMu.Lock()
+					_, dup := used[cfg.Key()]
+					if !dup {
+						used[cfg.Key()] = idx
+					}
+					usedMu.Unlock()
+					if dup {
+						debugLog("Instance %d: %s taken by another instance, retrying...", idx, shortName(cfg.Name))
+						continue
+					}
+					m.markOK(idx, cfg.Name, sel.LastLatency())
+					return
+				}
+				debugLog("Instance %d: round over without a claim, will retry", idx)
+			}(i, inst)
+		}
+		wg.Wait()
+		if m.AliveCount() == len(insts) {
+			break
+		}
 	}
-	wg.Wait()
 	close(stopTick)
 	tickWg.Wait()
 
