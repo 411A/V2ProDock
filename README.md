@@ -13,6 +13,11 @@
 
 A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle — from subscription parsing to automatic failover. Feed it a subscription URL, and it handles the rest: parses protocols, health-checks servers, and provides stable SOCKS5 + HTTP proxies for your other apps and containers.
 
+> [!CAUTION]
+> **Disclaimer**: V2ProDock operates no proxy servers and provides no bandwidth of its own. You supply the subscription URL(s) — self-hosted or public — and the app routes your traffic through those third-party servers as a free alternative to paid proxies. Public configs are run by strangers, so treat exit nodes as untrusted: prefer TLS end-to-end, and expect no uptime, speed, or anonymity guarantees.
+> 
+> Failover changes your exit IP whenever the active upstream switches, and the VPN gateway is **experimental (alpha)** — do not use it in production or for anything sensitive to IP changes (IP-locked accounts, banking, anti-fraud systems). You are responsible for complying with your ISP's terms and the terms of every service you access through this project.
+
 - [Features](#features) · [Quick Start](#quick-start) · [Multi-Instance Setup](#multi-instance-setup) · [Usage](#usage) · [VPN for legacy devices](#vpn-for-legacy-devices) · [Commands](#commands) · [How It Works](#how-it-works) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [License](#license)
 
 ## How it fits together
