@@ -1,0 +1,18 @@
+; Rendered by entrypoint.sh - do not edit by hand.
+; L2TP LNS: plain L2TP (IPsec wrapping is handled by strongSwan IKEv1),
+; PPP auth via chap-secrets. Any PPP method allowed (PAP/CHAP/MSCHAPv2):
+; the PPP stream already runs inside IPsec encryption.
+[global]
+port = 1701
+auth file = /etc/ppp/chap-secrets
+access control = no
+
+[lns default]
+ip range = __L2TP_RANGE__
+local ip = __L2TP_LOCAL__
+require chap = yes
+refuse pap = no
+require authentication = yes
+name = v2prodock-vpn
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes

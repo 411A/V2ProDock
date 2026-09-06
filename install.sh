@@ -51,6 +51,26 @@ show_status() {
     echo "Other containers use:"
     echo "  HTTP_PROXY=http://v2prodock:$((port_base + instances))"
     echo "  HTTPS_PROXY=socks5://v2prodock:$port_base"
+    echo ""
+    local vpn_enabled vpn_domain vpn_user vpn_plain
+    vpn_enabled=$(env_val VPN_ENABLED 0)
+    vpn_domain=$(env_val VPN_DOMAIN vpn.local)
+    vpn_user=$(env_val VPN_USER vpnuser)
+    vpn_plain=$(env_val VPN_ALLOW_PLAIN_L2TP 0)
+    if [ "$vpn_enabled" = "1" ]; then
+        echo -e "${CYAN}VPN for legacy devices (egress via working proxy):${NC}"
+        echo "  L2TP/IPsec (no files needed): server $vpn_domain, IPsec PSK (see .env VPN_IPSEC_PSK), user $vpn_user"
+        if [ "$vpn_plain" = "1" ]; then
+            echo -e "  ${RED}Bare L2TP (no IPsec): ALLOWED - cleartext, for old stock firmware only${NC}"
+        fi
+        echo "  IKEv2 (needs CA import):       server $vpn_domain (UDP 500/4500), user $vpn_user"
+        echo "  Apple profile: $DIR/config/vpn/apple.mobileconfig"
+        echo "  CA cert:       $DIR/config/vpn/ca.crt"
+        echo "  Verify pinning: curl http://localhost:$api_port/vpn"
+        echo "  Watch proofs:   docker logs -f v2prodock-vpn  (look for VERIFIED lines)"
+    else
+        echo -e "${CYAN}VPN:${NC} disabled (set VPN_ENABLED=1 + VPN_PASSWORD + VPN_IPSEC_PSK in .env to serve TVs/IoT)"
+    fi
 }
 
 # If piped from curl or not inside repo, clone/pull first
@@ -266,6 +286,51 @@ fix_vm_url() {
     echo "$url"
 }
 
+# Host-level prerequisites Docker cannot do itself: kernel modules the VPN
+# container relies on, and host-firewall holes for the VPN UDP ports.
+# Best-effort everywhere: missing tools only warn (README has manual steps).
+ensure_host_prereqs() {
+    local vpn_on="0"
+    if [ -f "$DIR/.env" ]; then
+        vpn_on=$(grep -E "^VPN_ENABLED=" "$DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
+    fi
+
+    # Containers cannot modprobe for themselves; no-ops when built-in.
+    if [ "$(id -u)" = "0" ]; then
+        for mod in tun ppp_generic xt_policy; do
+            modprobe "$mod" 2>/dev/null || true
+        done
+    fi
+    if [ ! -c /dev/net/tun ]; then
+        echo -e "${RED}[WARN] /dev/net/tun missing on this host - VPN cannot work (try: modprobe tun)${NC}"
+    fi
+
+    if [ "$vpn_on" != "1" ]; then
+        return 0
+    fi
+    # Docker publishes the ports, but a default-deny host firewall still
+    # blocks them before they reach Docker. With forced NAT-T encapsulation
+    # only UDP is needed - IP protocol ESP (50) is NOT required anywhere.
+    if command -v ufw &>/dev/null; then
+        if [ "$(id -u)" = "0" ]; then
+            for p in 500 4500 1701; do ufw allow "$p/udp" >/dev/null 2>&1 || true; done
+            ok "Host firewall (ufw): UDP 500/4500/1701 allowed"
+        else
+            echo -e "${RED}[WARN] ufw present but not root - run: sudo ufw allow 500,4500,1701/udp${NC}"
+        fi
+    elif command -v firewall-cmd &>/dev/null; then
+        if [ "$(id -u)" = "0" ] && systemctl is-active --quiet firewalld 2>/dev/null; then
+            for p in 500 4500 1701; do firewall-cmd --permanent --add-port="$p/udp" >/dev/null 2>&1 || true; done
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            ok "Host firewall (firewalld): UDP 500/4500/1701 allowed"
+        else
+            echo -e "${RED}[WARN] firewalld present - ensure UDP 500/4500/1701 are allowed${NC}"
+        fi
+    else
+        echo "Host firewall: no ufw/firewalld found - if clients cannot reach UDP 500/4500/1701, open them manually (cloud security groups too)."
+    fi
+}
+
 
 
 # Check if Docker is available
@@ -281,6 +346,7 @@ if [ "$DOCKER_MODE" = true ]; then
     # Docker mode
     case "${1:-}" in
         start)
+            ensure_host_prereqs
             docker compose up -d
             ok "Started"
             show_status
@@ -293,6 +359,10 @@ if [ "$DOCKER_MODE" = true ]; then
             docker compose ps
             echo ""
             docker logs --tail 10 v2prodock 2>&1
+            echo ""
+            echo "--- v2prodock-vpn (if enabled) ---"
+            docker logs --tail 5 v2prodock-vpn 2>&1 || true
+            curl -sf --max-time 5 http://localhost:$(env_val API_PORT 27018)/vpn 2>/dev/null || echo "(vpn status unavailable)"
             ;;
         logs)
             docker compose logs -f v2prodock
@@ -354,6 +424,28 @@ if [ "$DOCKER_MODE" = true ]; then
                 read -r -p "  Number of proxy instances [1]: " input
                 [ -n "$input" ] && set_env_key PROXY_INSTANCES "$input"
 
+                read -r -p "  Enable VPN (IKEv2 + L2TP) for legacy devices? [y/N]: " input
+                if [[ "$input" =~ ^[Yy]$ ]]; then
+                    set_env_key VPN_ENABLED "1"
+                    read -r -p "  VPN server domain/IP clients connect to [vpn.local]: " input
+                    [ -n "$input" ] && set_env_key VPN_DOMAIN "$input"
+                    read -r -p "  VPN username [vpnuser]: " input
+                    [ -n "$input" ] && set_env_key VPN_USER "$input"
+                    read -r -s -p "  VPN password (min 8 chars): " input; echo
+                    [ -n "$input" ] && set_env_key VPN_PASSWORD "$input"
+                    read -r -s -p "  IPsec PSK for L2TP (min 8 chars, Enter = auto-generate): " input; echo
+                    if [ -z "$input" ]; then
+                        if command -v openssl &>/dev/null; then
+                            input=$(openssl rand -base64 18 | tr -d '\n')
+                        else
+                            input=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 24)
+                        fi
+                        echo -e "${CYAN}  Generated IPsec PSK (save it — L2TP clients need it): $input${NC}"
+                    fi
+                    set_env_key VPN_IPSEC_PSK "$input"
+                    ok "VPN enabled (IKEv2 UDP 500/4500 + L2TP UDP 1701, egress pinned to working proxy)"
+                fi
+
                 ok ".env created from .env.example"
                 echo "  Edit $DIR/.env to customize further."
             else
@@ -370,6 +462,7 @@ if [ "$DOCKER_MODE" = true ]; then
                 fi
             fi
 
+            ensure_host_prereqs
             docker compose build 2>&1
             docker compose up -d 2>&1
             ok "Started"

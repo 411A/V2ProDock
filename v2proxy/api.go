@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 )
 
 func findFreePort(start int) int {
@@ -16,6 +18,27 @@ func findFreePort(start int) int {
 		}
 	}
 	return start
+}
+
+// readVPNStatus parses the shared vpn-gateway status file.
+// ok=false means VPN disabled/not booted yet (fail-closed discovery).
+func readVPNStatus(path string) (map[string]interface{}, bool) {
+	var st map[string]interface{}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return nil, false
+	}
+	if st == nil {
+		return nil, false
+	}
+	return st, true
+}
+
+func vpnStatusPath() string {
+	return filepath.Join(configDir, "vpn", "status.json")
 }
 
 func startAPI(manager *ProxyManager, basePort int) int {
@@ -57,6 +80,30 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"starting":  starting,
 		}); err != nil {
 			debugLog("encode /health failed: %v", err)
+		}
+	})
+
+	// /vpn exposes the sidecar gateway pinning proof written to the shared
+	// ./config volume (./config/vpn/status.json). It is the strict answer to
+	// "does VPN traffic really go FROM the working configs": verified=true
+	// means egress-via-tun0 == egress-via-upstream-SOCKS on the last poll.
+	mux.HandleFunc("/vpn", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		st, ok := readVPNStatus(vpnStatusPath())
+		if !ok {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"enabled": false,
+				"ikev2":   "500/udp,4500/udp",
+				"note":    "vpn-gateway not started or VPN_ENABLED=0; set VPN_ENABLED=1 + VPN_PASSWORD and compose up",
+			})
+			return
+		}
+		st["enabled"] = true
+		st["ikev2"] = "500/udp,4500/udp"
+		st["guarantee"] = "fail-closed: VPN subnet forwards to tun0 only; verified means tun egress == upstream SOCKS egress"
+		if err := json.NewEncoder(w).Encode(st); err != nil {
+			debugLog("encode /vpn failed: %v", err)
 		}
 	})
 

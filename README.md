@@ -64,7 +64,96 @@ curl http://localhost:27018/proxies
 | `/proxies` | GET | Alive proxies sorted by latency (lowest first) |
 | `/all` | GET | All instances including down ones |
 | `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` |
+| `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
+
+## VPN for legacy devices (IKEv2 + L2TP)
+
+`TVs, IoT, consoles` connect to the `v2prodock-vpn` sidecar. Its traffic is
+forced via `tun0` into the fastest **alive** Xray SOCKS — fail-closed, never
+direct. Proofs land in the logs and in `GET /vpn`:
+
+```bash
+# .env
+VPN_ENABLED=1
+VPN_DOMAIN=192.168.1.10   # or public hostname/IP
+VPN_USER=vpnuser
+VPN_PASSWORD=change-me-8-chars-min
+VPN_IPSEC_PSK=change-me-too-8-chars-min
+```
+
+```bash
+curl http://localhost:27018/vpn
+docker logs -f v2prodock-vpn   # look for: VPN egress VERIFIED via <name>: <ip>
+```
+
+### L2TP/IPsec — file-less login (recommended for legacy)
+
+Type `L2TP/IPsec with pre-shared key`, server = `VPN_DOMAIN`, then enter the
+IPsec PSK (`VPN_IPSEC_PSK`) + PPP username/password. No files to import —
+works on old Windows/Android/routers natively.
+
+### Bare L2TP — old stock firmware only (opt-in, insecure)
+
+Some old routers (e.g. stock Asus with bare-L2TP client, no IPsec option)
+cannot do IPsec at all. Set `VPN_ALLOW_PLAIN_L2TP=1` to accept them: server =
+`VPN_DOMAIN`, no PSK, just PPP username/password. **Everything — login and
+all traffic — crosses the internet in cleartext.** Default `0` refuses bare
+L2TP at packet level. Use a unique strong password and only for devices that
+cannot do IPsec.
+
+### IKEv2 — needs one CA import
+
+Server = `VPN_DOMAIN` (`UDP 500/4500`), `EAP-MSCHAPv2` with the same
+username/password, after trusting `config/vpn/ca.crt`. Apple devices can use
+`config/vpn/apple.mobileconfig` instead. Connect using exactly `VPN_DOMAIN`
+(or a name/IP listed in `VPN_EXTRA_SANS`) — anything else fails server-identity
+validation.
+
+### Privileges & troubleshooting
+
+The gateway needs `NET_ADMIN + MKNOD + SYS_ADMIN`, `/dev/net/tun`, and
+`UDP 500/4500/1701` (see compose) — least privilege verified, no
+`--privileged`. The host kernel needs PPP support (`modprobe ppp_generic`).
+PPP diagnostics: `docker exec v2prodock-vpn cat /var/log/ppp.log`.
+Single client stalled while others work: toggle VPN off/on on that device
+(child-SA desync is DPD-blind; the server also recycles DATA SAs every
+30 min regardless).
+Client-side kill switch (essential): our gateway is fail-closed, but a
+device whose own VPN SA dies will happily send traffic direct. On Android
+enable “Block connections without VPN”, on Windows bind sensitive apps
+with firewall rules to the VPN interface, on iOS use OnDemand mode. Without
+this, no VPN provider can promise no-leak on the device itself.
+
+### VM / VPS firewall & LAN clients
+
+Docker publishes the ports, but a default-deny host firewall still blocks
+them first. `install.sh` opens them automatically on `ufw`/`firewalld`
+when `VPN_ENABLED=1`; otherwise do it by hand:
+
+```bash
+sudo ufw allow 500,4500,1701/udp
+# or: sudo firewall-cmd --permanent --add-port={500,4500,1701}/udp && sudo firewall-cmd --reload
+```
+
+Cloud VMs need the same three UDP ports in the provider's security group.
+IP protocol ESP (50) is **not** required anywhere — all IPsec is forced
+through UDP/4500 encapsulation, which is also what makes same-LAN clients
+work (raw ESP cannot cross Docker's port NAT into the container).
+
+Example: project runs in a VM at `192.168.1.100`, legacy box on the same
+LAN connects L2TP to server `192.168.1.100` with your user/pass (+ PSK for
+L2TP/IPsec, none for opt-in bare L2TP). Set `VPN_DOMAIN=192.168.1.100` so
+the server identity matches what clients dial. No host sysctls or forwarding
+setup needed — the container handles its own networking.
+
+WSL2 note: stock WSL2 is NAT mode (`172.x` private IP), so physical LAN
+devices cannot reach services inside a WSL2 distro directly. This project
+runs on Docker Desktop (ports published on the Windows host's own
+interfaces, LAN-reachable), which we verified end-to-end from inside WSL2
+(IKE handshake + L2TP control + generic UDP all answer). If you instead run
+`dockerd` inside WSL2 itself, LAN devices need `netsh interface portproxy`
+relays for UDP 500/4500/1701 from the Windows host into WSL2.
 
 ## Usage
 
@@ -148,6 +237,13 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
+| `VPN_ENABLED` | `0` | `1` = serve IKEv2 + L2TP via working proxy |
+| `VPN_DOMAIN` | `vpn.local` | Hostname/IP clients connect to (server cert SAN) |
+| `VPN_SUBNET` | `10.10.10.0/24` | IKEv2 client pool (forwarded to tun0 only) |
+| `VPN_L2TP_NET` | `10.10.11.0/24` | L2TP client pool (forwarded to tun0 only) |
+| `VPN_DNS` | `1.1.1.1,8.8.8.8` | DNS pushed to clients (also via proxy) |
+| `VPN_USER` / `VPN_PASSWORD` | — | EAP-MSCHAPv2 + PPP creds (or `VPN_USERS=u1:p1,u2:p2`) |
+| `VPN_IPSEC_PSK` | — | IPsec pre-shared key for L2TP clients |
 
 ### Subscription URL
 

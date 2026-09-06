@@ -1,0 +1,17 @@
+# Rendered by entrypoint.sh - do not edit by hand.
+# pppd options for L2TP clients. No require-*-auth line on purpose:
+# PAP/CHAP/MSCHAP/MSCHAPv2 are all accepted for maximum legacy compat
+# (safe: PPP runs inside the IPsec-encrypted L2TP tunnel).
+name v2prodock-vpn
+auth
+nodefaultroute
+noproxyarp
+mtu 1400
+mru 1400
+asyncmap 0
+hide-password
+# debug + logfile: no syslog daemon in the container, so PPP negotiation
+# would otherwise be undiagnosable (see /var/log/ppp.log via docker exec).
+debug
+logfile /var/log/ppp.log
+# __MS_DNS__
