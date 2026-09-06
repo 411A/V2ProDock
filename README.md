@@ -4,7 +4,47 @@
   <img src="https://github.com/user-attachments/assets/82685dd3-b43b-4e27-a7c8-02f3ea5edc67" alt="V2ProDock logo" width="150" height="150">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/docker-ready-blue?logo=docker" alt="Docker ready">
+  <img src="https://img.shields.io/badge/proxy-VLESS_%7C_VMess_%7C_Trojan_%7C_ShadowSocks-lightgrey" alt="Proxy protocols">
+  <img src="https://img.shields.io/badge/VPN-IKEv2_%7C_L2TP_IPsec_%7C_PPTP-green" alt="VPN gateway">
+  <img src="https://img.shields.io/badge/egress-fail--closed-red" alt="Fail-closed egress">
+</p>
+
 A Dockerized V2Ray/Xray proxy client that manages the entire proxy lifecycle — from subscription parsing to automatic failover. Feed it a subscription URL, and it handles the rest: parses protocols, health-checks servers, and provides stable SOCKS5 + HTTP proxies for your other apps and containers.
+
+- [Features](#features) · [Quick Start](#quick-start) · [Multi-Instance Setup](#multi-instance-setup) · [Usage](#usage) · [VPN for legacy devices](#vpn-for-legacy-devices) · [Commands](#commands) · [How It Works](#how-it-works) · [Supported Protocols](#supported-protocols) · [Configuration](#configuration) · [License](#license)
+
+## How it fits together
+
+```mermaid
+flowchart TB
+    subgraph LAN["Your Local Network"]
+        TV["Smart TVs / IoT<br/>IKEv2 / L2TP-IPsec"]
+        SAT["Satellite Receivers<br/>PPTP + MPPE-128"]
+    end
+    subgraph GW["v2prodock-vpn Gateway"]
+        DAEMONS["charon (IKEv2) · xl2tpd (L2TP) · pptpd (PPTP)"]
+        IFACES["ppp / XFRM client interfaces"]
+        FW{{"iptables fail-closed<br/>direct egress DROPPED"}}
+        TUN(["tun0 — hev-socks5-tunnel"])
+        DAEMONS --> IFACES --> FW --> TUN
+    end
+    subgraph CORE["v2prodock Core Proxy Engine"]
+        XRAY[("Live Xray instances<br/>VLESS / VMess / Trojan / Shadowsocks")]
+        API["auto-healthcheck + latency sort<br/>GET /proxies"]
+    end
+    NET["The Internet"]
+    TV -- "UDP 500 / 4500 / 1701" --> DAEMONS
+    SAT -- "TCP 1723 + GRE (proto 47)" --> DAEMONS
+    TUN -- "SOCKS5, pinned to fastest alive" --> XRAY
+    XRAY --> NET
+    XRAY -.-> API
+    style TUN fill:#2ea043,color:#fff
+    style FW fill:#da3633,color:#fff
+```
+
+Pushed DNS is resolved through the same tunnel — clients cannot leak around the working proxy.
 
 ## Features
 
@@ -67,7 +107,43 @@ curl http://localhost:27018/proxies
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 
-## VPN for legacy devices (IKEv2 + L2TP + opt-in PPTP)
+## Usage
+
+### From Python (multi-instance)
+
+```python
+import requests
+
+proxies = requests.get("http://localhost:27018/proxies").json()
+proxy = proxies[0]  # Fastest proxy
+
+r = requests.get("https://api.ipify.org", proxies={
+    "http": f"http://{proxy['http']}",
+    "https": f"socks5://{proxy['socks5']}",
+})
+print(r.text)
+```
+
+### From other Docker containers
+
+```yaml
+services:
+  your-app:
+    image: your-app
+    environment:
+      - HTTP_PROXY=http://v2prodock:27020
+      - HTTPS_PROXY=socks5://v2prodock:27019
+      - NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
+    external: true
+    name: v2prodock_v2prodock-proxy-net
+```
+
+## VPN for legacy devices
 
 `TVs, IoT, consoles` connect to the `v2prodock-vpn` sidecar. Its traffic is
 forced via `tun0` into the fastest **alive** Xray SOCKS — fail-closed, never
@@ -86,6 +162,25 @@ VPN_IPSEC_PSK=change-me-too-8-chars-min
 curl http://localhost:27018/vpn
 docker logs -f v2prodock-vpn   # look for: VPN egress VERIFIED via <name>: <ip>
 ```
+
+### Device quick setup
+
+| Device | Protocol | Settings | Notes |
+|--------|----------|----------|-------|
+| MediaStar / StarSat / Ali-chipset receivers | PPTP | Server = your `VPN_DOMAIN` IP; user/pass from `.env`; encryption (`پنهانسازی`) **ON** | Set `VPN_ENABLE_PPTP=1`. Bridge mode works; switch to host networking only if reconnects stall. |
+| Smart TVs, legacy routers | L2TP/IPsec with pre-shared key | Server = `VPN_DOMAIN`; IPsec PSK = `VPN_IPSEC_PSK`; user/pass from `.env` | No files to import. |
+| Apple TV / iPhone / Mac | IKEv2 | Install `config/vpn/apple.mobileconfig` | Zero-config, certificate pinned. |
+
+### Receiver connection checklist
+
+1. Set `VPN_ENABLE_PPTP=1` in `.env` and `docker compose up -d`.
+2. On the box, server = the exact `VPN_DOMAIN` value (e.g. your VM's LAN IP).
+3. Encryption (`پنهانسازی`) MUST be ON — the server strictly enforces MPPE-128.
+4. Reboot the box once after changing VPN settings; wait 30s+ before redialing.
+5. If redials still stall, switch to host networking (command below).
+
+> **Linux host + PPTP reconnects stalling?** Bridge mode is proven and stays the default — but if redials stall behind Docker NAT, host networking removes NAT from the GRE path entirely (recommended fallback, not a requirement):
+> `docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build`
 
 ### L2TP/IPsec — file-less login (recommended for legacy)
 
@@ -211,42 +306,6 @@ interfaces, LAN-reachable), which we verified end-to-end from inside WSL2
 (IKE handshake + L2TP control + generic UDP all answer). If you instead run
 `dockerd` inside WSL2 itself, LAN devices need `netsh interface portproxy`
 relays for UDP 500/4500/1701 from the Windows host into WSL2.
-
-## Usage
-
-### From Python (multi-instance)
-
-```python
-import requests
-
-proxies = requests.get("http://localhost:27018/proxies").json()
-proxy = proxies[0]  # Fastest proxy
-
-r = requests.get("https://api.ipify.org", proxies={
-    "http": f"http://{proxy['http']}",
-    "https": f"socks5://{proxy['socks5']}",
-})
-print(r.text)
-```
-
-### From other Docker containers
-
-```yaml
-services:
-  your-app:
-    image: your-app
-    environment:
-      - HTTP_PROXY=http://v2prodock:27020
-      - HTTPS_PROXY=socks5://v2prodock:27019
-      - NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
-    networks:
-      - proxy-net
-
-networks:
-  proxy-net:
-    external: true
-    name: v2prodock_v2prodock-proxy-net
-```
 
 ## Commands
 
