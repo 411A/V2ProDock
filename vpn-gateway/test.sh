@@ -153,6 +153,7 @@ grep -q '^exit 0' pptp-ip-up.sh && grep -q '^exit 0' pptp-ip-down.sh && ok "hook
 [ -f ../docker-compose.host.yml ] && ok "host-network override present" || bad "docker-compose.host.yml missing"
 grep -q 'network_mode: host' ../docker-compose.host.yml && ok "host override uses host networking" || bad "host override must set network_mode: host"
 grep -q '127.0.0.1:27018/proxies' ../docker-compose.host.yml && ok "host override points at host API" || bad "host override must use 127.0.0.1 API (no Docker DNS in host mode)"
+grep -q 'sysctls: !reset' ../docker-compose.host.yml && ok "host override drops sysctls (runc forbids them in host netns)" || bad "host override must reset sysctls (ip_forward not allowed in host namespace)"
 grep -q 'docker-compose.host.yml' ../README.md && ok "README documents host override" || bad "README must document docker-compose.host.yml"
 if grep -q 'chap-secrets' pptpd.conf.tmpl options.pptpd.tmpl; then bad "pptp tmpls must not hardcode a secrets path (pppd default /etc/ppp/chap-secrets is the shared file)"; else ok "pptp uses default chap-secrets path (shared creds)"; fi
 grep -q '"pptp":' watchdog.sh || grep -q "'pptp'" watchdog.sh || grep -q 'pptp' watchdog.sh && ok "status exposes pptp" || bad "status.json must expose pptp"

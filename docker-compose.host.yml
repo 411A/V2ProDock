@@ -20,6 +20,12 @@ services:
     network_mode: host
     networks: !reset []
     ports: !reset []
+    # Base compose sets net.ipv4.ip_forward, but the daemon forbids
+    # per-container sysctls in the host network namespace (runc: sysctl
+    # "net.ipv4.ip_forward" not allowed). Forwarding is a host-wide setting
+    # anyway (Docker enables it) - the entrypoint tolerates a read-only
+    # /proc and continues with a warning.
+    sysctls: !reset []
     environment:
       - V2PRODOCK_API=http://127.0.0.1:27018/proxies
       - V2PRODOCK_SOCKS_HOST=127.0.0.1
