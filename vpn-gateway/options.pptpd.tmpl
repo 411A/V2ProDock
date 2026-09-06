@@ -17,11 +17,24 @@ mtu 1400
 mru 1400
 asyncmap 0
 hide-password
-lock
+# No `lock`: UUCP-style device locks are for shared serial lines, not for
+# per-call ptys that pptpd allocates fresh every time. A stale lock only
+# adds a failure mode on rapid reconnects - pppd already ignores locks of
+# dead pids, so dropping the option loses nothing.
+# No `idle`: it would hang up legitimately-idle links, and a satellite
+# receiver is idle 99% of the time. Dead peers are reaped by LCP echo.
 nobsdcomp
 nodeflate
-lcp-echo-interval 30
-lcp-echo-failure 4
+# Fast dead-peer detection for flaky consumer boxes: a vanished client is
+# reaped after ~30s (was 120s), freeing its IP and pty for the redial.
+lcp-echo-interval 10
+lcp-echo-failure 3
+# Per-session hooks (PPTP only - L2TP keeps the pppd defaults, untouched).
+# ip-up logs the session; ip-down logs the teardown and best-effort purges
+# this peer's GRE conntrack entries (effective under host networking, a
+# harmless no-op behind Docker NAT where the table lives on the host).
+ip-up-script /etc/ppp/pptp-ip-up
+ip-down-script /etc/ppp/pptp-ip-down
 # debug + logfile: no syslog daemon in the container, so PPP negotiation
 # would otherwise be undiagnosable (see /var/log/ppp-pptp.log via docker exec).
 debug

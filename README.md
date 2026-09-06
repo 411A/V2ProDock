@@ -126,6 +126,32 @@ stalls, your kernel/cloud lacks GRE passthrough — run the vpn service with
 `network_mode: host` (Linux only) as the fallback. Diagnostics:
 `docker exec v2prodock-vpn cat /var/log/ppp-pptp.log`.
 
+### PPTP reconnects stall after a disconnect (bridge NAT)
+
+Symptom: first connect works, then after an (abrupt/manual) disconnect the
+box redials into silence (`LCP: timeout sending Config-Requests`). Prime
+suspect is a stale GRE Call-ID mapping in the **host's** conntrack table:
+same Call ID reused while the old entry still lives, so return GRE goes to
+the dead session. The gateway already fights this three ways — dead sessions
+are reaped after ~30s (`lcp-echo-interval 10`, `failure 3`), every session
+teardown is logged (`[pptp-ip-down]` lines in `/var/log/ppp-pptp.log`), and
+teardown best-effort flushes the peer's GRE entries. Two honest limits: a
+container-side flush cannot reach the host NAT table in bridge mode (it is a
+no-op there, effective only under host networking), and no `idle` timeout is
+set on purpose — it would hang up your legitimately-idle receiver.
+
+Fix ladder:
+1. Wait 30s+ before redialing (lets zombies die and conntrack entries age
+   out), and reboot the box once after changing VPN settings — consumer
+   firmware often keeps its own stale call state.
+2. If it recurs, switch the gateway to host networking (no NAT, no helper,
+   no stale mappings involved at all):
+   `docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build`
+3. Diagnose with: on the VM host `sudo conntrack -L -p gre` (stale entries
+   for your box's IP during a failed redial confirm it) and in the container
+   `docker exec v2prodock-vpn tail -50 /var/log/ppp-pptp.log` (a redial that
+   never logs `[pptp-ip-up]` died before PPP — network/conntrack, not auth).
+
 ### IKEv2 — needs one CA import
 
 Server = `VPN_DOMAIN` (`UDP 500/4500`), `EAP-MSCHAPv2` with the same

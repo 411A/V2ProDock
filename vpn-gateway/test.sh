@@ -136,6 +136,24 @@ grep -q 'BROKEN' entrypoint.sh && ok "pptp breakage warning logged" || bad "must
 grep -q 'pptpd -c /etc/pptpd/pptpd.conf -o /etc/ppp/options.pptpd -f' entrypoint.sh \
   && ok "pptpd supervised (foreground)" || bad "entrypoint must start pptpd -f with conf+options"
 grep -q ':1723 ' entrypoint.sh && ok "1723 listener verified at boot" || bad "boot must verify TCP 1723 listener"
+# 6c. PPTP reconnect resilience (zombies must die fast, redials must work)
+grep -q 'lcp-echo-interval 10' options.pptpd.tmpl && grep -q 'lcp-echo-failure 3' options.pptpd.tmpl \
+  && ok "pptp dead-peer detection ~30s (zombies free the redial)" || bad "LCP echo must be 10/3 for fast zombie reaping"
+if grep -Eq '^[[:space:]]*lock([[:space:]]|$)' options.pptpd.tmpl; then bad "lock is pointless on per-call ptys (stale-lock failure mode)"; else ok "no ppp lock (per-call ptys)"; fi
+if grep -Eq '^[[:space:]]*idle[[:space:]]' options.pptpd.tmpl; then bad "idle would hang up legitimately-idle satellite boxes"; else ok "no idle timeout (boxes idle 99%)"; fi
+grep -q 'ip-up-script /etc/ppp/pptp-ip-up' options.pptpd.tmpl && ok "pptp ip-up hook wired" || bad "options.pptpd must call pptp-ip-up"
+grep -q 'ip-down-script /etc/ppp/pptp-ip-down' options.pptpd.tmpl && ok "pptp ip-down hook wired" || bad "options.pptpd must call pptp-ip-down"
+grep -q 'conntrack-tools' Dockerfile && ok "Dockerfile has conntrack-tools" || bad "conntrack-tools missing (GRE flush needs it)"
+grep -q 'pptp-ip-up' Dockerfile && grep -q 'pptp-ip-down' Dockerfile && ok "hooks installed by Dockerfile" || bad "Dockerfile must COPY both hooks"
+grep -q 'conntrack --version' Dockerfile && ok "conntrack presence verified at build" || bad "build must verify conntrack binary"
+grep -q 'pptp-ip-up' entrypoint.sh && grep -q 'pptp-ip-down' entrypoint.sh && ok "boot verifies hooks executable" || bad "entrypoint must fail fast on missing hooks"
+grep -q '"$5"' pptp-ip-down.sh && ok "down-hook flushes by peer IP (\$5)" || bad "GRE flush must key on \$5 (peer IP)"
+if grep -q -e '-s "$6"' pptp-ip-down.sh; then bad "must never flush by \$6 (ipparam, not an address)"; else ok "no \$6 flush bug"; fi
+grep -q '^exit 0' pptp-ip-up.sh && grep -q '^exit 0' pptp-ip-down.sh && ok "hooks always exit 0 (never break PPP)" || bad "hooks must end with exit 0"
+[ -f ../docker-compose.host.yml ] && ok "host-network override present" || bad "docker-compose.host.yml missing"
+grep -q 'network_mode: host' ../docker-compose.host.yml && ok "host override uses host networking" || bad "host override must set network_mode: host"
+grep -q '127.0.0.1:27018/proxies' ../docker-compose.host.yml && ok "host override points at host API" || bad "host override must use 127.0.0.1 API (no Docker DNS in host mode)"
+grep -q 'docker-compose.host.yml' ../README.md && ok "README documents host override" || bad "README must document docker-compose.host.yml"
 if grep -q 'chap-secrets' pptpd.conf.tmpl options.pptpd.tmpl; then bad "pptp tmpls must not hardcode a secrets path (pppd default /etc/ppp/chap-secrets is the shared file)"; else ok "pptp uses default chap-secrets path (shared creds)"; fi
 grep -q '"pptp":' watchdog.sh || grep -q "'pptp'" watchdog.sh || grep -q 'pptp' watchdog.sh && ok "status exposes pptp" || bad "status.json must expose pptp"
 grep -q 'ensure_pptpd' watchdog.sh && ok "watchdog self-heals pptpd" || bad "watchdog must restart dead pptpd"

@@ -349,6 +349,11 @@ if [ "$ENABLE_PPTP" = "1" ]; then
   rm -f /tmp/ms-dns-pptp.conf
   grep -q "ms-dns $DNS1" /etc/ppp/options.pptpd || die "pptp ppp options render failed (ms-dns)."
   grep -q "require-mppe-128" /etc/ppp/options.pptpd || die "pptp ppp options must require MPPE-128."
+  # Session hooks must be present AND executable or pppd misbehaves on
+  # every connect (pppd warns and continues, but the reconnect telemetry
+  # this was built for would silently go missing - fail fast instead).
+  [ -x /etc/ppp/pptp-ip-up ] || die "pptp ip-up hook missing/not executable."
+  [ -x /etc/ppp/pptp-ip-down ] || die "pptp ip-down hook missing/not executable."
   log "PPTP rendered: local=$VPN_PPTP_LOCAL range=$VPN_PPTP_RANGE net=$VPN_PPTP_NET (MPPE-128 mandatory, chap-secrets shared)."
 fi
 

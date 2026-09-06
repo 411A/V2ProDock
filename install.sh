@@ -66,6 +66,7 @@ show_status() {
         fi
         if [ "$vpn_pptp" = "1" ]; then
             echo -e "  ${RED}PPTP (ancient LAN devices): server $vpn_domain (TCP 1723+GRE), user $vpn_user, MPPE-128 mandatory - LAN-ONLY${NC}"
+            echo "  Reconnects stall? See README PPTP section (docker-compose.host.yml host-networking fallback)"
         else
             echo "  PPTP: off (satellite receivers & other ancient LAN devices need VPN_ENABLE_PPTP=1 in .env, then: docker compose up -d)"
         fi

@@ -16,6 +16,7 @@ RUN apk --no-cache add \
       ppp \
       iptables \
       iproute2 \
+      conntrack-tools \
       openssl \
       curl \
       jq \
@@ -61,7 +62,11 @@ COPY xl2tpd.conf.tmpl /xl2tpd.conf.tmpl
 COPY options.xl2tpd.tmpl /options.xl2tpd.tmpl
 COPY pptpd.conf.tmpl /pptpd.conf.tmpl
 COPY options.pptpd.tmpl /options.pptpd.tmpl
-RUN chmod +x /entrypoint.sh /watchdog.sh /gen-mobileconfig.sh
+COPY pptp-ip-up.sh /etc/ppp/pptp-ip-up
+COPY pptp-ip-down.sh /etc/ppp/pptp-ip-down
+RUN chmod +x /entrypoint.sh /watchdog.sh /gen-mobileconfig.sh \
+      /etc/ppp/pptp-ip-up /etc/ppp/pptp-ip-down \
+    && command -v conntrack && conntrack --version
 
 EXPOSE 500/udp 4500/udp 1701/udp 1723/tcp
 

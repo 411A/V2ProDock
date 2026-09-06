@@ -1,0 +1,25 @@
+# Host-networking override for v2prodock-vpn (Linux hosts ONLY, e.g. Ubuntu VM).
+# Use when PPTP/GRE misbehaves behind Docker bridge NAT - e.g. reconnects
+# stall after an abrupt client disconnect. With host networking there is no
+# NAT between the client and pptpd: TCP 1723 and GRE (IP proto 47) terminate
+# directly on the host stack, so no conntrack helper or Call-ID mapping is
+# involved at all. IKEv2/L2TP work identically in either mode.
+#
+# Usage (from the repo root, needs docker compose >= 2.24 for the !reset tag):
+#   docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build
+# Notes:
+# - v2prodock is reached via 127.0.0.1 (its API/proxy ports are published on
+#   the host); the Docker DNS name `v2prodock` does NOT resolve in host mode.
+# - `ports:`/`networks:` are intentionally emptied: publishing ports is a
+#   no-op on the host stack and the service must leave the bridge.
+# - Host firewall (ufw) rules are unchanged: UDP 500/4500/1701 + LAN-only
+#   TCP 1723 (+GRE). The container's own iptables/policy rules now apply to
+#   the host tables, scoped to the VPN pools (harmless otherwise).
+services:
+  v2prodock-vpn:
+    network_mode: host
+    networks: !reset []
+    ports: !reset []
+    environment:
+      - V2PRODOCK_API=http://127.0.0.1:27018/proxies
+      - V2PRODOCK_SOCKS_HOST=127.0.0.1
