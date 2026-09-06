@@ -445,7 +445,23 @@ if [ "$DOCKER_MODE" = true ]; then
                 if git -C "$DIR" pull --ff-only 2>&1; then
                     ok "Repo updated"
                 else
-                    echo -e "${RED}[WARN] git pull failed (local changes?) — continuing with local code${NC}"
+                    # No fast-forward: diverged history (e.g. after an upstream
+                    # rewrite) or local edits. Shelve everything (tracked AND
+                    # untracked - .env/config are git-ignored so credentials,
+                    # certs and subscriptions are never touched), take upstream
+                    # exactly, then restore the shelf.
+                    echo -e "${CYAN}Fast-forward failed (diverged history or local edits) - resyncing to origin/main...${NC}"
+                    git -C "$DIR" stash --include-untracked 2>/dev/null || true
+                    if git -C "$DIR" fetch origin && git -C "$DIR" reset --hard origin/main; then
+                        ok "Resynced to origin/main"
+                    else
+                        echo -e "${RED}[WARN] resync failed - continuing with local code${NC}"
+                    fi
+                    if ! git -C "$DIR" stash pop 2>/dev/null; then
+                        git -C "$DIR" stash list 2>/dev/null | grep -q "stash@{0}" \
+                            && echo -e "${RED}[WARN] stashed local changes could not be re-applied - review with: git -C \"$DIR\" status && git -C \"$DIR\" stash list${NC}" \
+                            || true
+                    fi
                 fi
             fi
             mkdir -p "$DIR/config"
