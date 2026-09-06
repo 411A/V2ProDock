@@ -52,16 +52,20 @@ show_status() {
     echo "  HTTP_PROXY=http://v2prodock:$((port_base + instances))"
     echo "  HTTPS_PROXY=socks5://v2prodock:$port_base"
     echo ""
-    local vpn_enabled vpn_domain vpn_user vpn_plain
+    local vpn_enabled vpn_domain vpn_user vpn_plain vpn_pptp
     vpn_enabled=$(env_val VPN_ENABLED 0)
     vpn_domain=$(env_val VPN_DOMAIN vpn.local)
     vpn_user=$(env_val VPN_USER vpnuser)
     vpn_plain=$(env_val VPN_ALLOW_PLAIN_L2TP 0)
+    vpn_pptp=$(env_val VPN_ENABLE_PPTP 0)
     if [ "$vpn_enabled" = "1" ]; then
         echo -e "${CYAN}VPN for legacy devices (egress via working proxy):${NC}"
         echo "  L2TP/IPsec (no files needed): server $vpn_domain, IPsec PSK (see .env VPN_IPSEC_PSK), user $vpn_user"
         if [ "$vpn_plain" = "1" ]; then
             echo -e "  ${RED}Bare L2TP (no IPsec): ALLOWED - cleartext, for old stock firmware only${NC}"
+        fi
+        if [ "$vpn_pptp" = "1" ]; then
+            echo -e "  ${RED}PPTP (ancient LAN devices): server $vpn_domain (TCP 1723+GRE), user $vpn_user, MPPE-128 mandatory - LAN-ONLY${NC}"
         fi
         echo "  IKEv2 (needs CA import):       server $vpn_domain (UDP 500/4500), user $vpn_user"
         echo "  Apple profile: $DIR/config/vpn/apple.mobileconfig"
@@ -296,8 +300,10 @@ ensure_host_prereqs() {
     fi
 
     # Containers cannot modprobe for themselves; no-ops when built-in.
+    # ppp_async is the N_PPP line discipline - without it every pppd fails
+    # with "Couldn't set tty to PPP discipline" (proven in E2E).
     if [ "$(id -u)" = "0" ]; then
-        for mod in tun ppp_generic xt_policy; do
+        for mod in tun ppp_generic ppp_async ppp_mppe xt_policy nf_conntrack_pptp nf_nat_pptp; do
             modprobe "$mod" 2>/dev/null || true
         done
     fi
@@ -311,23 +317,45 @@ ensure_host_prereqs() {
     # Docker publishes the ports, but a default-deny host firewall still
     # blocks them before they reach Docker. With forced NAT-T encapsulation
     # only UDP is needed - IP protocol ESP (50) is NOT required anywhere.
+    local pptp_on="0"
+    if [ -f "$DIR/.env" ]; then
+        pptp_on=$(grep -E "^VPN_ENABLE_PPTP=" "$DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
+    fi
     if command -v ufw &>/dev/null; then
         if [ "$(id -u)" = "0" ]; then
             for p in 500 4500 1701; do ufw allow "$p/udp" >/dev/null 2>&1 || true; done
             ok "Host firewall (ufw): UDP 500/4500/1701 allowed"
+            if [ "$pptp_on" = "1" ]; then
+                ufw allow 1723/tcp >/dev/null 2>&1 || true
+                ok "Host firewall (ufw): TCP 1723 allowed (PPTP, LAN-only recommended)"
+            fi
         else
             echo -e "${RED}[WARN] ufw present but not root - run: sudo ufw allow 500,4500,1701/udp${NC}"
+            [ "$pptp_on" = "1" ] && echo -e "${RED}[WARN] PPTP enabled - also run: sudo ufw allow 1723/tcp (LAN-only!)${NC}"
         fi
     elif command -v firewall-cmd &>/dev/null; then
         if [ "$(id -u)" = "0" ] && systemctl is-active --quiet firewalld 2>/dev/null; then
             for p in 500 4500 1701; do firewall-cmd --permanent --add-port="$p/udp" >/dev/null 2>&1 || true; done
+            [ "$pptp_on" = "1" ] && firewall-cmd --permanent --add-port="1723/tcp" >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
-            ok "Host firewall (firewalld): UDP 500/4500/1701 allowed"
+            ok "Host firewall (firewalld): UDP 500/4500/1701 allowed$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)')"
         else
-            echo -e "${RED}[WARN] firewalld present - ensure UDP 500/4500/1701 are allowed${NC}"
+            echo -e "${RED}[WARN] firewalld present - ensure UDP 500/4500/1701 are allowed$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)')${NC}"
         fi
     else
-        echo "Host firewall: no ufw/firewalld found - if clients cannot reach UDP 500/4500/1701, open them manually (cloud security groups too)."
+        echo "Host firewall: no ufw/firewalld found - if clients cannot reach UDP 500/4500/1701$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)'), open them manually (cloud security groups too)."
+    fi
+    # GRE (IP proto 47) cannot be published via Docker ports:. Behind bridge
+    # NAT the conntrack PPTP helper (modprobed above) forwards GRE alongside
+    # the TCP 1723 DNAT. If PPTP control connects but traffic stalls, either
+    # the helper is missing on this kernel or the cloud firewall drops GRE -
+    # then run the vpn service with network_mode: host (Linux only).
+    if [ "$pptp_on" = "1" ]; then
+        if lsmod 2>/dev/null | grep -q nf_conntrack_pptp; then
+            ok "GRE conntrack helper (nf_conntrack_pptp) loaded"
+        else
+            echo -e "${RED}[WARN] nf_conntrack_pptp not loaded - PPTP GRE may stall behind Docker NAT (host networking is the fallback)${NC}"
+        fi
     fi
 }
 
@@ -443,7 +471,13 @@ if [ "$DOCKER_MODE" = true ]; then
                         echo -e "${CYAN}  Generated IPsec PSK (save it — L2TP clients need it): $input${NC}"
                     fi
                     set_env_key VPN_IPSEC_PSK "$input"
-                    ok "VPN enabled (IKEv2 UDP 500/4500 + L2TP UDP 1701, egress pinned to working proxy)"
+                    read -r -p "  Enable PPTP for ancient LAN devices (MediaStar receivers)? [y/N]: " input
+                    if [[ "$input" =~ ^[Yy]$ ]]; then
+                        set_env_key VPN_ENABLE_PPTP "1"
+                        echo -e "  ${RED}PPTP is cryptographically broken - keep it on a trusted LAN, never expose TCP 1723 to the internet.${NC}"
+                        ok "PPTP enabled (TCP 1723 + GRE, MPPE-128 mandatory, egress pinned to working proxy)"
+                    fi
+                    ok "VPN enabled (IKEv2 UDP 500/4500 + L2TP UDP 1701$([ "$(env_val VPN_ENABLE_PPTP 0)" = "1" ] && echo ' + PPTP TCP 1723'), egress pinned to working proxy)"
                 fi
 
                 ok ".env created from .env.example"

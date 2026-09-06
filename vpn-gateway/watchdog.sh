@@ -13,6 +13,8 @@ TUN_ADDR="${TUN_ADDR:-198.18.0.1}"
 TUN_MTU="${TUN_MTU:-1500}"
 VPN_NET="${VPN_NET:-10.10.10.0/24}"
 VPN_L2TP_NET="${VPN_L2TP_NET:-10.10.11.0/24}"
+VPN_PPTP_NET="${VPN_PPTP_NET:-10.10.12.0/24}"
+ENABLE_PPTP="${ENABLE_PPTP:-0}"
 ALLOW_PLAIN_L2TP="${ALLOW_PLAIN_L2TP:-0}"
 POLL_SECS="${POLL_SECS:-15}"
 STATUS_FILE="${STATUS_FILE:-/config/vpn/status.json}"
@@ -29,6 +31,7 @@ cleanup() {
   pkill -f "$HEV_BIN" 2>/dev/null || true
   ipsec stop 2>/dev/null || true
   pkill -x xl2tpd 2>/dev/null || true
+  pkill -x pptpd 2>/dev/null || true
   exit 0
 }
 trap cleanup TERM INT
@@ -43,8 +46,10 @@ write_status() {
   err_clean="$(printf '%s' "$err" | tr -d '"\\' | tr '\n\r' '  ' | cut -c1-200)"
   _plain=false
   [ "${ALLOW_PLAIN_L2TP:-0}" = "1" ] && _plain=true
-  printf '{"updated":"%s","upstream_socks":"%s","upstream_name":"%s","tun":"%s","egress_ip":"%s","verified":%s,"error":"%s","ikev2":true,"l2tp":true,"plain_l2tp":%s}\n' \
-    "$ts" "$1" "$name_clean" "$TUN_DEV" "$3" "$verified" "$err_clean" "$_plain" > "$STATUS_FILE.tmp" 2>/dev/null \
+  _pptp=false
+  [ "${ENABLE_PPTP:-0}" = "1" ] && _pptp=true
+  printf '{"updated":"%s","upstream_socks":"%s","upstream_name":"%s","tun":"%s","egress_ip":"%s","verified":%s,"error":"%s","ikev2":true,"l2tp":true,"plain_l2tp":%s,"pptp":%s}\n' \
+    "$ts" "$1" "$name_clean" "$TUN_DEV" "$3" "$verified" "$err_clean" "$_plain" "$_pptp" > "$STATUS_FILE.tmp" 2>/dev/null \
     && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
 }
 
@@ -112,9 +117,22 @@ start_tunnel() {
     ip rule show | grep -q "from ${VPN_L2TP_NET} lookup 100" 2>/dev/null \
       || ip rule add from "$VPN_L2TP_NET" table 100 pref 219 2>/dev/null || warn "ip rule (l2tp) failed"
   fi
+  # Pref 221, NOT 220: Docker installs its own per-network rule at pref 220
+  # ("from all lookup <table>") in every container, and same-pref rules lose
+  # to it - PPTP traffic would route via eth0 into the fail-closed DROP
+  # instead of tun0 (proven by counters in E2E: DROP hit, ACCEPT missed).
+  # 217 = to-pool exceptions, 218/219/221 = from-rules, 220 = Docker's.
+  if [ "${ENABLE_PPTP:-0}" = "1" ] && [ -n "${VPN_PPTP_NET:-}" ]; then
+    ip rule show | grep -q "from ${VPN_PPTP_NET} lookup 100" 2>/dev/null \
+      || ip rule add from "$VPN_PPTP_NET" table 100 pref 221 2>/dev/null || warn "ip rule (pptp) failed"
+  fi
   ip route replace default dev "$TUN_DEV" table 100 2>/dev/null || warn "ip route table 100 failed"
   CURRENT_SOCKS="$socks"
-  log "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
+  if [ "${ENABLE_PPTP:-0}" = "1" ]; then
+    log "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET}${VPN_PPTP_NET:+, $VPN_PPTP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
+  else
+    log "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
+  fi
   return 0
 }
 
@@ -170,9 +188,26 @@ ensure_ipsec() {
   return 0
 }
 
+# pptpd has no runtime-state dependency like charon, but if the process
+# dies the TCP SYNs from ancient devices get silence (the exact symptom
+# that started this). Self-heal by restarting it with the rendered config.
+ensure_pptpd() {
+  [ "${ENABLE_PPTP:-0}" = "1" ] || return 0
+  if netstat -tln 2>/dev/null | grep -q ":1723 "; then
+    return 0
+  fi
+  warn "pptpd not listening on TCP 1723 - restarting."
+  rm -f /var/run/pptpd.pid
+  pptpd -c /etc/pptpd/pptpd.conf -o /etc/ppp/options.pptpd -f > /var/log/pptpd.log 2>&1 &
+  sleep 2
+  netstat -tln 2>/dev/null | grep -q ":1723 " || warn "pptpd restart failed (see /var/log/pptpd.log)"
+  return 0
+}
+
 while true; do
   sleep "$POLL_SECS"
   ensure_ipsec || exit 1
+  ensure_pptpd
   if ! fastest="$(api_fastest)"; then
     warn "API has no alive proxy; keeping last pin $CURRENT_SOCKS (fail-closed, no direct fallback)."
     write_status "$CURRENT_SOCKS" "" "" false "api returned no alive proxy"

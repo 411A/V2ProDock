@@ -67,7 +67,7 @@ curl http://localhost:27018/proxies
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 
-## VPN for legacy devices (IKEv2 + L2TP)
+## VPN for legacy devices (IKEv2 + L2TP + opt-in PPTP)
 
 `TVs, IoT, consoles` connect to the `v2prodock-vpn` sidecar. Its traffic is
 forced via `tun0` into the fastest **alive** Xray SOCKS — fail-closed, never
@@ -102,6 +102,30 @@ all traffic — crosses the internet in cleartext.** Default `0` refuses bare
 L2TP at packet level. Use a unique strong password and only for devices that
 cannot do IPsec.
 
+### PPTP — ancient LAN devices only (opt-in, broken crypto)
+
+Some devices speak nothing but PPTP — e.g. MediaStar / Ali-chipset satellite
+receivers whose VPN menu is just User + Password + an encryption toggle
+(`پنهانسازی` = MPPE). Symptom: the box sends `TCP SYN to port 1723` and times
+out because nothing listens there. Set `VPN_ENABLE_PPTP=1` to serve PPTP on
+`TCP 1723` (+ GRE protocol 47) with the **same** username/password as
+IKEv2/L2TP — enable the box's encryption option (MPPE-128 is mandatory
+server-side, no opt-out).
+
+**PPTP/MPPE is cryptographically broken — LAN-only, never expose TCP 1723
+to the internet.** The PPTP leg stays inside your trusted LAN; internet
+egress still goes via the working Xray proxy (fail-closed, same `tun0`
+machinery, same `VERIFIED` proofs). How to tell it's PPTP: packet capture
+shows `IP <box>.x > <server>.1723: Flags [S]` (L2TP would be `UDP 1701`).
+
+GRE note: GRE (IP proto 47) is not TCP/UDP, so Docker `ports:` cannot publish
+it. On a Linux host (e.g. Ubuntu 24.04 VM) the kernel helper
+`nf_conntrack_pptp` (loaded automatically by `install.sh`) forwards GRE to
+the container alongside the TCP 1723 DNAT. If PPTP control connects but data
+stalls, your kernel/cloud lacks GRE passthrough — run the vpn service with
+`network_mode: host` (Linux only) as the fallback. Diagnostics:
+`docker exec v2prodock-vpn cat /var/log/ppp-pptp.log`.
+
 ### IKEv2 — needs one CA import
 
 Server = `VPN_DOMAIN` (`UDP 500/4500`), `EAP-MSCHAPv2` with the same
@@ -113,9 +137,12 @@ validation.
 ### Privileges & troubleshooting
 
 The gateway needs `NET_ADMIN + MKNOD + SYS_ADMIN`, `/dev/net/tun`, and
-`UDP 500/4500/1701` (see compose) — least privilege verified, no
-`--privileged`. The host kernel needs PPP support (`modprobe ppp_generic`).
-PPP diagnostics: `docker exec v2prodock-vpn cat /var/log/ppp.log`.
+`UDP 500/4500/1701` (+ `TCP 1723` when PPTP is on, see compose) — least
+privilege verified, no `--privileged`. The host kernel needs PPP support
+(`modprobe ppp_generic`, plus `ppp_mppe` for PPTP and `nf_conntrack_pptp`
+for GRE passthrough — `install.sh` loads all of these).
+PPP diagnostics: `docker exec v2prodock-vpn cat /var/log/ppp.log`
+(L2TP) / `/var/log/ppp-pptp.log` (PPTP).
 Single client stalled while others work: toggle VPN off/on on that device
 (child-SA desync is DPD-blind; the server also recycles DATA SAs every
 30 min regardless).
@@ -134,9 +161,13 @@ when `VPN_ENABLED=1`; otherwise do it by hand:
 ```bash
 sudo ufw allow 500,4500,1701/udp
 # or: sudo firewall-cmd --permanent --add-port={500,4500,1701}/udp && sudo firewall-cmd --reload
+# PPTP only (LAN-only!): sudo ufw allow from 192.168.0.0/16 to any port 1723 proto tcp
 ```
 
 Cloud VMs need the same three UDP ports in the provider's security group.
+PPTP needs `TCP 1723` **restricted to your LAN** in the host firewall —
+never open it to `0.0.0.0/0` (PPTP crypto is broken); GRE (proto 47) must
+also pass where the VM firewall filters by protocol.
 IP protocol ESP (50) is **not** required anywhere — all IPsec is forced
 through UDP/4500 encapsulation, which is also what makes same-LAN clients
 work (raw ESP cannot cross Docker's port NAT into the container).
@@ -237,10 +268,12 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
-| `VPN_ENABLED` | `0` | `1` = serve IKEv2 + L2TP via working proxy |
+| `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |
 | `VPN_DOMAIN` | `vpn.local` | Hostname/IP clients connect to (server cert SAN) |
 | `VPN_SUBNET` | `10.10.10.0/24` | IKEv2 client pool (forwarded to tun0 only) |
 | `VPN_L2TP_NET` | `10.10.11.0/24` | L2TP client pool (forwarded to tun0 only) |
+| `VPN_ENABLE_PPTP` | `0` | `1` = serve PPTP on TCP 1723+GRE (ancient LAN devices only, MPPE-128 mandatory) |
+| `VPN_PPTP_NET` | `10.10.12.0/24` | PPTP client pool (forwarded to tun0 only) |
 | `VPN_DNS` | `1.1.1.1,8.8.8.8` | DNS pushed to clients (also via proxy) |
 | `VPN_USER` / `VPN_PASSWORD` | — | EAP-MSCHAPv2 + PPP creds (or `VPN_USERS=u1:p1,u2:p2`) |
 | `VPN_IPSEC_PSK` | — | IPsec pre-shared key for L2TP clients |

@@ -54,7 +54,9 @@ if grep -q 'POSTROUTING.*-o eth0' entrypoint.sh; then bad "must never MASQUERADE
 grep -q 'table 100' watchdog.sh entrypoint.sh && ok "policy routing table 100" || bad "table 100 routing missing"
 grep -q 'from "\$VPN_NET" table 100' watchdog.sh && ok "source-based rule (no loop)" || bad "source-based rule missing"
 grep -q 'from "\$VPN_L2TP_NET" table 100' watchdog.sh && ok "l2tp source-based rule" || bad "L2TP net missing table-100 rule"
-grep -q 'for _pool in "\$VPN_SUBNET" "\$VPN_L2TP_NET"' entrypoint.sh \
+grep -q 'from "\$VPN_PPTP_NET" table 100' watchdog.sh && ok "pptp source-based rule" || bad "PPTP net missing table-100 rule"
+if grep -q 'table 100 pref 220' watchdog.sh entrypoint.sh; then bad "pref 220 collides with Docker per-network rules (PPTP would miss tun0)"; else ok "no pref-220 collision with Docker"; fi
+grep -q 'for _pool in "\$VPN_SUBNET" "\$VPN_L2TP_NET" "\$VPN_PPTP_NET"' entrypoint.sh \
   && grep -q 'ip rule add to "\$_pool" lookup main pref 217' entrypoint.sh \
   && ok "to-pool exceptions precede from-rules" || bad "to-pool main-table exceptions (pref 217) missing"
 
@@ -108,6 +110,41 @@ if grep -q '|| true' Dockerfile; then bad "Dockerfile masks failures with || tru
 grep -q 'test -s /usr/local/bin/hev-socks5-tunnel' Dockerfile && ok "Dockerfile verifies tunnel binary" || bad "tunnel binary verification missing"
 grep -q '500/udp' Dockerfile && grep -q '4500/udp' Dockerfile && ok "IKE ports exposed" || bad "IKE ports missing"
 grep -q 'ENTRYPOINT' Dockerfile && ok "entrypoint set" || bad "ENTRYPOINT missing"
+# 6b. PPTP (poptop) build + wiring
+grep -q 'pptpd-1.4.0' Dockerfile && ok "Dockerfile builds poptop pptpd" || bad "pptpd source build missing"
+grep -q 'make pptpd pptpctrl' Dockerfile && ok "pptpd builds only portable targets (no musl-broken bcrelay)" || bad "must build pptpd+pptpctrl only (bcrelay fails on musl)"
+grep -q 'install -m755 pptpd /usr/local/sbin/pptpd' Dockerfile && ok "pptpd installed" || bad "pptpd install missing"
+grep -q 'apk del .pptpd-build' Dockerfile && ok "build deps purged (small image)" || bad "must purge .pptpd-build deps"
+grep -q '1723/tcp' Dockerfile && ok "PPTP port exposed" || bad "1723/tcp expose missing"
+grep -q 'pptpd.conf.tmpl' Dockerfile && grep -q 'options.pptpd.tmpl' Dockerfile && ok "pptp templates copied" || bad "pptpd/options.pptpd COPY missing"
+grep -q '__PPTP_LOCAL__' pptpd.conf.tmpl && grep -q '__PPTP_RANGE__' pptpd.conf.tmpl \
+  && ok "pptpd tmpl placeholders" || bad "pptpd.conf.tmpl missing placeholders"
+grep -q 'PPTP_SHORT_RANGE' entrypoint.sh && grep -q 'PPTP_END_LAST' entrypoint.sh \
+  && ok "pptp range converted to poptop short form (full IP-IP exits 1)" || bad "must convert VPN_PPTP_RANGE to startIP-lastOctet (poptop cannot parse full IP-IP)"
+if grep -q '^[[:space:]]*logwtmp' pptpd.conf.tmpl; then bad "logwtmp needs utmp/wtmp (absent in container)"; else ok "no logwtmp (no utmp in container)"; fi
+grep -q 'option /etc/ppp/options.pptpd' pptpd.conf.tmpl && ok "pptpd uses options.pptpd" || bad "pptpd.conf must reference options.pptpd"
+grep -q 'require-mppe-128' options.pptpd.tmpl && ok "pptp mandates MPPE-128" || bad "options.pptpd must require-mppe-128"
+grep -q 'require-mschap-v2' options.pptpd.tmpl && ok "pptp mandates MSCHAPv2 (MPPE keys)" || bad "options.pptpd must require-mschap-v2"
+if grep -Eq '^[[:space:]]*require (pap|chap|mschap)($|[[:space:]])' options.pptpd.tmpl; then bad "weak PPP methods must stay refused (MPPE needs MSCHAPv2)"; else ok "weak PPP methods refused"; fi
+grep -q '# __MS_DNS__' options.pptpd.tmpl && ok "pptp dns marker" || bad "options.pptpd missing MS_DNS marker"
+grep -q 'VPN_ENABLE_PPTP' entrypoint.sh && ok "pptp flag parsed" || bad "VPN_ENABLE_PPTP missing"
+grep -q 'VPN_PPTP_NET' entrypoint.sh && ok "pptp pool validated" || bad "VPN_PPTP_NET validation missing"
+grep -q 'enforce_net "\$VPN_PPTP_NET"' entrypoint.sh && ok "pptp pool fail-closed" || bad "enforce_net must cover PPTP pool"
+grep -q 'INPUT -p tcp --dport 1723' entrypoint.sh && ok "1723 firewall rule" || bad "TCP 1723 INPUT rule missing"
+grep -q 'INPUT -p gre -j ACCEPT' entrypoint.sh && ok "GRE firewall rule" || bad "GRE INPUT rule missing"
+grep -q 'BROKEN' entrypoint.sh && ok "pptp breakage warning logged" || bad "must warn that PPTP crypto is broken"
+grep -q 'pptpd -c /etc/pptpd/pptpd.conf -o /etc/ppp/options.pptpd -f' entrypoint.sh \
+  && ok "pptpd supervised (foreground)" || bad "entrypoint must start pptpd -f with conf+options"
+grep -q ':1723 ' entrypoint.sh && ok "1723 listener verified at boot" || bad "boot must verify TCP 1723 listener"
+if grep -q 'chap-secrets' pptpd.conf.tmpl options.pptpd.tmpl; then bad "pptp tmpls must not hardcode a secrets path (pppd default /etc/ppp/chap-secrets is the shared file)"; else ok "pptp uses default chap-secrets path (shared creds)"; fi
+grep -q '"pptp":' watchdog.sh || grep -q "'pptp'" watchdog.sh || grep -q 'pptp' watchdog.sh && ok "status exposes pptp" || bad "status.json must expose pptp"
+grep -q 'ensure_pptpd' watchdog.sh && ok "watchdog self-heals pptpd" || bad "watchdog must restart dead pptpd"
+grep -q 'pkill -x pptpd' watchdog.sh && ok "pptpd stopped on shutdown" || bad "cleanup must stop pptpd"
+grep -q '1723:1723/tcp' ../docker-compose.yml && ok "compose maps TCP 1723" || bad "compose must map 1723/tcp"
+grep -q 'VPN_ENABLE_PPTP' ../docker-compose.yml && ok "compose passes pptp flag" || bad "compose must pass VPN_ENABLE_PPTP"
+grep -q 'VPN_PPTP_NET' ../docker-compose.yml && ok "compose passes pptp net" || bad "compose must pass VPN_PPTP_NET"
+grep -q 'VPN_ENABLE_PPTP' ../.env.example && ok ".env documents pptp flag" || bad ".env.example must document VPN_ENABLE_PPTP"
+grep -q 'MPPE-128' ../.env.example || grep -q 'MPPE' ../.env.example && ok ".env warns about pptp crypto" || bad ".env.example must warn about PPTP crypto"
 
 # 7. hev config keys
 grep -q 'ipv4:' watchdog.sh && ok "hev ipv4 set" || bad "hev ipv4 missing"

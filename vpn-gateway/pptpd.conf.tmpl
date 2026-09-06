@@ -1,0 +1,7 @@
+# Rendered by entrypoint.sh - do not edit by hand.
+# poptop pptpd: PPTP control on TCP 1723, PPP auth via the shared CHAP file.
+# GRE (IP proto 47) carries the data - needs host conntrack helper
+# (nf_conntrack_pptp) when behind Docker NAT, or host networking.
+option /etc/ppp/options.pptpd
+localip __PPTP_LOCAL__
+remoteip __PPTP_RANGE__

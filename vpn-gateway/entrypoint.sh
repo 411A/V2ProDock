@@ -27,6 +27,15 @@ VPN_EXTRA_SANS="${VPN_EXTRA_SANS:-}"
 VPN_IPSEC_PSK="${VPN_IPSEC_PSK:-}"
 VPN_L2TP_LOCAL="${VPN_L2TP_LOCAL:-10.10.11.1}"
 VPN_L2TP_RANGE="${VPN_L2TP_RANGE:-10.10.11.10-10.10.11.100}"
+# PPTP for ancient LAN devices only (e.g. satellite receivers that speak
+# nothing else). OFF by default: PPTP/MPPE is cryptographically broken, so
+# the PPTP leg must stay on a trusted LAN; internet egress still goes via
+# the working Xray proxy. GRE (IP proto 47) needs host conntrack help
+# (nf_conntrack_pptp) behind Docker NAT, or host networking on Linux.
+VPN_ENABLE_PPTP="${VPN_ENABLE_PPTP:-0}"
+VPN_PPTP_NET="${VPN_PPTP_NET:-10.10.12.0/24}"
+VPN_PPTP_LOCAL="${VPN_PPTP_LOCAL:-10.10.12.1}"
+VPN_PPTP_RANGE="${VPN_PPTP_RANGE:-10.10.12.10-10.10.12.100}"
 V2PRODOCK_API="${V2PRODOCK_API:-http://v2prodock:27018/proxies}"
 V2PRODOCK_SOCKS_HOST="${V2PRODOCK_SOCKS_HOST:-v2prodock}"
 TUN_DEV="${TUN_DEV:-tun0}"
@@ -98,6 +107,48 @@ esac
 case "$L2TP_RANGE" in
   "$NET_PFX".*-"$NET_PFX".*) ;;
   *) die "VPN_L2TP_RANGE ($L2TP_RANGE) is outside VPN_L2TP_NET ($VPN_L2TP_NET)." ;;
+esac
+# PPTP pool: same explicit local/range discipline as L2TP (always validated
+# so a typo can never silently shrink the pool, even while PPTP is off).
+case "$VPN_PPTP_NET" in
+  *.*.*.0/24) ;;
+  *) die "VPN_PPTP_NET must be a /24 like 10.10.12.0/24 (got '$VPN_PPTP_NET')." ;;
+esac
+case "$VPN_PPTP_LOCAL" in
+  *.*.*.*) ;;
+  *) die "VPN_PPTP_LOCAL must be an IPv4 address (got '$VPN_PPTP_LOCAL')." ;;
+esac
+case "$VPN_PPTP_LOCAL" in
+  *[!0-9.]*) die "VPN_PPTP_LOCAL allows only digits/dots (got '$VPN_PPTP_LOCAL')." ;;
+esac
+case "$VPN_PPTP_RANGE" in
+  *.*.*.*-*.*.*.*) ;;
+  *) die "VPN_PPTP_RANGE must be IP-IP like 10.10.12.10-10.10.12.100." ;;
+esac
+case "$VPN_PPTP_RANGE" in
+  *[!0-9.-]*) die "VPN_PPTP_RANGE allows only digits/dots/dash." ;;
+esac
+PPTP_PFX="$(pfx3 "$VPN_PPTP_NET")"
+case "$PPTP_PFX" in
+  *.*.*) ;;
+  *) die "Cannot parse VPN_PPTP_NET prefix (net='$VPN_PPTP_NET' pfx='$PPTP_PFX')." ;;
+esac
+case "$PPTP_PFX" in
+  *[!0-9.]*) die "Cannot parse VPN_PPTP_NET prefix (net='$VPN_PPTP_NET' pfx='$PPTP_PFX')." ;;
+esac
+case "$VPN_PPTP_LOCAL" in
+  "$PPTP_PFX".*) ;;
+  *) die "VPN_PPTP_LOCAL ($VPN_PPTP_LOCAL) is outside VPN_PPTP_NET ($VPN_PPTP_NET)." ;;
+esac
+case "$VPN_PPTP_RANGE" in
+  "$PPTP_PFX".*-"$PPTP_PFX".*) ;;
+  *) die "VPN_PPTP_RANGE ($VPN_PPTP_RANGE) is outside VPN_PPTP_NET ($VPN_PPTP_NET)." ;;
+esac
+# PPTP on/off flag (parsed once, used for render + firewall + daemon).
+case "${VPN_ENABLE_PPTP:-0}" in
+  1|true|True|TRUE|yes|Yes|YES|on|On|ON) ENABLE_PPTP=1 ;;
+  0|false|False|FALSE|no|No|NO|off|Off|OFF|"") ENABLE_PPTP=0 ;;
+  *) die "VPN_ENABLE_PPTP must be 0 or 1 (got '$VPN_ENABLE_PPTP')." ;;
 esac
 # Template values go through sed: restrict charsets so any input is safe.
 case "$VPN_DOMAIN" in
@@ -267,13 +318,47 @@ IFS="$OLD_IFS"
 [ -s /etc/ppp/chap-secrets ] || die "chap-secrets render failed."
 log "L2TP rendered: lns=$L2TP_LOCAL range=$L2TP_RANGE net=$VPN_L2TP_NET ($EAP_COUNT chap user(s))."
 
+# ---- PPTP configs (pptpd + pppd options) ----
+# chap-secrets above is shared: pptpd reads the same file, so the same
+# VPN_USERS creds log in via IKEv2, L2TP and PPTP alike.
+if [ "$ENABLE_PPTP" = "1" ]; then
+  mkdir -p /etc/pptpd
+  # poptop only parses SHORT ranges (startIP-lastOctet, e.g. 10.10.12.10-100):
+  # a full IP-IP value is misread as a DNS name, NXDOMAINs, and pptpd exits 1
+  # with the error going to syslog only (proven via strace). The /24-prefix
+  # validation above guarantees both ends share the first three octets, so
+  # the short form is always exact.
+  PPTP_START="${VPN_PPTP_RANGE%%-*}"
+  PPTP_END_LAST="${VPN_PPTP_RANGE##*.}"
+  PPTP_SHORT_RANGE="${PPTP_START}-${PPTP_END_LAST}"
+  sed -e "s|__PPTP_RANGE__|${PPTP_SHORT_RANGE}|g" \
+      -e "s|__PPTP_LOCAL__|${VPN_PPTP_LOCAL}|g" \
+      /pptpd.conf.tmpl > /etc/pptpd/pptpd.conf
+  grep -q "localip $VPN_PPTP_LOCAL" /etc/pptpd/pptpd.conf || die "pptpd.conf render failed (localip)."
+  grep -q "remoteip $PPTP_SHORT_RANGE" /etc/pptpd/pptpd.conf || die "pptpd.conf render failed (remoteip)."
+  DNS1="${VPN_DNS%%,*}"; DNS_REST="${VPN_DNS#*,}"
+  [ "$DNS_REST" = "$VPN_DNS" ] && DNS_REST=""
+  {
+    printf 'ms-dns %s\n' "$DNS1"
+    [ -n "$DNS_REST" ] && printf 'ms-dns %s\n' "${DNS_REST%%,*}"
+  } > /tmp/ms-dns-pptp.conf
+  awk '
+    /# __MS_DNS__/ { while ((getline l < "/tmp/ms-dns-pptp.conf") > 0) print l; next }
+    { print }
+  ' /options.pptpd.tmpl > /etc/ppp/options.pptpd
+  rm -f /tmp/ms-dns-pptp.conf
+  grep -q "ms-dns $DNS1" /etc/ppp/options.pptpd || die "pptp ppp options render failed (ms-dns)."
+  grep -q "require-mppe-128" /etc/ppp/options.pptpd || die "pptp ppp options must require MPPE-128."
+  log "PPTP rendered: local=$VPN_PPTP_LOCAL range=$VPN_PPTP_RANGE net=$VPN_PPTP_NET (MPPE-128 mandatory, chap-secrets shared)."
+fi
+
 # ---- policy routing exceptions: traffic TO a VPN pool address must use
 # real interfaces (ppp0/XFRM), never the tunnel. Without this, e.g. ping
 # replies to the LNS address or inter-client traffic get src-matched into
 # table 100 and die in hev (proven in E2E). Deterministic order: 217 here,
 # 218/219 from-rules in watchdog (lower number = higher precedence).
 # Fail-closed is unaffected: internet destinations never match these rules.
-for _pool in "$VPN_SUBNET" "$VPN_L2TP_NET"; do
+for _pool in "$VPN_SUBNET" "$VPN_L2TP_NET" "$VPN_PPTP_NET"; do
   ip rule show 2>/dev/null | grep -q "to ${_pool} lookup main" \
     || ip rule add to "$_pool" lookup main pref 217 2>/dev/null \
     || log "WARN: cannot add to-pool routing exception for $_pool"
@@ -317,6 +402,18 @@ else
   log "WARN: VPN_ALLOW_PLAIN_L2TP=1 - bare L2TP ACCEPTED. PPP logins AND all user traffic cross the internet in CLEARTEXT. Use only for routers that cannot do IPsec, with a unique strong password."
 fi
 iptables -C INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 1701 -j ACCEPT
+# PPTP control channel (TCP 1723). Only opened when PPTP is enabled; GRE
+# (IP proto 47) is a separate protocol - Docker ports: cannot publish it,
+# so on Linux the host needs nf_conntrack_pptp (install.sh modprobes it)
+# or host networking, otherwise control connects but data stalls.
+if [ "$ENABLE_PPTP" = "1" ]; then
+  iptables -C INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 1723 -j ACCEPT
+  iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
+  log "WARN: VPN_ENABLE_PPTP=1 - PPTP is cryptographically BROKEN (MSCHAPv2/MPPE). Keep the PPTP leg on a trusted LAN only; internet egress stays via the working proxy. MPPE-128 is mandatory."
+else
+  iptables -D INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null || true
+  log "PPTP disabled (VPN_ENABLE_PPTP=0): TCP 1723 not served."
+fi
 # Return path: hev terminates client flows in userspace and re-injects
 # replies into tun0, so conntrack never sees them as ESTABLISHED (a state
 # match here would blackhole ALL client return traffic - proven in E2E).
@@ -326,6 +423,11 @@ iptables -C FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null \
   || iptables -A FORWARD -i "$TUN_DEV" -j ACCEPT
 enforce_net "$VPN_SUBNET"
 enforce_net "$VPN_L2TP_NET"
+# PPTP pool gets the same fail-closed treatment (only via tun0, never
+# direct) - but only when PPTP is served; otherwise no such traffic exists.
+if [ "$ENABLE_PPTP" = "1" ]; then
+  enforce_net "$VPN_PPTP_NET"
+fi
 
 # ---- start charon via distro starter (charon lives under libexec on Alpine) ----
 mkdir -p /var/run/charon /var/log
@@ -368,6 +470,18 @@ kill -0 "$XL2TPD_PID" 2>/dev/null || { cat /var/log/xl2tpd.log 2>/dev/null; die 
 netstat -uln 2>/dev/null | grep -q ":1701 " || die "xl2tpd not listening on UDP 1701"
 log "xl2tpd up on UDP 1701 (L2TP range $L2TP_RANGE)."
 
+# ---- start pptpd (PPTP on TCP 1723 + GRE proto 47), opt-in only ----
+if [ "$ENABLE_PPTP" = "1" ]; then
+  rm -f /var/run/pptpd.pid
+  log "Starting pptpd (TCP 1723, MPPE-128 mandatory)..."
+  pptpd -c /etc/pptpd/pptpd.conf -o /etc/ppp/options.pptpd -f > /var/log/pptpd.log 2>&1 &
+  PPTPD_PID=$!
+  sleep 2
+  kill -0 "$PPTPD_PID" 2>/dev/null || { cat /var/log/pptpd.log 2>/dev/null; die "pptpd failed to start"; }
+  netstat -tln 2>/dev/null | grep -q ":1723 " || die "pptpd not listening on TCP 1723"
+  log "pptpd up on TCP 1723 (PPTP range $VPN_PPTP_RANGE). Same-LAN clients only; GRE needs host nf_conntrack_pptp behind Docker NAT."
+fi
+
 # ---- hand over to watchdog (owns tun0 + upstream pinning + proofs) ----
-export VPN_NET VPN_L2TP_NET TUN_DEV TUN_ADDR TUN_MTU V2PRODOCK_API V2PRODOCK_SOCKS_HOST PERSIST_DIR VPN_DOMAIN ALLOW_PLAIN_L2TP
+export VPN_NET VPN_L2TP_NET VPN_PPTP_NET ENABLE_PPTP TUN_DEV TUN_ADDR TUN_MTU V2PRODOCK_API V2PRODOCK_SOCKS_HOST PERSIST_DIR VPN_DOMAIN ALLOW_PLAIN_L2TP
 exec /watchdog.sh

@@ -1,0 +1,29 @@
+# Rendered by entrypoint.sh - do not edit by hand.
+# pppd options for PPTP clients (poptop pptpd).
+# MPPE-128 + MSCHAPv2 are MANDATORY (no opt-out): PPTP without MPPE is
+# cleartext PPP, and MPPE keys only derive from MSCHAPv2. Ancient devices
+# that cannot do MPPE cannot use this - use L2TP/IPsec or IKEv2 instead.
+name v2prodock-vpn
+auth
+require-mschap-v2
+require-mppe-128
+refuse-pap
+refuse-chap
+refuse-mschap
+refuse-eap
+nodefaultroute
+noproxyarp
+mtu 1400
+mru 1400
+asyncmap 0
+hide-password
+lock
+nobsdcomp
+nodeflate
+lcp-echo-interval 30
+lcp-echo-failure 4
+# debug + logfile: no syslog daemon in the container, so PPP negotiation
+# would otherwise be undiagnosable (see /var/log/ppp-pptp.log via docker exec).
+debug
+logfile /var/log/ppp-pptp.log
+# __MS_DNS__

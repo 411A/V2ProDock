@@ -42,10 +42,14 @@ services:
         max-size: "5m"
         max-file: "2"
 
-  # IKEv2 + L2TP/IPsec gateway for legacy devices (TVs, IoT, consoles).
-  # Single gateway on UDP 500/4500 (+1701 for L2TP); client traffic is
-  # forced via tun0 into the fastest ALIVE Xray SOCKS (fail-closed).
-  # Disable with VPN_ENABLED=0 (proxy-only mode stays green).
+  # IKEv2 + L2TP/IPsec (+ opt-in PPTP) gateway for legacy devices.
+  # Single gateway on UDP 500/4500 (+1701 for L2TP, +1723/tcp for PPTP);
+  # client traffic is forced via tun0 into the fastest ALIVE Xray SOCKS
+  # (fail-closed). Disable with VPN_ENABLED=0 (proxy-only mode stays green).
+  # NOTE: PPTP also needs GRE (IP proto 47), which Docker ports: cannot
+  # publish. On a Linux host (e.g. Ubuntu 24.04 VM) the host conntrack helper
+  # nf_conntrack_pptp usually forwards GRE to the container once TCP 1723 is
+  # DNATed; if GRE stalls, run this service with network_mode: host instead.
   v2prodock-vpn:
     build: ./vpn-gateway
     image: v2prodock/vpn-gateway:latest
@@ -60,6 +64,7 @@ services:
       - "500:500/udp"
       - "4500:4500/udp"
       - "1701:1701/udp"
+      - "1723:1723/tcp"
     volumes:
       - ./config:/config
     # NET_ADMIN: iptables/policy routing. MKNOD: create /dev/ppp.
@@ -92,6 +97,10 @@ services:
       - VPN_L2TP_LOCAL=${VPN_L2TP_LOCAL:-10.10.11.1}
       - VPN_L2TP_RANGE=${VPN_L2TP_RANGE:-10.10.11.10-10.10.11.100}
       - VPN_ALLOW_PLAIN_L2TP=${VPN_ALLOW_PLAIN_L2TP:-0}
+      - VPN_ENABLE_PPTP=${VPN_ENABLE_PPTP:-0}
+      - VPN_PPTP_NET=${VPN_PPTP_NET:-10.10.12.0/24}
+      - VPN_PPTP_LOCAL=${VPN_PPTP_LOCAL:-10.10.12.1}
+      - VPN_PPTP_RANGE=${VPN_PPTP_RANGE:-10.10.12.10-10.10.12.100}
       - V2PRODOCK_API=http://v2prodock:27018/proxies
       - V2PRODOCK_SOCKS_HOST=v2prodock
       - TUN_DEV=${VPN_TUN_DEV:-tun0}
