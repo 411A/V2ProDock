@@ -25,6 +25,21 @@ hide-password
 # receiver is idle 99% of the time. Dead peers are reaped by LCP echo.
 nobsdcomp
 nodeflate
+# Fast-handshake hygiene for legacy/embedded PPP stacks (satellite boxes):
+# never OFFER what they would only reject or choke on. A rejected option
+# costs one extra round trip; a confused peer costs much more. None of this
+# touches auth/MPPE, and on a LAN the byte savings would be noise anyway.
+nopcomp
+noaccomp
+novj
+novjccomp
+# IPv4-only service (the tun0 upstream carries IPv4, so negotiated IPv6
+# addresses would be unusable): skip the IPV6CP chatter entirely.
+noipv6
+# Tighter LCP retransmit (default 3s): faster recovery if an LCP packet is
+# lost during dial. max-configure 10 is the default, stated explicitly.
+lcp-restart 2
+lcp-max-configure 10
 # Fast dead-peer detection for flaky consumer boxes: a vanished client is
 # reaped after ~30s (was 120s), freeing its IP and pty for the redial.
 lcp-echo-interval 10

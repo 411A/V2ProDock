@@ -141,6 +141,13 @@ grep -q 'lcp-echo-interval 10' options.pptpd.tmpl && grep -q 'lcp-echo-failure 3
   && ok "pptp dead-peer detection ~30s (zombies free the redial)" || bad "LCP echo must be 10/3 for fast zombie reaping"
 if grep -Eq '^[[:space:]]*lock([[:space:]]|$)' options.pptpd.tmpl; then bad "lock is pointless on per-call ptys (stale-lock failure mode)"; else ok "no ppp lock (per-call ptys)"; fi
 if grep -Eq '^[[:space:]]*idle[[:space:]]' options.pptpd.tmpl; then bad "idle would hang up legitimately-idle satellite boxes"; else ok "no idle timeout (boxes idle 99%)"; fi
+# 6d. Fast-handshake hygiene: never offer legacy peers what they only reject
+for _opt in nopcomp noaccomp novj novjccomp noipv6; do
+  grep -Eq "^[[:space:]]*${_opt}([[:space:]]|$)" options.pptpd.tmpl \
+    && ok "pptp offers no ${_opt#no}" || bad "options.pptpd must set $_opt (legacy handshake hygiene)"
+done
+grep -Eq '^[[:space:]]*lcp-restart 2([[:space:]]|$)' options.pptpd.tmpl && ok "pptp LCP retransmit 2s" || bad "lcp-restart must be 2 (fast dial recovery)"
+grep -Eq '^[[:space:]]*lcp-max-configure 10([[:space:]]|$)' options.pptpd.tmpl && ok "pptp LCP max-configure stated" || bad "lcp-max-configure 10 must be explicit"
 grep -q 'ip-up-script /etc/ppp/pptp-ip-up' options.pptpd.tmpl && ok "pptp ip-up hook wired" || bad "options.pptpd must call pptp-ip-up"
 grep -q 'ip-down-script /etc/ppp/pptp-ip-down' options.pptpd.tmpl && ok "pptp ip-down hook wired" || bad "options.pptpd must call pptp-ip-down"
 grep -q 'conntrack-tools' Dockerfile && ok "Dockerfile has conntrack-tools" || bad "conntrack-tools missing (GRE flush needs it)"
