@@ -16,9 +16,16 @@ vendor/
 # Logs
 *.log
 
-# Environment
+# Environment (credentials live ONLY in .env - no copy of it, under any
+# name, may ever be committed; a bare `git add -A` must stay safe)
 .env
 .env.local
+.env.*
+!.env.example
+*.bak
+*.backup
+*.orig
+*credential*
 
 # IDE
 .vscode/
