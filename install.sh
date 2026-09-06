@@ -66,6 +66,8 @@ show_status() {
         fi
         if [ "$vpn_pptp" = "1" ]; then
             echo -e "  ${RED}PPTP (ancient LAN devices): server $vpn_domain (TCP 1723+GRE), user $vpn_user, MPPE-128 mandatory - LAN-ONLY${NC}"
+        else
+            echo "  PPTP: off (satellite receivers & other ancient LAN devices need VPN_ENABLE_PPTP=1 in .env, then: docker compose up -d)"
         fi
         echo "  IKEv2 (needs CA import):       server $vpn_domain (UDP 500/4500), user $vpn_user"
         echo "  Apple profile: $DIR/config/vpn/apple.mobileconfig"
@@ -315,35 +317,67 @@ ensure_host_prereqs() {
         return 0
     fi
     # Docker publishes the ports, but a default-deny host firewall still
-    # blocks them before they reach Docker. With forced NAT-T encapsulation
-    # only UDP is needed - IP protocol ESP (50) is NOT required anywhere.
-    local pptp_on="0"
+    # blocks them before packets reach Docker. What each opening is for:
+    #   UDP 500  - IKE handshake: opens every IPsec connection (IKEv2 and L2TP/IPsec alike)
+    #   UDP 4500 - IPsec payloads, UDP-encapsulated (NAT-T): ALL IKEv2/L2TP bytes
+    #              ride here, so raw ESP (IP protocol 50) is NOT required anywhere
+    #   UDP 1701 - L2TP control/data: always wrapped in the IPsec above
+    #              (bare L2TP is refused by default, opt-in only)
+    #   TCP 1723 - PPTP control channel, ONLY when VPN_ENABLE_PPTP=1
+    #   GRE      - PPTP data (IP protocol 47, NOT TCP/UDP, so no port rule can
+    #              cover it - it needs a protocol rule). PPTP crypto is broken,
+    #              so 1723+GRE stay confined to the LAN, never the internet.
+    local pptp_on="0" n
     if [ -f "$DIR/.env" ]; then
         pptp_on=$(grep -E "^VPN_ENABLE_PPTP=" "$DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
     fi
+    # Private ranges PPTP is confined to (RFC 1918 - covers any home/CGNAT LAN).
+    local pptp_nets="192.168.0.0/16 10.0.0.0/8 172.16.0.0/12"
     if command -v ufw &>/dev/null; then
         if [ "$(id -u)" = "0" ]; then
             for p in 500 4500 1701; do ufw allow "$p/udp" >/dev/null 2>&1 || true; done
-            ok "Host firewall (ufw): UDP 500/4500/1701 allowed"
+            ok "Host firewall (ufw): UDP 500 (IKE handshake) + 4500 (IPsec data) + 1701 (L2TP-in-IPsec) allowed"
             if [ "$pptp_on" = "1" ]; then
-                ufw allow 1723/tcp >/dev/null 2>&1 || true
-                ok "Host firewall (ufw): TCP 1723 allowed (PPTP, LAN-only recommended)"
+                for n in $pptp_nets; do
+                    ufw allow from "$n" to any port 1723 proto tcp >/dev/null 2>&1 || true
+                    ufw allow proto gre from "$n" >/dev/null 2>&1 || true
+                done
+                ok "Host firewall (ufw): PPTP confined to LAN (TCP 1723 + GRE from private ranges only)"
             fi
         else
-            echo -e "${RED}[WARN] ufw present but not root - run: sudo ufw allow 500,4500,1701/udp${NC}"
-            [ "$pptp_on" = "1" ] && echo -e "${RED}[WARN] PPTP enabled - also run: sudo ufw allow 1723/tcp (LAN-only!)${NC}"
+            echo -e "${CYAN}Host firewall (ufw) is active - Docker's ports stay blocked until you open them:${NC}"
+            echo "  sudo ufw allow 500/udp    # IKE handshake: opens every IPsec connection (IKEv2 + L2TP/IPsec)"
+            echo "  sudo ufw allow 4500/udp   # IPsec payloads: all VPN bytes ride here (raw ESP proto 50 NOT needed)"
+            echo "  sudo ufw allow 1701/udp   # L2TP control/data (travels inside the IPsec above)"
+            if [ "$pptp_on" = "1" ]; then
+                echo -e "  ${RED}PPTP is on (VPN_ENABLE_PPTP=1) but its crypto is broken - LAN-only, never the internet:${NC}"
+                echo "  sudo ufw allow proto gre from 192.168.0.0/16  # PPTP data (IP proto 47, not a port)"
+                echo "  sudo ufw allow proto gre from 10.0.0.0/8      # (one rule per private range you use)"
+                echo "  sudo ufw allow proto gre from 172.16.0.0/12"
+                echo "  sudo ufw allow from 192.168.0.0/16 to any port 1723 proto tcp  # PPTP control channel"
+                echo "  sudo ufw allow from 10.0.0.0/8 to any port 1723 proto tcp"
+                echo "  sudo ufw allow from 172.16.0.0/12 to any port 1723 proto tcp"
+            fi
         fi
     elif command -v firewall-cmd &>/dev/null; then
         if [ "$(id -u)" = "0" ] && systemctl is-active --quiet firewalld 2>/dev/null; then
             for p in 500 4500 1701; do firewall-cmd --permanent --add-port="$p/udp" >/dev/null 2>&1 || true; done
             [ "$pptp_on" = "1" ] && firewall-cmd --permanent --add-port="1723/tcp" >/dev/null 2>&1 || true
+            [ "$pptp_on" = "1" ] && firewall-cmd --permanent --add-protocol=gre >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
-            ok "Host firewall (firewalld): UDP 500/4500/1701 allowed$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)')"
+            ok "Host firewall (firewalld): UDP 500 (IKE) + 4500 (IPsec data) + 1701 (L2TP-in-IPsec) allowed$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 and GRE (PPTP)')"
+            if [ "$pptp_on" = "1" ]; then
+                echo -e "${RED}[WARN] PPTP crypto is broken - confine 1723/GRE to your LAN with rich rules (see README), not the whole zone${NC}"
+            fi
         else
-            echo -e "${RED}[WARN] firewalld present - ensure UDP 500/4500/1701 are allowed$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)')${NC}"
+            echo -e "${RED}[WARN] firewalld present - make sure these reach Docker:${NC}"
+            echo "  UDP 500 (IKE handshake), UDP 4500 (IPsec data, ESP proto 50 NOT needed), UDP 1701 (L2TP-in-IPsec)"
+            [ "$pptp_on" = "1" ] && echo -e "  ${RED}Plus LAN-only: TCP 1723 (PPTP control) + GRE proto 47 (PPTP data)${NC}"
         fi
     else
-        echo "Host firewall: no ufw/firewalld found - if clients cannot reach UDP 500/4500/1701$([ "$pptp_on" = "1" ] && echo ' + TCP 1723 (PPTP)'), open them manually (cloud security groups too)."
+        echo "Host firewall: no ufw/firewalld found - if clients cannot connect, open these (host firewall + cloud security group):"
+        echo "  UDP 500 (IKE handshake), UDP 4500 (IPsec data), UDP 1701 (L2TP-in-IPsec)"
+        [ "$pptp_on" = "1" ] && echo -e "  ${RED}Plus LAN-only: TCP 1723 (PPTP control) + GRE proto 47 (PPTP data)${NC}"
     fi
     # GRE (IP proto 47) cannot be published via Docker ports:. Behind bridge
     # NAT the conntrack PPTP helper (modprobed above) forwards GRE alongside
