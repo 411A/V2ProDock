@@ -1,8 +1,9 @@
 #!/bin/sh
 # Strict static self-tests for vpn-gateway. No docker needed.
 # Fails fast; used by CI and by install.sh --check.
+# Lives in tests/; hop to the gateway root so all relative paths below work.
 set -eu
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 fail=0
 ok() { echo "[vpn-test][OK] $*"; }

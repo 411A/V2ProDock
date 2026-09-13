@@ -55,8 +55,9 @@ Pushed DNS is resolved through the same tunnel — clients cannot leak around th
 
 - **Subscription-based** — paste a v2ray subscription URL, it parses vless/vmess/trojan/shadowsocks configs automatically
 - **Multi-instance** — run N independent xray processes, each with its own proxy pair and failover
-- **Auto-failover** — health-checks every 60s, switches to the next working server on failure
+- **Auto-failover** — health-checks every 60s (3-strike rule); dead servers are replaced quickly by bounded switching that can't stall the engine
 - **Auto-refresh** — re-fetches subscription every 120s for updated server lists
+- **Slow-proxy rotation** — sluggish connections are automatically moved to faster servers when fresh configs arrive; healthy fast ones are never touched
 - **HTTP API** — query live proxies sorted by latency at `GET /proxies`
 - **Dynamic ports** — all ports are auto-assigned, no hardcoded ranges
 - **Docker bridge** — other containers connect through the Docker network without port mapping
@@ -353,7 +354,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `PROXY_INSTANCES` | `1` | Number of xray instances to run |
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
-| `HEALTH_CHECK_URL` | `http://api.ipify.org` | URL used to test proxy connectivity |
+| `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |

@@ -148,6 +148,7 @@ func healthCheckLoop(manager *ProxyManager) {
 	defer ticker.Stop()
 	for range ticker.C {
 		manager.HealthCheckAll()
+		manager.WatchdogCheck()
 	}
 }
 

@@ -231,6 +231,18 @@ func (m *ProxyManager) Start() error {
 	round := 0
 	for {
 		round++
+		if round > maxPopulateRounds {
+			// Bounded startup: serve what works, mark the rest down, return.
+			// The health loop keeps healing stragglers with bounded switches,
+			// so a thin pool can no longer wedge startup forever.
+			for i := range insts {
+				if m.statusOf(i).Status != "ok" {
+					m.markDown(i, "populate budget exhausted, retrying in background")
+				}
+			}
+			warnLog("populate gave up after %d rounds: %d/%d ready, rest heal in background", maxPopulateRounds, m.AliveCount(), len(insts))
+			break
+		}
 		if round > 1 {
 			infoLog("populate round %d: %d/%d ready, retrying the rest...", round, m.AliveCount(), len(insts))
 			time.Sleep(populateRetryDelay)
@@ -388,7 +400,89 @@ func (m *ProxyManager) RefreshSubscriptions() {
 				}
 				m.markOK(i, name, inst.LastLatency())
 			}
+			continue
 		}
+		// Status is ok, but the slice was just swapped underneath the
+		// instance: re-anchor the active config by KEY (index alone may now
+		// point at a different proxy), rotate it away if it vanished, and
+		// opportunistically replace it if it got slow — all strictly bounded
+		// so a healthy fast instance costs nothing here.
+		m.reconcileActive(i, inst)
+	}
+}
+
+// reconcileActive re-anchors an ok instance after a refresh swapped its pool
+// (UpdateConfigs already re-anchored the index by key; this handles the rest).
+// Vanished active -> switch now. Slow active (>rotateSlowLatency) -> probe a
+// few fresh candidates on a THROWAWAY port (serving is never interrupted) and
+// rotate only to one proven >=30% faster. Fast present active -> untouched.
+func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector) {
+	active := inst.ActiveConfig()
+	present := active != nil
+	if present {
+		present = false
+		for _, c := range inst.snapshotConfigs() {
+			if c.Key() == active.Key() {
+				present = true
+				break
+			}
+		}
+	}
+	if !present {
+		warnLog("Instance %d: active config vanished from pool, rotating...", i)
+		m.markDown(i, "active config vanished from pool")
+		used := m.buildExcluding(i)
+		if err := inst.SwitchToNextExcluding(used); err != nil {
+			m.markDown(i, err.Error())
+			return
+		}
+		if cfg := inst.ActiveConfig(); cfg != nil {
+			m.markOK(i, cfg.Name, inst.LastLatency())
+		}
+		return
+	}
+	if inst.LastLatency() < rotateSlowLatency {
+		return
+	}
+	used := m.buildExcluding(i)
+	deadline := time.Now().Add(rotateBudget)
+	tried := 0
+	for _, c := range inst.snapshotConfigs() {
+		if tried >= rotateMaxCandidates || time.Now().After(deadline) {
+			break
+		}
+		if c.Key() == active.Key() {
+			continue
+		}
+		if _, ok := used[c.Key()]; ok {
+			continue // owned by another instance — don't steal
+		}
+		tried++
+		res := inst.probeCandidateOnTempPort(c)
+		if !res.Working {
+			continue
+		}
+		// Rotate only for a decisive win: candidate >=30% faster.
+		if res.Latency*10 >= inst.LastLatency()*7 {
+			continue
+		}
+		// Surgical switch: exclude everything but the proven candidate. The
+		// switch skips the current active by index and restores it on failure,
+		// so the instance can never strand on a random third proxy.
+		excl := make(map[string]int, len(inst.snapshotConfigs()))
+		for _, o := range inst.snapshotConfigs() {
+			if o.Key() != c.Key() {
+				excl[o.Key()] = -1
+			}
+		}
+		if err := inst.SwitchToNextExcluding(excl); err != nil {
+			break
+		}
+		if cfg := inst.ActiveConfig(); cfg != nil && cfg.Key() == c.Key() {
+			m.markOK(i, cfg.Name, inst.LastLatency())
+			infoLog("Instance %d: rotated slow %s -> %s (%dms)", i, shortName(active.Name), shortName(cfg.Name), inst.LastLatency().Milliseconds())
+		}
+		return
 	}
 }
 

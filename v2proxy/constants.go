@@ -20,10 +20,17 @@ const (
 	probeMaxAttempts   = 3               // full-pool passes per instance before giving up
 	populateTick       = 20 * time.Second
 	populateRetryDelay = 15 * time.Second // wait between populate rounds for missing instances
+	maxPopulateRounds  = 20               // then serve degraded; the health loop keeps healing stragglers
 )
 
-// ---- Quick probe: single URL, no fallbacks, used while populating ----
-const probeURL = "http://www.gstatic.com/generate_204"
+// ---- Quick probe: primary + ONE independent fallback, raced, used everywhere hot ----
+// Plain-HTTP probes die under DPI even when the tunnel itself is fine, and a
+// single hard-blocked endpoint must not condemn a healthy tunnel — so the
+// quick probe races two URLs on independent infrastructure (Google vs
+// Cloudflare). First success wins; worst case is still one 3s budget.
+const probeURL = "https://www.gstatic.com/generate_204"
+
+const quickFallbackURL = "https://cp.cloudflare.com/generate_204"
 
 const quickProbeTimeout = 3 * time.Second
 
@@ -34,6 +41,17 @@ const (
 	healthTLSHandshakeTimeout   = 5 * time.Second
 	healthResponseHeaderTimeout = 5 * time.Second
 	healthFailThreshold         = 3 // consecutive fails before an instance is switched
+)
+
+// ---- Failover switching (bounded: never freeze the ticker loop) ----
+const switchBudget = 60 * time.Second // aggregate cap for one switch pass
+
+// ---- Refresh rotation (only slow/missing actives are touched; fast ones cost zero) ----
+const (
+	rotateSlowLatency    = 2500 * time.Millisecond // active slower than this becomes rotation-eligible
+	rotateMaxCandidates  = 3                       // fresh candidates tried per rotation, then stop
+	rotateBudget         = 20 * time.Second        // aggregate cap for one rotation attempt
+	watchdogPortDialWait = 300 * time.Millisecond  // TCP sanity-dial timeout per instance port
 )
 
 // ---- Subscription fetching ----
@@ -57,11 +75,13 @@ var loopbackFallbackHosts = []string{
 	"10.0.2.2",
 }
 
-// Fallback health URLs for steady-state checks (tried in order after the primary).
+// Fallback health URLs for full checks (tried in order after the primary).
+// All HTTPS: plain-HTTP probes die under DPI even when the tunnel is fine.
+// NOTE: cp.cloudflare.com needs the /generate_204 path — the bare host 404s.
 var fallbackHealthURLs = []string{
 	"https://www.gstatic.com/generate_204",
-	"https://cp.cloudflare.com",
-	"http://api.ipify.org",
+	"https://cp.cloudflare.com/generate_204",
+	"https://api.ipify.org",
 }
 
 // ---- Refresh loop ----
@@ -69,7 +89,7 @@ const subscriptionRefreshInterval = 120 * time.Second
 
 // ---- xray process lifecycle ----
 const (
-	xrayCrashDetect  = 200 * time.Millisecond // wait after start to catch instant crashes
+	xrayCrashDetect  = 100 * time.Millisecond // wait after start to catch instant crashes (bind fails surface in ms)
 	xrayStopWait     = 2 * time.Second        // graceful stop before SIGKILL
 	xrayPortFreeWait = 3 * time.Second        // wait for old SOCKS port to free after stop
 	switchPortWait   = 2 * time.Second        // port wait when switching to a new config
@@ -82,7 +102,7 @@ const (
 	subscriptionFile = "subscription.txt"
 )
 
-const defaultHealthCheckURL = "http://httpbin.org/ip"
+const defaultHealthCheckURL = "https://www.gstatic.com/generate_204"
 
 const defaultInstanceCount = 1
 
@@ -90,8 +110,10 @@ const defaultInstanceCount = 1
 const (
 	defaultMaxConns         = 128 // concurrent proxied connections (MAX_CONNS env overrides)
 	relayBufSize            = 32 * 1024
-	proxySlotWait           = 5 * time.Second // wait for a connection slot before 503
-	relayIdleDeadline       = 5 * time.Minute // idle deadline on relayed CONNECT streams
+	proxySlotWait           = 5 * time.Second  // wait for a connection slot before 503
+	bridgeDialTimeout       = 5 * time.Second  // upstream SOCKS dial budget: fail fast with 503, never hang
+	bridgeUpstreamDeadline  = 60 * time.Second // total budget per plain-HTTP relay so slots recycle
+	relayIdleDeadline       = 5 * time.Minute  // idle deadline on relayed CONNECT streams
 	bridgeReadHeaderTimeout = 10 * time.Second
 	bridgeIdleTimeout       = 120 * time.Second
 	bridgeMaxHeaderBytes    = 4096

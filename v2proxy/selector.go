@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -44,6 +43,16 @@ func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInt
 
 func (s *ProxySelector) SOCKSPort() int { return s.socksPort }
 func (s *ProxySelector) HTTPPort() int  { return s.httpPort }
+
+// currentPID returns the managed xray child PID (0 = none) for watchdog accounting.
+func (s *ProxySelector) currentPID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
+		return s.xrayCmd.Process.Pid
+	}
+	return 0
+}
 func (s *ProxySelector) LastLatency() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -53,7 +62,31 @@ func (s *ProxySelector) LastLatency() time.Duration {
 func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Re-anchor the active index by KEY: the new pool is a different slice, so
+	// the old index may now point at a different proxy (or out of range).
+	var activeKey string
+	if s.activeIndex >= 0 && s.activeIndex < len(s.configs) {
+		activeKey = s.configs[s.activeIndex].Key()
+	}
 	s.configs = configs
+	s.activeIndex = -1
+	if activeKey != "" {
+		for i := range s.configs {
+			if s.configs[i].Key() == activeKey {
+				s.activeIndex = i
+				break
+			}
+		}
+	}
+}
+
+// snapshotConfigs returns a copy of the pool for key lookups outside s.mu.
+func (s *ProxySelector) snapshotConfigs() []ProxyConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ProxyConfig, len(s.configs))
+	copy(out, s.configs)
+	return out
 }
 
 func (s *ProxySelector) StartWithBest() error {
@@ -195,7 +228,9 @@ func (s *ProxySelector) HealthCheck() bool {
 		return false
 	}
 
-	result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, healthCheckTimeout)
+	// Single fast probe: the old multi-URL pass cost up to ~32s per check and
+	// held s.mu the whole time, stalling switches and status reads.
+	result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
 	s.lastCheck = time.Now()
 	s.lastLatency = result.Latency
 
@@ -219,6 +254,30 @@ func (s *ProxySelector) SwitchToNext() error {
 	return s.SwitchToNextExcluding(nil)
 }
 
+// switchOrder returns every candidate index exactly once, starting just after
+// the active one and wrapping around (the old index itself is excluded: there
+// is no point re-probing the config that just failed).
+// The previous loop `for i := start; i != old` NEVER TERMINATED when old == -1
+// (instance never started), churning xray processes forever.
+func switchOrder(n, startIdx, oldIndex int) []int {
+	if n <= 0 {
+		return nil
+	}
+	start := startIdx % n
+	if start < 0 {
+		start = 0
+	}
+	order := make([]int, 0, n)
+	for k := 0; k < n; k++ {
+		i := (start + k) % n
+		if i == oldIndex {
+			continue
+		}
+		order = append(order, i)
+	}
+	return order
+}
+
 func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -234,37 +293,47 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 
 	oldCmd := s.xrayCmd
 	oldIndex := s.activeIndex
+	deadline := time.Now().Add(switchBudget)
 
-	for i := startIdx; i != oldIndex; i = (i + 1) % len(s.configs) {
-		if i < 0 || i >= len(s.configs) {
-			continue
+	for _, i := range switchOrder(len(s.configs), startIdx, oldIndex) {
+		if time.Now().After(deadline) {
+			debugLog("switch budget exhausted, giving up for now")
+			break
 		}
 		if exclude != nil {
 			if _, ok := exclude[s.configs[i].Key()]; ok {
 				continue
 			}
 		}
-		s.stopXrayCmd(oldCmd)
-		oldCmd = nil
+		if oldCmd != nil {
+			s.stopXrayCmd(oldCmd)
+			oldCmd = nil
+		}
 
 		if err := s.startXray(i); err != nil {
 			continue
 		}
-		if waitForPort(s.socksPort, switchPortWait) {
-			result := TestProxyHealth(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL, healthCheckTimeout)
-			if result.Working {
-				s.activeIndex = i
-				s.lastLatency = result.Latency
-				s.failCount = 0
-				switchedLog(s.configs[i].Name, result.Latency.Milliseconds())
-				return nil
-			}
+		if !waitForPort(s.socksPort, switchPortWait) {
+			s.stopXray()
+			continue
 		}
+		// Fast single-URL probe: a full multi-URL health pass here cost ~32s
+		// per dead candidate and froze the ticker loop for tens of minutes.
+		result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
+		if result.Working {
+			s.activeIndex = i
+			s.lastLatency = result.Latency
+			s.failCount = 0
+			switchedLog(s.configs[i].Name, result.Latency.Milliseconds())
+			return nil
+		}
+		debugLog("candidate %s: unhealthy: %v", shortName(s.configs[i].Name), result.Error)
 		s.stopXray()
 	}
 
 	if oldIndex >= 0 && oldIndex < len(s.configs) {
 		debugLog("All alternative configs failed. Attempting to restore original config %s", shortName(s.configs[oldIndex].Name))
+		s.stopXray()
 		if err := s.startXray(oldIndex); err == nil {
 			s.activeIndex = oldIndex
 			s.failCount = 0
@@ -301,8 +370,61 @@ func (s *ProxySelector) startXray(index int) error {
 		return fmt.Errorf("invalid index: %d", index)
 	}
 
-	cfg := s.configs[index]
+	cfgPath, err := s.renderXrayConfig(s.configs[index], s.socksPort, false)
+	if err != nil {
+		return err
+	}
 
+	// Never orphan a previous child: a failed start leaves s.xrayCmd pointing
+	// at a possibly-live process, and overwriting the handle would leak it
+	// (leaked xrays keep holding the SOCKS port and break every later bind).
+	if s.xrayCmd != nil && s.xrayCmd.Process != nil {
+		s.stopXrayCmd(s.xrayCmd)
+		s.xrayCmd = nil
+	}
+
+	cmd, err := launchXray(s.xrayDir, cfgPath)
+	if err != nil {
+		return err
+	}
+	s.xrayCmd = cmd
+	return nil
+}
+
+// probeCandidateOnTempPort tests one candidate through a throwaway xray on an
+// ephemeral loopback port. Serving on the real SOCKS port is never touched,
+// so rotation probing costs zero disruption. Callers must NOT hold s.mu (it
+// takes s.mu briefly for config access only).
+func (s *ProxySelector) probeCandidateOnTempPort(cfg ProxyConfig) HealthResult {
+	// Ephemeral port: bind :0, read back the port, release.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return HealthResult{Error: err}
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	cfgPath, err := s.renderXrayConfig(cfg, port, true)
+	if err != nil {
+		return HealthResult{Error: err}
+	}
+	defer os.Remove(cfgPath)
+
+	cmd, err := launchXray(s.xrayDir, cfgPath)
+	if err != nil {
+		return HealthResult{Error: err}
+	}
+	defer stopXrayCmdPort(cmd, port)
+
+	if !waitForPort(port, switchPortWait) {
+		return HealthResult{Error: fmt.Errorf("temp xray port never opened")}
+	}
+	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), s.testURL)
+}
+
+// renderXrayConfig writes the full xray config for one upstream. temp files
+// get a distinct name so rotation probes never clobber the serving config.
+func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bool) (string, error) {
 	logLevel := "none"
 	if isDebug() {
 		logLevel = "warning"
@@ -320,7 +442,7 @@ func (s *ProxySelector) startXray(index int) error {
 		"inbounds": []map[string]interface{}{
 			{
 				"tag":      "socks-in",
-				"port":     s.socksPort,
+				"port":     socksPort,
 				"listen":   "0.0.0.0",
 				"protocol": "socks",
 				"settings": map[string]interface{}{
@@ -334,7 +456,7 @@ func (s *ProxySelector) startXray(index int) error {
 
 	var outbound map[string]interface{}
 	if err := json.Unmarshal(cfg.XrayCfg, &outbound); err != nil {
-		return fmt.Errorf("bad config: %w", err)
+		return "", fmt.Errorf("bad config: %w", err)
 	}
 
 	fullConfig["outbounds"] = []interface{}{
@@ -360,33 +482,44 @@ func (s *ProxySelector) startXray(index int) error {
 		},
 	}
 
-	cfgPath := filepath.Join(s.xrayDir, fmt.Sprintf("config-%d.json", s.socksPort))
+	name := fmt.Sprintf("config-%d.json", socksPort)
+	if temp {
+		name = fmt.Sprintf("config-rot-%d.json", socksPort)
+	}
+	cfgPath := filepath.Join(s.xrayDir, name)
 	cfgData, _ := json.Marshal(fullConfig)
 	if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
-		return err
+		return "", err
 	}
+	return cfgPath, nil
+}
 
-	xrayBin := filepath.Join(s.xrayDir, "xray")
-	s.xrayCmd = exec.Command(xrayBin, "run", "-c", cfgPath)
+// launchXray starts one xray child in its own process group and rejects
+// instant crashes (bad config, missing binary, port already held).
+func launchXray(xrayDir, cfgPath string) (*exec.Cmd, error) {
+	xrayBin := filepath.Join(xrayDir, "xray")
+	cmd := exec.Command(xrayBin, "run", "-c", cfgPath)
+	isolateChild(cmd)
 	if isDebug() {
-		s.xrayCmd.Stdout = os.Stdout
-		s.xrayCmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 	} else {
-		s.xrayCmd.Stdout = io.Discard
-		s.xrayCmd.Stderr = io.Discard
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
 	}
 
-	if err := s.xrayCmd.Start(); err != nil {
-		return fmt.Errorf("start failed: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start failed: %w", err)
 	}
 
 	// Detect immediate crashes (bad config, missing binary, etc.)
 	time.Sleep(xrayCrashDetect)
-	if s.xrayCmd.Process != nil && s.xrayCmd.Process.Signal(syscall.Signal(0)) != nil {
-		return fmt.Errorf("xray crashed on start")
+	if !processAlive(cmd.Process) {
+		_ = cmd.Wait() // reap; caller drops the handle, so reap here
+		return nil, fmt.Errorf("xray crashed on start")
 	}
 
-	return nil
+	return cmd, nil
 }
 
 func (s *ProxySelector) stopXray() {
@@ -395,21 +528,31 @@ func (s *ProxySelector) stopXray() {
 }
 
 func (s *ProxySelector) stopXrayCmd(cmd *exec.Cmd) {
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() {
-			_ = cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(xrayStopWait):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-		waitForPortFree(s.socksPort, xrayPortFreeWait)
+	stopXrayCmdPort(cmd, s.socksPort)
+}
+
+// stopXrayCmdPort terminates one xray child (whole process group on unix),
+// reaps it, and waits until its port is actually free — so the next bind on
+// that port cannot fail. Package-level so temp-port rotation probes reuse it.
+func stopXrayCmdPort(cmd *exec.Cmd, port int) {
+	if cmd == nil || cmd.Process == nil {
+		return
 	}
+	pid := cmd.Process.Pid
+	// Whole process group on unix (negative PID); ESRCH (already dead) is fine.
+	_ = signalGroup(pid, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait() // reap the zombie either way
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(xrayStopWait):
+		_ = killGroup(pid)
+		<-done
+	}
+	waitForPortFree(port, xrayPortFreeWait)
 }
 
 func waitForPort(port int, timeout time.Duration) bool {

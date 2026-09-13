@@ -80,12 +80,33 @@ func TestProxyHealth(proxyAddr string, primaryURL string, timeout time.Duration)
 	return lastRes
 }
 
-// TestProxyQuick does a single fast probe: one URL, 3s timeout, no fallbacks.
-// Used during initial population to test many candidates quickly.
+// TestProxyQuick races the primary URL against one independent fallback
+// (different infrastructure: Google vs Cloudflare), 3s each. First success
+// wins, so the cost is ALWAYS <= 3s — but a single filtered/blocked endpoint
+// can no longer condemn a healthy tunnel. Both URLs travel through the xray
+// SOCKS port under test; nothing here is a local TCP check.
 func TestProxyQuick(proxyAddr, testURL string) HealthResult {
-	url := probeURL
+	primary := probeURL
 	if testURL != "" {
-		url = testURL
+		primary = testURL
 	}
-	return testSingleURL(proxyAddr, url, quickProbeTimeout)
+	if quickFallbackURL == "" || quickFallbackURL == primary {
+		return testSingleURL(proxyAddr, primary, quickProbeTimeout)
+	}
+	type out struct {
+		res HealthResult
+		fb  bool
+	}
+	ch := make(chan out, 2)
+	go func() { ch <- out{testSingleURL(proxyAddr, primary, quickProbeTimeout), false} }()
+	go func() { ch <- out{testSingleURL(proxyAddr, quickFallbackURL, quickProbeTimeout), true} }()
+	first := <-ch
+	if first.res.Working {
+		return first.res
+	}
+	second := <-ch
+	if second.res.Working {
+		return second.res
+	}
+	return first.res
 }

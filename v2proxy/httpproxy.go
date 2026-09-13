@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +15,36 @@ import (
 
 	"golang.org/x/net/proxy"
 )
+
+var errDialTimeout = errors.New("upstream dial timeout")
+
+// dialSocksTimeout bounds the SOCKS dial: a dead upstream previously hung the
+// handler (and its connection slot) indefinitely. Timeout -> caller gets a
+// fast 504 instead of a hung client.
+func dialSocksTimeout(dialer proxy.Dialer, network, addr string, timeout time.Duration) (net.Conn, error) {
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		c, err := dialer.Dial(network, addr)
+		ch <- res{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("%w after %s", errDialTimeout, timeout)
+	}
+}
+
+func dialErrorCode(err error) int {
+	if errors.Is(err, errDialTimeout) {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusBadGateway
+}
 
 var relayBufPool = sync.Pool{
 	New: func() interface{} {
@@ -100,25 +132,28 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		host += ":80"
 	}
 
-	conn, err := dialer.Dial("tcp", host)
+	conn, err := dialSocksTimeout(dialer, "tcp", host, bridgeDialTimeout)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), dialErrorCode(err))
 		return
 	}
 	defer func() { _ = conn.Close() }()
+	// Absolute budget for the whole upstream exchange so a stalled server
+	// cannot pin a connection slot forever (CONNECT streams keep relayIdleDeadline).
+	_ = conn.SetDeadline(time.Now().Add(bridgeUpstreamDeadline))
 
 	r.Header.Del("Proxy-Connection")
 	r.Header.Del("Proxy-Authorization")
 
 	if err := r.Write(conn); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
 	reader := bufio.NewReaderSize(conn, relayBufSize)
 	resp, err := http.ReadResponse(reader, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -155,9 +190,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 	}
 	defer func() { connSem <- struct{}{} }()
 
-	destConn, err := dialer.Dial("tcp", target)
+	destConn, err := dialSocksTimeout(dialer, "tcp", target, bridgeDialTimeout)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), dialErrorCode(err))
 		return
 	}
 
