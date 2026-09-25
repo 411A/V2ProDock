@@ -46,3 +46,6 @@ repomix-output.xml
 
 # Internal
 .mimocode/
+
+# skills.sh generated links (junctions/symlinks recreated by `skills add`)
+.claude/

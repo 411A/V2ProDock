@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "use-modern-go": {
+      "source": "JetBrains/go-modern-guidelines",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/use-modern-go/SKILL.md",
+      "computedHash": "38fa785f9fdca56a5f1a87a589bdbb32f56b241aca319fdd82f616ff88803004"
+    }
+  }
+}
