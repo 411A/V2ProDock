@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -84,7 +85,7 @@ func splitURLs(s string) []string {
 
 func fetchOneURL(client *http.Client, subURL string) (string, error) {
 	var lastErr error
-	for attempt := 0; attempt < fetchAttempts; attempt++ {
+	for attempt := range fetchAttempts {
 		if attempt > 0 {
 			time.Sleep(fetchBackoffBase * time.Duration(1<<attempt))
 		}
@@ -149,7 +150,7 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	decodedContent := decodeBase64Content(content)
 
 	var proxies []ProxyConfig
-	for _, line := range strings.Split(decodedContent, "\n") {
+	for line := range strings.SplitSeq(decodedContent, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -215,23 +216,21 @@ func FetchMergedSubscriptions(urls []string) []ProxyConfig {
 	var merged []ProxyConfig
 	var wg sync.WaitGroup
 	for _, u := range clean {
-		wg.Add(1)
-		go func(subURL string) {
-			defer wg.Done()
-			cfgs, err := FetchSubscription(subURL)
+		wg.Go(func() {
+			cfgs, err := FetchSubscription(u)
 			if err != nil {
-				warnLog("subscription %s failed (%v), using other sources", subURL, err)
+				warnLog("subscription %s failed (%v), using other sources", u, err)
 				return
 			}
 			if len(cfgs) == 0 {
-				warnLog("subscription %s returned 0 proxies, using other sources", subURL)
+				warnLog("subscription %s returned 0 proxies, using other sources", u)
 				return
 			}
 			mu.Lock()
 			merged = append(merged, cfgs...)
 			mu.Unlock()
-			debugLog("subscription %s contributed %d configs", subURL, len(cfgs))
-		}(u)
+			debugLog("subscription %s contributed %d configs", u, len(cfgs))
+		})
 	}
 	wg.Wait()
 	if len(merged) == 0 {
@@ -319,15 +318,9 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	uuid := u.User.Username()
 	security := q.Get("security")
 	flow := q.Get("flow")
-	transport := q.Get("type")
-	if transport == "" {
-		transport = q.Get("headerType")
-	}
-	if transport == "" {
-		transport = "tcp"
-	}
+	transport := cmp.Or(q.Get("type"), q.Get("headerType"), "tcp")
 
-	stream := map[string]interface{}{
+	stream := map[string]any{
 		"network":  transport,
 		"security": security,
 	}
@@ -339,7 +332,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		if path == "" {
 			path = "/"
 		}
-		wsSettings := map[string]interface{}{
+		wsSettings := map[string]any{
 			"path": path,
 		}
 		if host != "" {
@@ -351,7 +344,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		if serviceName == "" {
 			serviceName = q.Get("path")
 		}
-		grpcSettings := map[string]interface{}{
+		grpcSettings := map[string]any{
 			"serviceName": serviceName,
 		}
 		if q.Get("mode") == "multi" {
@@ -365,7 +358,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 			path = "/"
 		}
 		host := q.Get("host")
-		httpSettings := map[string]interface{}{
+		httpSettings := map[string]any{
 			"path": path,
 		}
 		if host != "" {
@@ -379,7 +372,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		}
 		host := q.Get("host")
 		settingsKey := transport + "Settings"
-		settings := map[string]interface{}{
+		settings := map[string]any{
 			"path": path,
 		}
 		if host != "" {
@@ -391,7 +384,7 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 	// Security settings are transport-independent (REALITY/TLS work with any transport)
 	switch security {
 	case "reality":
-		stream["realitySettings"] = map[string]interface{}{
+		stream["realitySettings"] = map[string]any{
 			"serverName":  q.Get("sni"),
 			"fingerprint": q.Get("fp"),
 			"publicKey":   q.Get("pbk"),
@@ -405,14 +398,14 @@ func parseVless(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		stream["tlsSettings"] = buildTLS(q, transport)
 	}
 
-	outbound := map[string]interface{}{
+	outbound := map[string]any{
 		"protocol": "vless",
-		"settings": map[string]interface{}{
-			"vnext": []map[string]interface{}{
+		"settings": map[string]any{
+			"vnext": []map[string]any{
 				{
 					"address": server,
 					"port":    port,
-					"users": []map[string]interface{}{
+					"users": []map[string]any{
 						{
 							"id":         uuid,
 							"encryption": "none",
@@ -463,7 +456,7 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("failed to decode vmess base64: %w", err)
 	}
 
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(jsonData, &m); err != nil {
 		return nil, err
 	}
@@ -478,13 +471,13 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 	}
 	tls, _ := m["tls"].(string)
 
-	stream := map[string]interface{}{
+	stream := map[string]any{
 		"network":  net,
 		"security": tls,
 	}
 	switch net {
 	case "ws":
-		wsSettings := map[string]interface{}{}
+		wsSettings := map[string]any{}
 		if path, ok := m["path"].(string); ok && path != "" {
 			wsSettings["path"] = path
 		}
@@ -493,14 +486,14 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 		}
 		stream["wsSettings"] = wsSettings
 	case "grpc":
-		grpcSettings := map[string]interface{}{}
+		grpcSettings := map[string]any{}
 		if path, ok := m["path"].(string); ok && path != "" {
 			grpcSettings["serviceName"] = path
 		}
 		stream["grpcSettings"] = grpcSettings
 	case "http", "h2":
 		stream["network"] = "http"
-		httpSettings := map[string]interface{}{}
+		httpSettings := map[string]any{}
 		if path, ok := m["path"].(string); ok && path != "" {
 			httpSettings["path"] = path
 		}
@@ -511,7 +504,7 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 	}
 
 	if tls == "tls" {
-		tlsSettings := map[string]interface{}{}
+		tlsSettings := map[string]any{}
 		if sni, ok := m["sni"].(string); ok && sni != "" {
 			tlsSettings["serverName"] = sni
 		}
@@ -526,14 +519,14 @@ func parseVmess(raw, name string) (*ProxyConfig, error) {
 		scy = "auto"
 	}
 
-	outbound := map[string]interface{}{
+	outbound := map[string]any{
 		"protocol": "vmess",
-		"settings": map[string]interface{}{
-			"vnext": []map[string]interface{}{
+		"settings": map[string]any{
+			"vnext": []map[string]any{
 				{
 					"address": server,
 					"port":    port,
-					"users": []map[string]interface{}{
+					"users": []map[string]any{
 						{
 							"id":       id,
 							"alterId":  aid,
@@ -568,36 +561,36 @@ func parseTrojan(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		transport = "tcp"
 	}
 
-	stream := map[string]interface{}{
+	stream := map[string]any{
 		"network":  transport,
 		"security": "tls",
-		"tlsSettings": map[string]interface{}{
+		"tlsSettings": map[string]any{
 			"serverName":  q.Get("sni"),
 			"fingerprint": q.Get("fp"),
 		},
 	}
 	// Only add ALPN for non-WebSocket transports (deprecated in xray v26 for WS)
 	if transport != "ws" {
-		stream["tlsSettings"].(map[string]interface{})["alpn"] = []string{"h2", "http/1.1"}
+		stream["tlsSettings"].(map[string]any)["alpn"] = []string{"h2", "http/1.1"}
 	}
 
 	switch transport {
 	case "ws":
-		stream["wsSettings"] = map[string]interface{}{
+		stream["wsSettings"] = map[string]any{
 			"path": q.Get("path"),
 			"host": q.Get("host"),
 		}
 	case "grpc":
-		stream["grpcSettings"] = map[string]interface{}{
+		stream["grpcSettings"] = map[string]any{
 			"serviceName": q.Get("serviceName"),
 		}
 	}
 
 	// Trojan in xray: password is at the SERVER level, NOT inside users
-	outbound := map[string]interface{}{
+	outbound := map[string]any{
 		"protocol": "trojan",
-		"settings": map[string]interface{}{
-			"servers": []map[string]interface{}{
+		"settings": map[string]any{
+			"servers": []map[string]any{
 				{
 					"address":  server,
 					"port":     port,
@@ -650,10 +643,10 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("unsupported SS cipher: %s", method)
 	}
 
-	outbound := map[string]interface{}{
+	outbound := map[string]any{
 		"protocol": "shadowsocks",
-		"settings": map[string]interface{}{
-			"servers": []map[string]interface{}{
+		"settings": map[string]any{
+			"servers": []map[string]any{
 				{
 					"address":  server,
 					"port":     port,
@@ -662,7 +655,7 @@ func parseSS(u *url.URL, raw, name string) (*ProxyConfig, error) {
 				},
 			},
 		},
-		"streamSettings": map[string]interface{}{
+		"streamSettings": map[string]any{
 			"network": "tcp",
 		},
 		"tag": "proxy",
@@ -680,8 +673,8 @@ func parseHy2(_ *url.URL, _, _ string) (*ProxyConfig, error) {
 	return nil, fmt.Errorf("hysteria2 not supported by xray-core")
 }
 
-func buildTLS(q url.Values, transport string) map[string]interface{} {
-	m := map[string]interface{}{
+func buildTLS(q url.Values, transport string) map[string]any {
+	m := map[string]any{
 		"serverName": q.Get("sni"),
 	}
 	if fp := q.Get("fp"); fp != "" {

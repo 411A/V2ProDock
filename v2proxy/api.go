@@ -22,8 +22,8 @@ func findFreePort(start int) int {
 
 // readVPNStatus parses the shared vpn-gateway status file.
 // ok=false means VPN disabled/not booted yet (fail-closed discovery).
-func readVPNStatus(path string) (map[string]interface{}, bool) {
-	var st map[string]interface{}
+func readVPNStatus(path string) (map[string]any, bool) {
+	var st map[string]any
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
@@ -73,7 +73,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		if alive == 0 {
 			status = "degraded"
 		}
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"status":    status,
 			"instances": total,
 			"alive":     alive,
@@ -92,7 +92,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Cache-Control", "no-cache")
 		st, ok := readVPNStatus(vpnStatusPath())
 		if !ok {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"enabled": false,
 				"ikev2":   "500/udp,4500/udp",
 				"note":    "vpn-gateway not started or VPN_ENABLED=0; set VPN_ENABLED=1 + VPN_PASSWORD and compose up",
@@ -112,11 +112,9 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		}
 	})
 
-	mux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusMethodNotAllowed)
-			return
-		}
+	// Method-aware pattern: non-POST refresh attempts get a 405 from the
+	// mux itself (with an Allow header) instead of a manual check.
+	mux.HandleFunc("POST /refresh", func(w http.ResponseWriter, r *http.Request) {
 		go manager.RefreshSubscriptions()
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "refreshing"}); err != nil {

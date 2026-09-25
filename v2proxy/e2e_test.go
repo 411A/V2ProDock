@@ -189,7 +189,7 @@ func TestLifecycleStartSwitchNoOrphans(t *testing.T) {
 	for stubCount(dir) > 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
-	for i := 0; i < healthFailThreshold; i++ {
+	for range healthFailThreshold {
 		s.HealthCheck()
 	}
 	swStart := time.Now()

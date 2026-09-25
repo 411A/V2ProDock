@@ -1,10 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"math/rand"
 	"net"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +52,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		return m
 	}
 
-	for i := 0; i < instanceCount; i++ {
+	for i := range instanceCount {
 		socksPort := block + i
 		httpPort := block + instanceCount + i
 
@@ -99,7 +101,7 @@ func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
 		return nil, fmt.Errorf("no subscription URLs configured")
 	}
 	var lastErr error = fmt.Errorf("all %d subscription URLs failed", len(clean))
-	for attempt := 0; attempt < fetchPoolAttempts; attempt++ {
+	for attempt := range fetchPoolAttempts {
 		if attempt > 0 {
 			time.Sleep(fetchPoolRetrySleep)
 		}
@@ -140,10 +142,8 @@ func shuffleConfigs(in []ProxyConfig, seed int64) {
 func (m *ProxyManager) snapshot() (insts []*ProxySelector, subURLs []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	insts = make([]*ProxySelector, len(m.instances))
-	copy(insts, m.instances)
-	subURLs = make([]string, len(m.subURLs))
-	copy(subURLs, m.subURLs)
+	insts = slices.Clone(m.instances)
+	subURLs = slices.Clone(m.subURLs)
 	return insts, subURLs
 }
 
@@ -204,18 +204,12 @@ func (m *ProxyManager) Start() error {
 	snapUsed := func() map[string]int {
 		usedMu.Lock()
 		defer usedMu.Unlock()
-		cp := make(map[string]int, len(used))
-		for k, v := range used {
-			cp[k] = v
-		}
-		return cp
+		return maps.Clone(used)
 	}
 
 	stopTick := make(chan struct{})
 	var tickWg sync.WaitGroup
-	tickWg.Add(1)
-	go func() {
-		defer tickWg.Done()
+	tickWg.Go(func() {
 		t := time.NewTicker(populateTick)
 		defer t.Stop()
 		for {
@@ -226,7 +220,7 @@ func (m *ProxyManager) Start() error {
 				return
 			}
 		}
-	}()
+	})
 
 	round := 0
 	for {
@@ -280,38 +274,36 @@ func (m *ProxyManager) Start() error {
 			if m.statusOf(i).Status == "ok" || rawLists[i] == nil {
 				continue
 			}
-			wg.Add(1)
-			go func(idx int, sel *ProxySelector) {
-				defer wg.Done()
+			wg.Go(func() {
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				debugLog("Instance %d: testing %d configs for first working unique proxy...", idx, len(rawLists[idx]))
+				debugLog("Instance %d: testing %d configs for first working unique proxy...", i, len(rawLists[i]))
 				deadline := time.Now().Add(probeTimeout)
 				for attempt := 0; attempt < probeMaxAttempts && time.Now().Before(deadline); attempt++ {
-					if err := sel.startShared(snapUsed(), shared, deadline); err != nil {
-						debugLog("Instance %d: %v", idx, err)
+					if err := inst.startShared(snapUsed(), shared, deadline); err != nil {
+						debugLog("Instance %d: %v", i, err)
 						return
 					}
-					cfg := sel.ActiveConfig()
+					cfg := inst.ActiveConfig()
 					if cfg == nil {
-						debugLog("Instance %d: no active config yet", idx)
+						debugLog("Instance %d: no active config yet", i)
 						return
 					}
 					usedMu.Lock()
 					_, dup := used[cfg.Key()]
 					if !dup {
-						used[cfg.Key()] = idx
+						used[cfg.Key()] = i
 					}
 					usedMu.Unlock()
 					if dup {
-						debugLog("Instance %d: %s taken by another instance, retrying...", idx, shortName(cfg.Name))
+						debugLog("Instance %d: %s taken by another instance, retrying...", i, shortName(cfg.Name))
 						continue
 					}
-					m.markOK(idx, cfg.Name, sel.LastLatency())
+					m.markOK(i, cfg.Name, inst.LastLatency())
 					return
 				}
-				debugLog("Instance %d: round over without a claim, will retry", idx)
-			}(i, inst)
+				debugLog("Instance %d: round over without a claim, will retry", i)
+			})
 		}
 		wg.Wait()
 		if m.AliveCount() == len(insts) {
@@ -418,16 +410,10 @@ func (m *ProxyManager) RefreshSubscriptions() {
 // rotate only to one proven >=30% faster. Fast present active -> untouched.
 func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector) {
 	active := inst.ActiveConfig()
-	present := active != nil
-	if present {
-		present = false
-		for _, c := range inst.snapshotConfigs() {
-			if c.Key() == active.Key() {
-				present = true
-				break
-			}
-		}
-	}
+	present := active != nil &&
+		slices.ContainsFunc(inst.snapshotConfigs(), func(c ProxyConfig) bool {
+			return c.Key() == active.Key()
+		})
 	if !present {
 		warnLog("Instance %d: active config vanished from pool, rotating...", i)
 		m.markDown(i, "active config vanished from pool")
@@ -490,12 +476,11 @@ func (m *ProxyManager) GetStatuses() []InstanceStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	result := make([]InstanceStatus, len(m.statuses))
-	copy(result, m.statuses)
+	result := slices.Clone(m.statuses)
 
 	// Human-friendly: always in instance order.
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Index < result[j].Index
+	slices.SortFunc(result, func(a, b InstanceStatus) int {
+		return cmp.Compare(a.Index, b.Index)
 	})
 
 	return result
@@ -511,8 +496,8 @@ func (m *ProxyManager) GetAliveStatuses() []InstanceStatus {
 	}
 	m.mu.Unlock()
 
-	sort.Slice(alive, func(i, j int) bool {
-		return alive[i].LatMs < alive[j].LatMs
+	slices.SortFunc(alive, func(a, b InstanceStatus) int {
+		return cmp.Compare(a.LatMs, b.LatMs)
 	})
 
 	return alive

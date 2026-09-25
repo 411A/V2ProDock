@@ -47,16 +47,23 @@ func dialErrorCode(err error) int {
 }
 
 var relayBufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		b := make([]byte, relayBufSize)
 		return &b
 	},
 }
 
-var (
-	connSem  chan struct{}
-	onceInit sync.Once
-)
+var connSem chan struct{}
+
+// initConnSem fills the connection-slot semaphore exactly once; later
+// MAX_CONNS changes intentionally do not resize the live channel.
+var initConnSem = sync.OnceFunc(func() {
+	max := getMaxConns()
+	connSem = make(chan struct{}, max)
+	for range max {
+		connSem <- struct{}{}
+	}
+})
 
 func getMaxConns() int {
 	if v := os.Getenv("MAX_CONNS"); v != "" {
@@ -65,16 +72,6 @@ func getMaxConns() int {
 		}
 	}
 	return defaultMaxConns
-}
-
-func initConnSem() {
-	onceInit.Do(func() {
-		max := getMaxConns()
-		connSem = make(chan struct{}, max)
-		for i := 0; i < max; i++ {
-			connSem <- struct{}{}
-		}
-	})
 }
 
 func startHTTPProxy(addr, socksAddr string) {

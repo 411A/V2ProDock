@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"net"
 	"net/http"
@@ -22,7 +23,7 @@ func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResul
 	}
 
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		},
 		TLSHandshakeTimeout:   healthTLSHandshakeTimeout,
@@ -86,10 +87,7 @@ func TestProxyHealth(proxyAddr string, primaryURL string, timeout time.Duration)
 // can no longer condemn a healthy tunnel. Both URLs travel through the xray
 // SOCKS port under test; nothing here is a local TCP check.
 func TestProxyQuick(proxyAddr, testURL string) HealthResult {
-	primary := probeURL
-	if testURL != "" {
-		primary = testURL
-	}
+	primary := cmp.Or(testURL, probeURL)
 	if quickFallbackURL == "" || quickFallbackURL == primary {
 		return testSingleURL(proxyAddr, primary, quickProbeTimeout)
 	}

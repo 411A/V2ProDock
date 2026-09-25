@@ -8,7 +8,7 @@ import (
 )
 
 // isolateChild is a no-op on Windows (no process groups via syscall).
-func isolateChild(cmd *exec.Cmd) {}
+func isolateChild(_ *exec.Cmd) {}
 
 // processAlive is best-effort on Windows: Go cannot probe liveness without
 // killing, so report alive and let the port wait + probe verdict decide.

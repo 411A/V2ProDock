@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -69,24 +70,16 @@ func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
 		activeKey = s.configs[s.activeIndex].Key()
 	}
 	s.configs = configs
-	s.activeIndex = -1
-	if activeKey != "" {
-		for i := range s.configs {
-			if s.configs[i].Key() == activeKey {
-				s.activeIndex = i
-				break
-			}
-		}
-	}
+	s.activeIndex = slices.IndexFunc(s.configs, func(c ProxyConfig) bool {
+		return activeKey != "" && c.Key() == activeKey
+	})
 }
 
 // snapshotConfigs returns a copy of the pool for key lookups outside s.mu.
 func (s *ProxySelector) snapshotConfigs() []ProxyConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]ProxyConfig, len(s.configs))
-	copy(out, s.configs)
-	return out
+	return slices.Clone(s.configs)
 }
 
 func (s *ProxySelector) StartWithBest() error {
@@ -183,10 +176,10 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			return skipped, fmt.Errorf("probe timeout")
 		}
 		key := s.configs[i].Key()
-		if exclude != nil {
-			if _, ok := exclude[s.configs[i].Key()]; ok {
-				continue
-			}
+		// Indexing a nil exclude map is safe in Go (yields zero value),
+		// so no nil check is needed here.
+		if _, ok := exclude[key]; ok {
+			continue
 		}
 		if respectBad && shared.isBad(key) {
 			skipped++
@@ -268,7 +261,7 @@ func switchOrder(n, startIdx, oldIndex int) []int {
 		start = 0
 	}
 	order := make([]int, 0, n)
-	for k := 0; k < n; k++ {
+	for k := range n {
 		i := (start + k) % n
 		if i == oldIndex {
 			continue
@@ -300,10 +293,8 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 			debugLog("switch budget exhausted, giving up for now")
 			break
 		}
-		if exclude != nil {
-			if _, ok := exclude[s.configs[i].Key()]; ok {
-				continue
-			}
+		if _, ok := exclude[s.configs[i].Key()]; ok {
+			continue
 		}
 		if oldCmd != nil {
 			s.stopXrayCmd(oldCmd)
@@ -429,51 +420,51 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bo
 	if isDebug() {
 		logLevel = "warning"
 	}
-	fullConfig := map[string]interface{}{
-		"log": map[string]interface{}{
+	fullConfig := map[string]any{
+		"log": map[string]any{
 			"loglevel": logLevel,
 		},
-		"dns": map[string]interface{}{
+		"dns": map[string]any{
 			"servers": []string{
 				"https://1.1.1.1/dns-query",
 				"localhost",
 			},
 		},
-		"inbounds": []map[string]interface{}{
+		"inbounds": []map[string]any{
 			{
 				"tag":      "socks-in",
 				"port":     socksPort,
 				"listen":   "0.0.0.0",
 				"protocol": "socks",
-				"settings": map[string]interface{}{
+				"settings": map[string]any{
 					"auth": "noauth",
 					"udp":  true,
 				},
 			},
 		},
-		"outbounds": []interface{}{},
+		"outbounds": []any{},
 	}
 
-	var outbound map[string]interface{}
+	var outbound map[string]any
 	if err := json.Unmarshal(cfg.XrayCfg, &outbound); err != nil {
 		return "", fmt.Errorf("bad config: %w", err)
 	}
 
-	fullConfig["outbounds"] = []interface{}{
+	fullConfig["outbounds"] = []any{
 		outbound,
-		map[string]interface{}{
+		map[string]any{
 			"protocol": "freedom",
 			"tag":      "direct",
 		},
-		map[string]interface{}{
+		map[string]any{
 			"protocol": "blackhole",
 			"tag":      "blocked",
 		},
 	}
 
-	fullConfig["routing"] = map[string]interface{}{
+	fullConfig["routing"] = map[string]any{
 		"domainStrategy": "AsIs",
-		"rules": []map[string]interface{}{
+		"rules": []map[string]any{
 			{
 				"type":        "field",
 				"outboundTag": "blocked",
