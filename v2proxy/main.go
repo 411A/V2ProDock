@@ -137,6 +137,9 @@ func main() {
 	if aggSocksAddr != "" || aggHTTPAddr != "" {
 		bannerLog(fmt.Sprintf("Stable endpoints (pin bots here): SOCKS5 %s  HTTP %s", aggSocksAddr, aggHTTPAddr))
 	}
+	if n := len(cleanIPMap()); n > 0 {
+		infoLog("Clean-IP map active: %d entries (CLEAN_IP_MAP; SNI untouched)", n)
+	}
 
 	debugLog("Starting %d instance(s)...", manager.InstanceCount())
 	if err := manager.Start(); err != nil {

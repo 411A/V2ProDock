@@ -282,6 +282,8 @@ func decodeBase64Content(s string) string {
 }
 
 func parseToXrayConfig(raw string) (*ProxyConfig, error) {
+	// L2 escape hatch: blocked edge IP -> working edge IP, SNI untouched.
+	raw = rewriteCleanIP(raw, cleanIPMap())
 	if strings.HasPrefix(raw, "vmess://") {
 		return parseVmess(raw, "")
 	}

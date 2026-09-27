@@ -354,6 +354,29 @@ sudo bash install.sh uninstall # Remove everything
 6. API returns alive proxies sorted by latency — dead ones excluded
 7. Subscriptions re-fetched every 120s for updated server lists
 
+## Under Hard Censorship
+
+Three layers, three answers (see `AGENT.md` for the full roadmap):
+
+1. **SNI filtering / TLS RST (daily):** set `XRAY_FRAGMENT=1` — splits the
+   TLS ClientHello so DPI can't reassemble the SNI (TLS upstreams only).
+2. **CDN edge-IP blocks (high tension):** the SNI still works, only the dial
+   IP is dead. From the VM on the censored network, run
+   `./scripts/cleanip-scan.sh <sni-host> 443`, paste the suggested
+   `CLEAN_IP_MAP="blocked.edge=working.ip"` into `.env`, and
+   `docker compose up -d --build v2proxy`. The daemon swaps only the dial
+   address at ingest — SNI, Host header and credentials untouched.
+   Candidates come from live sources, not a fixed list: DoH answers for
+   your SNI plus fresh random samples from Cloudflare's official ranges
+   (private builtin set is last resort). If fetching those lists is itself
+   blocked, bootstrap discovery through your still-working proxy:
+   `--via socks5h://127.0.0.1:27017`, or point `DOH_BASES=` at an
+   unblocked DoH server.
+3. **Total international blackout:** no software on this host can create
+   routes that don't exist. The answer is a domestic relay (in-country VPS
+   with limited transit + reverse tunnel to the foreign VPS) — planned, not
+   yet built; Telegram-only DNS-tunnel fallback is the last-resort tier.
+
 ## Supported Protocols
 
 | Protocol | Transport |
@@ -380,6 +403,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `AGG_MIN_STREAK` | `3` | Aggregate prefers this-consecutive-successes stability over raw latency (`0` = fastest wins) |
 | `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
 | `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |
+| `CLEAN_IP_MAP` | — | L2 escape hatch: `blocked.edge=working.edge.ip,...` swaps the dial address at ingest (SNI/Host/UUID untouched); find winners via `scripts/cleanip-scan.sh` |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
