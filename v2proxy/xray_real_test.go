@@ -285,6 +285,36 @@ func TestRealXrayParallelSwitch(t *testing.T) {
 	}
 }
 
+func TestRealXrayAggregate(t *testing.T) {
+	bin := needRealXray(t)
+	target := startLocalHTTPTarget(t)
+	srvPort := freeLoopbackPort(t)
+	startRealServer(t, bin, srvPort)
+
+	dir := t.TempDir()
+	copyRealXray(t, bin, dir)
+
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, target, socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{
+		{Name: "good", Raw: "ra-good", Endpoint: "ra-good:1", XrayCfg: realOutbound(srvPort)},
+	})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "ok", LatMs: s.LastLatency().Milliseconds()}},
+	}
+	ap := freeAggPort(t)
+	startAggregator(m, ap, 0)
+	addr := fmt.Sprintf("127.0.0.1:%d", ap)
+	waitAggTCP(t, addr)
+	if res := TestProxyQuick(addr, target); !res.Working {
+		t.Fatalf("aggregate over real xray must serve, got %v", res.Error)
+	}
+}
+
 func TestRealXraySelectorLifecycle(t *testing.T) {
 	bin := needRealXray(t)
 	target := startLocalHTTPTarget(t)

@@ -61,6 +61,15 @@ func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
 		_ = client.Close()
 		return
 	}
-	go relay(up, client)
-	go relay(client, up)
+	// First byte in either direction timestamps this backend as proven
+	// responsive (passive health). Port parsed once per connection; a backend
+	// that never moves bytes earns no trust.
+	egress := func() {}
+	if _, p, perr := net.SplitHostPort(backend); perr == nil {
+		var port int
+		_, _ = fmt.Sscanf(p, "%d", &port)
+		egress = func() { noteEgress(port) }
+	}
+	go relay(up, client, egress)
+	go relay(client, up, egress)
 }

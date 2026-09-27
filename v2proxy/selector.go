@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,13 @@ type ProxySelector struct {
 	checkInterval time.Duration
 	lastCheck     time.Time
 	lastLatency   time.Duration
+	// Stability signals for long-polling clients: a 2s proxy that stays up an
+	// hour beats a 200ms one that dies every 5 minutes, but latency alone
+	// cannot see that. okStreak counts CONSECUTIVE successful health checks
+	// on the current upstream (any failure zeroes it); activeSince marks when
+	// the current upstream was adopted. Exposed via /proxies for ranking.
+	okStreak    int
+	activeSince time.Time
 	// tempMu serializes throwaway-port allocation (bind :0, render, launch):
 	// two workers must never pick the same ephemeral port/file.
 	tempMu sync.Mutex
@@ -210,6 +218,8 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			s.activeIndex = i
 			s.lastLatency = result.Latency
 			s.failCount = 0
+			s.okStreak = 0
+			s.activeSince = time.Now()
 			readyLog(s.configs[i].Name, result.Latency.Milliseconds())
 			return skipped, nil
 		}
@@ -229,6 +239,17 @@ func (s *ProxySelector) HealthCheck() bool {
 		return false
 	}
 
+	// Passive proof first: real client bytes flowed through this instance
+	// within grace — it is responsive BY DEFINITION, so no synthetic probe
+	// may strike it. Skipping also spares probe traffic on busy instances.
+	if egressActive([]int{s.httpPort, s.socksPort}, egressGrace) {
+		s.lastCheck = time.Now()
+		s.failCount = 0
+		s.okStreak++
+		debugLog("instance serving client traffic, probe skipped (streak %d)", s.okStreak)
+		return true
+	}
+
 	// Single fast probe: the old multi-URL pass cost up to ~32s per check and
 	// held s.mu the whole time, stalling switches and status reads.
 	result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
@@ -237,10 +258,23 @@ func (s *ProxySelector) HealthCheck() bool {
 
 	if result.Working {
 		s.failCount = 0
+		s.okStreak++
+		if s.activeSince.IsZero() {
+			s.activeSince = time.Now()
+		}
+		return true
+	}
+
+	// Inconclusive, not dead: the PROBE TARGET throttled/blocked our egress
+	// IP (429/403) while the tunnel itself may be fine. Neither strike nor
+	// absolve — hold serving, retry next tick. Anything else strikes.
+	if result.Status == http.StatusTooManyRequests || result.Status == http.StatusForbidden {
+		debugLog("probe inconclusive (%d from target, tunnel may be fine): %s", result.Status, shortName(s.configs[s.activeIndex].Name))
 		return true
 	}
 
 	s.failCount++
+	s.okStreak = 0
 	warnLog("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
 
 	if s.failCount < healthFailThreshold {
@@ -357,8 +391,18 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	s.activeIndex = cur
 	s.lastLatency = winLat
 	s.failCount = 0
+	s.okStreak = 0
+	s.activeSince = time.Now()
 	switchedLog(s.configs[cur].Name, winLat.Milliseconds())
 	return nil
+}
+
+// Stability returns the consecutive-success streak and adoption time of the
+// current upstream (zero values = never healthy yet).
+func (s *ProxySelector) Stability() (int, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.okStreak, s.activeSince
 }
 
 // tryRestoreLocked best-effort restarts the pre-switch config (by key) after
@@ -374,6 +418,8 @@ func (s *ProxySelector) tryRestoreLocked(oldKey string) {
 			if err := s.startXray(i); err == nil {
 				s.activeIndex = i
 				s.failCount = 0
+				s.okStreak = 0
+				s.activeSince = time.Now()
 			}
 			return
 		}

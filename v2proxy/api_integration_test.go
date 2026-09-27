@@ -108,6 +108,28 @@ func TestAPIProxiesAndAll(t *testing.T) {
 	}
 }
 
+func TestAPIProxiesExposeStability(t *testing.T) {
+	// Hermes ranks stable-slow above flappy-fast: the stability fields must
+	// survive JSON encoding on every /proxies entry.
+	m, api := startTestStack(t, 27800, 1)
+	m.markOK(0, "stable-one", 5*time.Millisecond)
+	resp, err := testClient().Get(api + "/proxies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alive []InstanceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&alive); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(alive) != 1 {
+		t.Fatalf("/proxies returned %d entries, want 1", len(alive))
+	}
+	if alive[0].OkStreak != 0 {
+		t.Fatalf("OkStreak = %d, want 0 (never health-checked)", alive[0].OkStreak)
+	}
+}
+
 func TestAPIVPNReportsDisabled(t *testing.T) {
 	if _, err := os.Stat(vpnStatusPath()); err == nil {
 		t.Skip("integration: live vpn status file present, disabled-path untestable")

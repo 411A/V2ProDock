@@ -107,7 +107,7 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies sorted by latency (lowest first) |
+| `/proxies` | GET | Alive proxies sorted by latency (lowest first); each carries `ok_streak` (consecutive successful checks) — prefer high streaks over merely low latency for long-polling bots |
 | `/all` | GET | All instances including down ones |
 | `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` + stable `aggregate_socks`/`aggregate_http` endpoints |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
@@ -350,7 +350,7 @@ sudo bash install.sh uninstall # Remove everything
 2. Converts each to an xray-core JSON outbound config
 3. Distributes configs across N instances (round-robin)
 4. Each instance: starts xray, tests configs, keeps the first working one
-5. Health checks run every 60s per instance — on failure, switches to next config
+5. Health checks run every 60s per instance — 3 strikes switch to next config, except: proxies actively serving client traffic are never killed by probe blips (real bytes outrank synthetic probes), and 429/403 from the probe target itself is inconclusive (target throttling you, not a dead tunnel)
 6. API returns alive proxies sorted by latency — dead ones excluded
 7. Subscriptions re-fetched every 120s for updated server lists
 
@@ -375,6 +375,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity (must be `https://` — plain HTTP is DPI-killed on bare transports, causing false downs) |
+| `TELEGRAM_PROBE` | `1` | Race an api.telegram.org leg into every probe (`0` = 204-only race) |
 | `AGGREGATE_SOCKS_PORT` / `AGGREGATE_HTTP_PORT` | `27017` / `27016` | Stable single ports routing to the fastest alive instance (`0` disables) |
 | `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
 | `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |

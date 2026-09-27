@@ -83,6 +83,14 @@ func startHTTPProxy(addr, socksAddr string) {
 		return
 	}
 
+	// Bridge identity for passive health: any proven byte flow through this
+	// listener timestamps the instance as responsive (ground truth that
+	// outranks synthetic probes). Unparseable addr disables notes silently.
+	httpPort := 0
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		_, _ = fmt.Sscanf(p, "%d", &httpPort)
+	}
+
 	server := &http.Server{
 		Addr:              addr,
 		ReadHeaderTimeout: bridgeReadHeaderTimeout,
@@ -90,9 +98,9 @@ func startHTTPProxy(addr, socksAddr string) {
 		MaxHeaderBytes:    bridgeMaxHeaderBytes,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
-				handleConnect(w, r, dialer)
+				handleConnect(w, r, dialer, httpPort)
 			} else {
-				handlePlainHTTP(w, r, dialer)
+				handlePlainHTTP(w, r, dialer, httpPort)
 			}
 		}),
 	}
@@ -111,7 +119,42 @@ func startHTTPProxy(addr, socksAddr string) {
 	}()
 }
 
-func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) {
+// egressNotes timestamps proven byte flows per instance port: the passive
+// health registry. A proxy that just served real traffic is responsive by
+// definition — HealthCheck trusts freshness here over synthetic probes.
+var egressNotes = struct {
+	mu     sync.Mutex
+	lastOK map[int]time.Time
+}{lastOK: map[int]time.Time{}}
+
+// noteEgress records a proven flow for one instance port (bridge HTTP port or
+// serving SOCKS port). Port 0 (unparseable listener addr) is dropped: a note
+// that matches nothing must never fake health.
+func noteEgress(port int) {
+	if port <= 0 {
+		return
+	}
+	egressNotes.mu.Lock()
+	defer egressNotes.mu.Unlock()
+	egressNotes.lastOK[port] = time.Now()
+}
+
+// egressActive reports whether ANY of the given instance ports proved a flow
+// within grace. Pure read for HealthCheck; keys are the fixed per-instance
+// port set, so the map stays tiny forever.
+func egressActive(ports []int, grace time.Duration) bool {
+	cutoff := time.Now().Add(-grace)
+	egressNotes.mu.Lock()
+	defer egressNotes.mu.Unlock()
+	for _, p := range ports {
+		if t, ok := egressNotes.lastOK[p]; ok && t.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, httpPort int) {
 	// Acquire connection slot to prevent unbounded HTTP request goroutines
 	select {
 	case <-connSem:
@@ -154,6 +197,9 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		return
 	}
 	defer resp.Body.Close()
+	// Response head arrived through the tunnel: full path proven (SOCKS +
+	// upstream + egress). Timestamp it — this outranks any synthetic probe.
+	noteEgress(httpPort)
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -172,7 +218,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	}
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) {
+func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, httpPort int) {
 	target := r.Host
 	if !strings.Contains(target, ":") {
 		target += ":443"
@@ -213,11 +259,38 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer) 
 		return
 	}
 
-	go relay(destConn, clientConn)
-	go relay(clientConn, destConn)
+	// First byte in either direction proves the tunnel live (the 200 above
+	// only proved the dial). Idempotent timestamp: double-fire is harmless.
+	egress := func() { noteEgress(httpPort) }
+	go relay(destConn, clientConn, egress)
+	go relay(clientConn, destConn, egress)
 }
 
-func relay(dst, src net.Conn) {
+// setKeepAlive arms dead-peer detection on a relayed stream. Full tuning
+// (idle/interval/count) where the platform allows, classic keepalive period
+// otherwise. Non-TCP conns are left alone. Never fails the caller: worst case
+// is today's behavior (absolute deadline only).
+func setKeepAlive(c net.Conn) {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if err := tc.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     keepAliveIdle,
+		Interval: keepAliveInterval,
+		Count:    keepAliveCount,
+	}); err != nil {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(keepAliveIdle)
+	}
+}
+
+func relay(dst, src net.Conn, onFirstByte func()) {
+	// Both ends: a blackholed upstream must surface here (relay unblocks,
+	// both sides close, client reconnects) instead of hanging to the deadline.
+	setKeepAlive(dst)
+	setKeepAlive(src)
 	defer func() { _ = dst.Close() }()
 	defer func() { _ = src.Close() }()
 
@@ -232,6 +305,10 @@ func relay(dst, src net.Conn) {
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
+			if onFirstByte != nil {
+				onFirstByte()
+				onFirstByte = nil
+			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				return
 			}

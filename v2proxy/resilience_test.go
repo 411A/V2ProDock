@@ -191,6 +191,37 @@ func handleMiniSocks(c net.Conn, mode string) {
 		time.Sleep(30 * time.Second)
 		return
 	}
+	if mode == "limited" {
+		// Slurp the HTTP request head, then 429 (target throttling us —
+		// tunnel may be fine; must NEVER count as proxy death).
+		buf := make([]byte, 0, 512)
+		tmp := make([]byte, 256)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for !strings.Contains(string(buf), "\r\n\r\n") && len(buf) < 4096 {
+			m, err := c.Read(tmp)
+			if err != nil {
+				return
+			}
+			buf = append(buf, tmp[:m]...)
+		}
+		_, _ = c.Write([]byte("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		return
+	}
+	if mode == "notfound" {
+		// Slurp the HTTP request head, then 404 (Telegram-root shape).
+		buf := make([]byte, 0, 512)
+		tmp := make([]byte, 256)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for !strings.Contains(string(buf), "\r\n\r\n") && len(buf) < 4096 {
+			m, err := c.Read(tmp)
+			if err != nil {
+				return
+			}
+			buf = append(buf, tmp[:m]...)
+		}
+		_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"ok\":false,\"x\":1}"))
+		return
+	}
 	// Slurp the HTTP request head, then 204.
 	buf := make([]byte, 0, 512)
 	tmp := make([]byte, 256)
@@ -249,8 +280,37 @@ func TestQuickProbeHungUpstreamBounded(t *testing.T) {
 
 // ---- Probe URLs must stay HTTPS (DPI kills plain HTTP) ----
 
+func TestTelegramAcceptsAnyStatus(t *testing.T) {
+	// Telegram's root answers non-2xx: a plain probe would condemn a
+	// reachable API. The mini stub cannot terminate TLS, so the transport
+	// legs are proven elsewhere (204-stub + real-xray tests) and the
+	// ACCEPTANCE is proven here, hermetically, both halves:
+	// 1. plain probe rejects a 404 served over plaintext HTTP;
+	// 2. the telegram predicate accepts any completed exchange.
+	addr, done := serveSocks204(t, "notfound")
+	defer done()
+	if res := testSingleURL(addr, "http://probe.invalid/", quickProbeTimeout); res.Working {
+		t.Fatal("plain probe must NOT accept 404")
+	}
+	if !telegramWorking(HealthResult{Latency: time.Millisecond}) {
+		t.Fatal("completed exchange (even 404) must prove Telegram reachability")
+	}
+	if telegramWorking(HealthResult{Error: fmt.Errorf("boom")}) {
+		t.Fatal("transport error must still fail the telegram leg")
+	}
+	// Kill-switch restores the two-leg race shape.
+	t.Setenv("TELEGRAM_PROBE", "0")
+	if telegramProbeEnabled() {
+		t.Fatal("TELEGRAM_PROBE=0 must disable")
+	}
+	t.Setenv("TELEGRAM_PROBE", "")
+	if !telegramProbeEnabled() {
+		t.Fatal("telegram probe must default on")
+	}
+}
+
 func TestProbeURLsAreHTTPS(t *testing.T) {
-	for _, u := range append([]string{probeURL, quickFallbackURL, defaultHealthCheckURL}, fallbackHealthURLs...) {
+	for _, u := range append([]string{probeURL, quickFallbackURL, telegramProbeURL, defaultHealthCheckURL}, fallbackHealthURLs...) {
 		if !strings.HasPrefix(u, "https://") {
 			t.Fatalf("probe URL must be HTTPS, got %s", u)
 		}

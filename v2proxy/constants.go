@@ -152,6 +152,39 @@ const (
 	bridgeMaxHeaderBytes    = 4096
 )
 
+// ---- Half-open connection detection (long-poll survival) ----
+// A DPI blackhole (no FIN/RST) leaves relay Reads blocked until the absolute
+// deadline. Aggressive keepalives on BOTH relay ends detect the dead peer in
+// ~idle+interval*count instead of minutes, so the client reconnects onto a
+// fresh upstream. Idle stays above long-poll silence: healthy polls never
+// trip, only truly dead sockets do.
+const (
+	keepAliveIdle     = 30 * time.Second
+	keepAliveInterval = 10 * time.Second
+	keepAliveCount    = 3
+)
+
+// ---- Telegram-targeted probing ----
+// api.telegram.org root answers non-2xx (documented 404 envelope), so it can
+// never be a plain health URL — but ANY completed HTTPS exchange with it
+// proves Telegram reachability, which is exactly what the gateway needs.
+// Raced alongside the 204s; first success wins, cost stays one 3s budget.
+const telegramProbeURL = "https://api.telegram.org/"
+
+// ---- Passive health: real client traffic outranks synthetic probes ----
+// A proxy that just served real bytes is responsive BY DEFINITION — no probe
+// blip may kill it. Bridges (per-instance HTTP) and the aggregate (raw relay)
+// timestamp every proven byte flow per instance port; HealthCheck trusts
+// activity fresher than this instead of probing. 90s covers a quiet tick
+// with margin while bounding true-down detection to grace + 3 strikes.
+const egressGrace = 90 * time.Second
+
+// ---- Startup serving threshold ----
+// Thin pools grind for minutes before EVERY instance lands one. Serve as soon
+// as this many are ready (capped by instance count); stragglers keep healing
+// via the health + refresh loops. N=1 keeps the old all-must-be-ok behavior.
+const serveMinReady = 2
+
 // ---- Status API server ----
 const (
 	apiReadTimeout       = 5 * time.Second

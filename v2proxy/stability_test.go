@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -248,6 +249,259 @@ func TestRenderNoFragmentByDefault(t *testing.T) {
 	up := got["up"].(map[string]any)
 	if _, ok := up["streamSettings"].(map[string]any)["sockopt"]; ok {
 		t.Fatal("fragment off by default: no sockopt may appear")
+	}
+}
+
+func TestServeReady(t *testing.T) {
+	for _, c := range []struct {
+		alive, total int
+		want         bool
+	}{
+		{0, 10, false},
+		{1, 10, false}, // thin pool still grinding
+		{2, 10, true},  // serve now, heal rest in background
+		{9, 10, true},
+		{10, 10, true},
+		{1, 1, true}, // single instance keeps all-must-be-ok
+		{0, 1, false},
+		{2, 2, true},
+		{1, 2, false},
+		{0, 0, false},
+	} {
+		if got := serveReady(c.alive, c.total); got != c.want {
+			t.Fatalf("serveReady(%d,%d) = %v, want %v", c.alive, c.total, got, c.want)
+		}
+	}
+}
+
+func TestRelayKeepAliveFlows(t *testing.T) {
+	// setKeepAlive must accept real TCP conns on every platform (full tuning
+	// or classic fallback) and never disturb traffic. Non-TCP input is a
+	// silent no-op, never a panic.
+	setKeepAlive(nil)
+	a, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	go func() {
+		for {
+			c, err := a.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				setKeepAlive(c)
+				buf := make([]byte, 8)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	b, err := net.DialTimeout("tcp", a.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	setKeepAlive(b)
+	_ = b.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := b.Write([]byte("ka")); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := readN(b, 2)
+	if !ok || string(got) != "ka" {
+		t.Fatalf("echo = %q", got)
+	}
+}
+
+func TestStreakLifecycle(t *testing.T) {
+	// Streak counts CONSECUTIVE successes on the current upstream; any
+	// failure zeroes it. HealthCheck needs no xray — only something answering
+	// on the SOCKS port (the stub answers every request with 204).
+	stubAddr, done := serveSocks204(t, "ok")
+	stubPort := splitPort(t, stubAddr)
+	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", stubPort, freeAggPort(t), time.Minute)
+	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
+	s.mu.Lock()
+	s.activeIndex = 0
+	s.mu.Unlock()
+	for range 3 {
+		if !s.HealthCheck() {
+			t.Fatal("HealthCheck through stub must pass")
+		}
+	}
+	if streak, _ := s.Stability(); streak != 3 {
+		t.Fatalf("streak = %d, want 3", streak)
+	}
+	if _, since := s.Stability(); since.IsZero() {
+		t.Fatal("activeSince must be set after first success")
+	}
+	done() // kill the stub: after the 3-strike threshold the verdict must
+	// fail and zero the streak (single failures stay "healthy" by design).
+	failed := false
+	for range 5 {
+		if !s.HealthCheck() {
+			failed = true
+			break
+		}
+	}
+	if !failed {
+		t.Fatal("HealthCheck on dead port must fail after 3 strikes")
+	}
+	if streak, _ := s.Stability(); streak != 0 {
+		t.Fatalf("streak after failure = %d, want 0", streak)
+	}
+}
+
+func TestMarkOKCopiesStreak(t *testing.T) {
+	stubAddr, done := serveSocks204(t, "ok")
+	defer done()
+	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t), time.Minute)
+	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
+	s.mu.Lock()
+	s.activeIndex = 0
+	s.mu.Unlock()
+	for range 2 {
+		if !s.HealthCheck() {
+			t.Fatal("HealthCheck through stub must pass")
+		}
+	}
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "starting"}},
+	}
+	m.markOK(0, "n", 5*time.Millisecond)
+	got := m.GetStatuses()[0]
+	if got.OkStreak != 2 {
+		t.Fatalf("status OkStreak = %d, want 2", got.OkStreak)
+	}
+	if got.ActiveSince == "" {
+		t.Fatal("status ActiveSince must be set")
+	}
+	if _, err := time.Parse(time.RFC3339, got.ActiveSince); err != nil {
+		t.Fatalf("ActiveSince must be RFC3339, got %q", got.ActiveSince)
+	}
+}
+
+func TestRateLimitNeutral(t *testing.T) {
+	// A 429/403 comes from the PROBE TARGET throttling our egress IP — the
+	// tunnel may be perfectly fine. It must neither strike nor absolve:
+	// failCount frozen, streak untouched, still serving.
+	stubAddr, done := serveSocks204(t, "limited")
+	defer done()
+	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t), time.Minute)
+	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
+	s.mu.Lock()
+	s.activeIndex = 0
+	s.mu.Unlock()
+	for range 3 {
+		if !s.HealthCheck() {
+			t.Fatal("rate-limited probe must stay inconclusive (serving), never down")
+		}
+	}
+	s.mu.Lock()
+	fc, streak := s.failCount, s.okStreak
+	s.mu.Unlock()
+	if fc != 0 || streak != 0 {
+		t.Fatalf("inconclusive must freeze counters, got failCount=%d streak=%d", fc, streak)
+	}
+}
+
+func TestEgressActivitySkip(t *testing.T) {
+	// Nothing listens on these ports: without traffic proof the synthetic
+	// path fails after 3 strikes; with a fresh note the instance is healthy
+	// by definition (no network touched).
+	mkDead := func() *ProxySelector {
+		s := NewProxySelector(t.TempDir(), "http://probe.invalid/", freeAggPort(t), freeAggPort(t), time.Minute)
+		s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
+		s.mu.Lock()
+		s.activeIndex = 0
+		s.mu.Unlock()
+		return s
+	}
+	stale := mkDead()
+	failed := false
+	for range 5 {
+		if !stale.HealthCheck() {
+			failed = true
+			break
+		}
+	}
+	if !failed {
+		t.Fatal("dead instance without traffic proof must fail after strikes")
+	}
+	served := mkDead()
+	noteEgress(served.HTTPPort())
+	noteEgress(served.SOCKSPort())
+	for range 3 {
+		if !served.HealthCheck() {
+			t.Fatal("instance with fresh traffic proof must skip probing (healthy)")
+		}
+	}
+	if streak, _ := served.Stability(); streak != 3 {
+		t.Fatalf("skipped probes still count as serving streak, got %d", streak)
+	}
+	// Port 0 notes match nothing and must never fake health.
+	noteEgress(0)
+	noteEgress(-5)
+}
+
+func TestRelayFirstByteHook(t *testing.T) {
+	// True splice: two independent pairs, relay joining them. Bytes can ONLY
+	// travel through relay (a single connected pair would short-circuit it).
+	dial := func(t *testing.T, ln net.Listener) (net.Conn, net.Conn) {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, s
+	}
+	la, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer la.Close()
+	lb, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lb.Close()
+	in, relaySrc := dial(t, la)  // test writes in, relay reads relaySrc
+	relayDst, out := dial(t, lb) // relay writes relayDst, test reads out
+	defer in.Close()
+	defer out.Close()
+	var fired int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		relay(relayDst, relaySrc, func() { atomic.AddInt32(&fired, 1) })
+	}()
+	_ = in.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = out.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := in.Write([]byte("hb")); err != nil {
+		t.Fatal(err)
+	}
+	buf, ok := readN(out, 2)
+	if !ok || string(buf) != "hb" {
+		t.Fatalf("relay broke traffic: %q", buf)
+	}
+	_ = in.Close()
+	<-done
+	if n := atomic.LoadInt32(&fired); n < 1 {
+		t.Fatalf("first-byte hook never fired (n=%d)", n)
 	}
 }
 

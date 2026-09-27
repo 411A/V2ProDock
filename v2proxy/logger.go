@@ -209,19 +209,21 @@ func printSummaryTable(statuses []InstanceStatus) {
 			}
 			return baseStyle
 		}).
-		Headers("#", "Name", "SOCKS", "HTTP", "Status", "Latency")
+		Headers("#", "Name", "SOCKS", "HTTP", "Status", "Latency", "Streak")
 	if !useColor {
 		t = table.New().
 			Border(lipgloss.NormalBorder()).
-			Headers("#", "Name", "SOCKS", "HTTP", "Status", "Latency")
+			Headers("#", "Name", "SOCKS", "HTTP", "Status", "Latency", "Streak")
 	}
 	rows := [][]string{}
 	for _, s := range statuses {
 		name := shortName(s.Name)
 		stat := s.Status
 		lat := fmt.Sprintf("%dms", s.LatMs)
+		streak := fmt.Sprintf("%d", s.OkStreak)
 		if s.Status != "ok" {
 			lat = "—"
+			streak = "—"
 			if s.Error != "" {
 				stat = fmt.Sprintf("%s (%s)", s.Status, shortErr(s.Error))
 			}
@@ -247,6 +249,7 @@ func printSummaryTable(statuses []InstanceStatus) {
 			portOnly(s.HTTP),
 			stat,
 			lat,
+			streak,
 		})
 	}
 	t.Rows(rows...)

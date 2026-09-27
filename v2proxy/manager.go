@@ -21,6 +21,11 @@ type InstanceStatus struct {
 	LatMs   int64         `json:"latency_ms"`
 	Name    string        `json:"name"`
 	Error   string        `json:"error,omitempty"`
+	// Stability signals: consecutive successful health checks on the current
+	// upstream, and when it was adopted. Long-polling clients should prefer
+	// high streaks over merely low latency (stable-slow beats flappy-fast).
+	OkStreak    int    `json:"ok_streak"`
+	ActiveSince string `json:"active_since,omitempty"`
 }
 
 type ProxyManager struct {
@@ -231,13 +236,35 @@ func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
 		}
 		m.statuses[i].Latency = lat
 		m.statuses[i].LatMs = lat.Milliseconds()
+		if i < len(m.instances) {
+			streak, since := m.instances[i].Stability()
+			m.statuses[i].OkStreak = streak
+			if !since.IsZero() {
+				m.statuses[i].ActiveSince = since.UTC().Format(time.RFC3339)
+			}
+		}
 	}
 }
 
+// serveReady reports whether populate may return early: all instances, or at
+// least serveMinReady of them (thin pools would otherwise grind for minutes
+// before anything serves). Stragglers keep healing via the health + refresh
+// loops, which both drive bounded switches for non-ok instances.
+func serveReady(alive, total int) bool {
+	if total <= 0 || alive <= 0 {
+		return false
+	}
+	if alive >= total {
+		return true
+	}
+	return alive >= min(serveMinReady, total)
+}
+
 // Start fetches subscriptions and probes proxies, retrying in rounds until
-// EVERY instance holds a unique working proxy. It only returns when all are
-// ok, so the final table never shows a down instance. The manager lock is
-// only held for short state updates so the API stays responsive during populate.
+// serveReady holds (all instances, or enough to serve on thin pools).
+// Stragglers are marked down with a healing note and keep recovering in the
+// background. The manager lock is only held for short state updates so the
+// API stays responsive during populate.
 func (m *ProxyManager) Start() error {
 	insts, subURLs := m.snapshot()
 	if len(insts) == 0 {
@@ -355,7 +382,17 @@ func (m *ProxyManager) Start() error {
 			})
 		}
 		wg.Wait()
-		if m.AliveCount() == len(insts) {
+		if serveReady(m.AliveCount(), len(insts)) {
+			if m.AliveCount() < len(insts) {
+				// Thin pool: serve NOW, heal the rest in background instead
+				// of grinding up to maxPopulateRounds before anything works.
+				for i := range insts {
+					if m.statusOf(i).Status != "ok" {
+						m.markDown(i, "background healing after early serve")
+					}
+				}
+				infoLog("serving early: %d/%d ready, rest heal in background", m.AliveCount(), len(insts))
+			}
 			break
 		}
 	}
