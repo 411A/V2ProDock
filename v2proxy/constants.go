@@ -46,6 +46,39 @@ const (
 // ---- Failover switching (bounded: never freeze the ticker loop) ----
 const switchBudget = 60 * time.Second // aggregate cap for one switch pass
 
+// ---- Parallel probing (zero-dead-window switches) ----
+// A switch probes candidates on throwaway ports with this many workers while
+// the OLD xray keeps serving its port. Only after a winner is proven does the
+// swap happen (brief rebind), so searching never equals outage. Sequential
+// HealthCheckAll bounds total churn to one instance's workers at a time.
+const (
+	switchWorkersDefault = 3 // SWITCH_WORKERS overrides, clamped to [1, switchWorkersMax]
+	switchWorkersMax     = 8
+)
+
+// ---- Stable aggregate endpoints (single ports that survive switches) ----
+// Raw TCP relays in front of the instances: each new connection is routed to
+// the fastest alive instance at dial time, so clients (long-polling bots)
+// never rewrite config. Inside the published 27000-27100 range; 0 disables.
+const (
+	defaultAggSocksPort = 27017 // AGGREGATE_SOCKS_PORT overrides
+	defaultAggHttpPort  = 27016 // AGGREGATE_HTTP_PORT overrides
+	aggPublishedMax     = 27100 // compose publishes 27000-27100; above is container-only
+)
+
+// ---- DPI fragmentation (opt-in; binary-verified schema, off by default) ----
+// Mechanism (proven against Xray 26.3.27: loads + proxies end-to-end):
+// the proxy outbound chains via streamSettings.sockopt.dialerProxy at a
+// freedom outbound tagged "frag-out" that carries settings.fragment. Only
+// TLS/reality upstreams get the chain (plaintext gains nothing, pays
+// overhead); "tlshello" fragments the handshake only (cheapest effective).
+const (
+	fragmentOutTag   = "frag-out"
+	fragmentPackets  = "tlshello"
+	fragmentLength   = "100-200"
+	fragmentInterval = "10-20"
+)
+
 // ---- Refresh rotation (only slow/missing actives are touched; fast ones cost zero) ----
 const (
 	rotateSlowLatency    = 2500 * time.Millisecond // active slower than this becomes rotation-eligible

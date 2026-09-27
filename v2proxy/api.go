@@ -73,12 +73,19 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		if alive == 0 {
 			status = "degraded"
 		}
-		if err := json.NewEncoder(w).Encode(map[string]any{
+		body := map[string]any{
 			"status":    status,
 			"instances": total,
 			"alive":     alive,
 			"starting":  starting,
-		}); err != nil {
+		}
+		// Stable endpoints for clients that must never rewrite config: query
+		// once, use forever — per-connection routing survives every switch.
+		if as, ah := manager.aggregateAddrs(); as != "" || ah != "" {
+			body["aggregate_socks"] = as
+			body["aggregate_http"] = ah
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
 			debugLog("encode /health failed: %v", err)
 		}
 	})

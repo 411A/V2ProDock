@@ -32,6 +32,8 @@ type ProxyManager struct {
 	testURL       string
 	portBase      int
 	checkInterval time.Duration
+	aggSocks      string
+	aggHTTP       string
 }
 
 func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subURLs []string, checkInterval time.Duration) *ProxyManager {
@@ -169,6 +171,53 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 		m.statuses[i].Status = "down"
 		m.statuses[i].Error = errMsg
 	}
+}
+
+// pickBestBackend returns the loopback addr of the fastest alive instance
+// (SOCKS or HTTP-bridge side). Alive statuses arrive latency-sorted, so [0]
+// is the current best. False when nothing is servable.
+func (m *ProxyManager) pickBestBackend(httpSide bool) (string, bool) {
+	alive := m.GetAliveStatuses()
+	if len(alive) == 0 {
+		return "", false
+	}
+	insts, _ := m.snapshot()
+	best := alive[0]
+	if best.Index < 0 || best.Index >= len(insts) {
+		return "", false
+	}
+	port := insts[best.Index].SOCKSPort()
+	if httpSide {
+		port = insts[best.Index].HTTPPort()
+	}
+	return fmt.Sprintf("127.0.0.1:%d", port), true
+}
+
+// usedPorts snapshots every instance SOCKS+HTTP port for collision-aware
+// planning (aggregate endpoint placement).
+func (m *ProxyManager) usedPorts() map[int]bool {
+	insts, _ := m.snapshot()
+	out := make(map[int]bool, len(insts)*2)
+	for _, inst := range insts {
+		out[inst.SOCKSPort()] = true
+		out[inst.HTTPPort()] = true
+	}
+	return out
+}
+
+// setAggregate records the stable endpoint addrs exposed via /health.
+// Empty strings mean that protocol is disabled.
+func (m *ProxyManager) setAggregate(socks, http string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.aggSocks = socks
+	m.aggHTTP = http
+}
+
+func (m *ProxyManager) aggregateAddrs() (string, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.aggSocks, m.aggHTTP
 }
 
 func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
@@ -375,7 +424,8 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	}
 	pool = dedupConfigs(pool)
 	shuffleBase := time.Now().UnixNano()
-	shared := newProbeShared()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, probeWorkers)
 	for i, inst := range insts {
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
@@ -384,14 +434,16 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		inst.UpdateConfigs(configs)
 
 		if m.statusOf(i).Status != "ok" {
-			used := m.buildExcluding(i)
-			if err := inst.startShared(used, shared, time.Now().Add(probeTimeout)); err == nil {
-				name := ""
-				if cfg := inst.ActiveConfig(); cfg != nil {
-					name = cfg.Name
-				}
-				m.markOK(i, name, inst.LastLatency())
-			}
+			// Down instances recover in PARALLEL (each switch is already
+			// budget-bounded): sequential recovery multiplied worst-case
+			// stalls by the instance count and wedged the refresh ticker.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				m.recoverInstance(i, inst)
+			}()
 			continue
 		}
 		// Status is ok, but the slice was just swapped underneath the
@@ -400,6 +452,29 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		// opportunistically replace it if it got slow — all strictly bounded
 		// so a healthy fast instance costs nothing here.
 		m.reconcileActive(i, inst)
+	}
+	wg.Wait()
+}
+
+// recoverInstance drives one down instance back to ok via the fast parallel
+// switch (unique-claim guarded: a parallel peer may have just taken the same
+// upstream, in which case one bounded retry with a refreshed exclude runs).
+func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
+	for range 2 {
+		used := m.buildExcluding(i)
+		if err := inst.SwitchToNextExcluding(used); err != nil {
+			return
+		}
+		cfg := inst.ActiveConfig()
+		if cfg == nil {
+			return
+		}
+		if owner, dup := used[cfg.Key()]; dup {
+			debugLog("Instance %d: %s taken by instance %d, retrying...", i, shortName(cfg.Name), owner)
+			continue
+		}
+		m.markOK(i, cfg.Name, inst.LastLatency())
+		return
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +28,12 @@ type ProxySelector struct {
 	checkInterval time.Duration
 	lastCheck     time.Time
 	lastLatency   time.Duration
+	// tempMu serializes throwaway-port allocation (bind :0, render, launch):
+	// two workers must never pick the same ephemeral port/file.
+	tempMu sync.Mutex
+	// tempSeq makes throwaway config filenames unique even if the kernel
+	// ever hands two workers the same ephemeral port number.
+	tempSeq atomic.Uint64
 }
 
 func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
@@ -272,66 +280,149 @@ func switchOrder(n, startIdx, oldIndex int) []int {
 }
 
 func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
+	// Snapshot under lock; the search itself runs lock-free on throwaway
+	// ports so the OLD xray keeps serving its port the whole time. Only the
+	// final swap (stop old, start proven winner) briefly rebinds the port.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if len(s.configs) == 0 {
+		s.mu.Unlock()
 		return fmt.Errorf("no configs available")
 	}
-
+	configs := slices.Clone(s.configs)
 	startIdx := s.activeIndex + 1
-	if startIdx >= len(s.configs) {
+	if startIdx >= len(configs) {
 		startIdx = 0
 	}
-
-	oldCmd := s.xrayCmd
 	oldIndex := s.activeIndex
-	deadline := time.Now().Add(switchBudget)
+	var oldKey string
+	if oldIndex >= 0 && oldIndex < len(configs) {
+		oldKey = configs[oldIndex].Key()
+	}
+	cands := make([]int, 0, len(configs))
+	for _, i := range switchOrder(len(configs), startIdx, oldIndex) {
+		if _, ok := exclude[configs[i].Key()]; ok {
+			continue
+		}
+		cands = append(cands, i)
+	}
+	s.mu.Unlock()
 
-	for _, i := range switchOrder(len(s.configs), startIdx, oldIndex) {
-		if time.Now().After(deadline) {
-			debugLog("switch budget exhausted, giving up for now")
+	if len(cands) == 0 {
+		return fmt.Errorf("no working config found")
+	}
+
+	// Parallel search: workers probe candidates on throwaway ports, first
+	// proven winner stops the search. Serving is untouched until the swap.
+	ctx, cancel := context.WithTimeout(context.Background(), switchBudget)
+	defer cancel()
+	winIdx, winLat := s.searchCandidates(ctx, configs, cands)
+	if winIdx < 0 {
+		debugLog("switch found no working candidate (old keeps serving)")
+		return fmt.Errorf("no working config found")
+	}
+
+	// Swap under lock. The pool may have been refreshed mid-search, so the
+	// winner is re-anchored by KEY, never trusted by snapshot index.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	winKey := configs[winIdx].Key()
+	cur := -1
+	for i := range s.configs {
+		if s.configs[i].Key() == winKey {
+			cur = i
 			break
 		}
-		if _, ok := exclude[s.configs[i].Key()]; ok {
-			continue
-		}
-		if oldCmd != nil {
-			s.stopXrayCmd(oldCmd)
-			oldCmd = nil
-		}
-
-		if err := s.startXray(i); err != nil {
-			continue
-		}
-		if !waitForPort(s.socksPort, switchPortWait) {
-			s.stopXray()
-			continue
-		}
-		// Fast single-URL probe: a full multi-URL health pass here cost ~32s
-		// per dead candidate and froze the ticker loop for tens of minutes.
-		result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
-		if result.Working {
-			s.activeIndex = i
-			s.lastLatency = result.Latency
-			s.failCount = 0
-			switchedLog(s.configs[i].Name, result.Latency.Milliseconds())
-			return nil
-		}
-		debugLog("candidate %s: unhealthy: %v", shortName(s.configs[i].Name), result.Error)
-		s.stopXray()
 	}
-
-	if oldIndex >= 0 && oldIndex < len(s.configs) {
-		debugLog("All alternative configs failed. Attempting to restore original config %s", shortName(s.configs[oldIndex].Name))
+	if cur < 0 {
+		return fmt.Errorf("winner vanished after refresh")
+	}
+	s.stopXray()
+	if err := s.startXray(cur); err != nil {
+		s.tryRestoreLocked(oldKey)
+		return fmt.Errorf("winner failed on serving port: %w", err)
+	}
+	if !waitForPort(s.socksPort, switchPortWait) {
 		s.stopXray()
-		if err := s.startXray(oldIndex); err == nil {
-			s.activeIndex = oldIndex
-			s.failCount = 0
+		s.tryRestoreLocked(oldKey)
+		return fmt.Errorf("winner never bound serving port")
+	}
+	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL); !res.Working {
+		debugLog("winner failed verification on serving port: %v", res.Error)
+		s.stopXray()
+		s.tryRestoreLocked(oldKey)
+		return fmt.Errorf("winner failed verification: %w", res.Error)
+	}
+	s.activeIndex = cur
+	s.lastLatency = winLat
+	s.failCount = 0
+	switchedLog(s.configs[cur].Name, winLat.Milliseconds())
+	return nil
+}
+
+// tryRestoreLocked best-effort restarts the pre-switch config (by key) after
+// a failed swap. Caller holds s.mu. A dead upstream is still better than a
+// silent port: the next tick retries the switch.
+func (s *ProxySelector) tryRestoreLocked(oldKey string) {
+	if oldKey == "" {
+		return
+	}
+	for i := range s.configs {
+		if s.configs[i].Key() == oldKey {
+			debugLog("restoring pre-switch config %s", shortName(s.configs[i].Name))
+			if err := s.startXray(i); err == nil {
+				s.activeIndex = i
+				s.failCount = 0
+			}
+			return
 		}
 	}
+}
 
-	return fmt.Errorf("no working config found")
+// searchCandidates probes snapshot candidates in parallel on throwaway ports.
+// Returns the snapshot index + latency of the first proven winner, or -1 when
+// the budget expires with nothing working. Never touches serving state.
+func (s *ProxySelector) searchCandidates(ctx context.Context, configs []ProxyConfig, cands []int) (int, time.Duration) {
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var winMu sync.Mutex
+	winIdx := -1
+	var winLat time.Duration
+
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			res := s.probeSnapshotOnTempPort(configs[idx])
+			if res.Working {
+				winMu.Lock()
+				if winIdx < 0 {
+					winIdx, winLat = idx, res.Latency
+				}
+				winMu.Unlock()
+				return
+			}
+			debugLog("candidate %s: unhealthy: %v", shortName(configs[idx].Name), res.Error)
+		}
+	}
+	n := min(switchWorkerCount(), len(cands))
+	for range n {
+		wg.Add(1)
+		go worker()
+	}
+	go func() {
+		defer close(jobs)
+		for _, idx := range cands {
+			select {
+			case jobs <- idx:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	return winIdx, winLat
 }
 
 func (s *ProxySelector) Stop() {
@@ -361,7 +452,7 @@ func (s *ProxySelector) startXray(index int) error {
 		return fmt.Errorf("invalid index: %d", index)
 	}
 
-	cfgPath, err := s.renderXrayConfig(s.configs[index], s.socksPort, false)
+	cfgPath, err := s.renderXrayConfig(s.configs[index], s.socksPort, 0)
 	if err != nil {
 		return err
 	}
@@ -387,35 +478,61 @@ func (s *ProxySelector) startXray(index int) error {
 // so rotation probing costs zero disruption. Callers must NOT hold s.mu (it
 // takes s.mu briefly for config access only).
 func (s *ProxySelector) probeCandidateOnTempPort(cfg ProxyConfig) HealthResult {
+	return s.probeSnapshotOnTempPort(cfg)
+}
+
+// probeSnapshotOnTempPort is the lock-free core used by parallel switches and
+// rotation alike: it only reads immutable selector fields (xrayDir, testURL),
+// so any number of workers may run it concurrently. Port allocation through
+// launch is serialized on tempMu so two workers can never share an ephemeral
+// port or config file.
+func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
+	s.tempMu.Lock()
 	// Ephemeral port: bind :0, read back the port, release.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		s.tempMu.Unlock()
 		return HealthResult{Error: err}
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	cfgPath, err := s.renderXrayConfig(cfg, port, true)
+	seq := s.tempSeq.Add(1)
+	cfgPath, err := s.renderXrayConfig(cfg, port, seq)
 	if err != nil {
+		s.tempMu.Unlock()
 		return HealthResult{Error: err}
 	}
-	defer os.Remove(cfgPath)
 
 	cmd, err := launchXray(s.xrayDir, cfgPath)
 	if err != nil {
+		s.tempMu.Unlock()
+		_ = os.Remove(cfgPath)
 		return HealthResult{Error: err}
 	}
-	defer stopXrayCmdPort(cmd, port)
+	open := waitForPort(port, switchPortWait)
+	s.tempMu.Unlock()
+	defer func() {
+		stopXrayCmdPort(cmd, port)
+		_ = os.Remove(cfgPath)
+	}()
 
-	if !waitForPort(port, switchPortWait) {
+	if !open {
 		return HealthResult{Error: fmt.Errorf("temp xray port never opened")}
 	}
 	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), s.testURL)
 }
 
-// renderXrayConfig writes the full xray config for one upstream. temp files
-// get a distinct name so rotation probes never clobber the serving config.
-func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bool) (string, error) {
+// renderXrayConfig writes the full xray config for one upstream. seq > 0
+// marks a throwaway probe config: the filename carries the sequence so
+// parallel workers never clobber each other (or the serving config).
+// When XRAY_FRAGMENT=1 and the upstream negotiates TLS, the proxy outbound
+// chains via sockopt.dialerProxy at a freedom outbound tagged "frag-out"
+// that carries settings.fragment (schema proven against Xray 26.3.27:
+// loads + proxies end-to-end; a "fragment"-protocol outbound does NOT exist
+// in this build). Plaintext upstreams and pre-chained outbounds are left
+// untouched — fragment buys them nothing and costs handshake overhead.
+func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uint64) (string, error) {
 	logLevel := "none"
 	if isDebug() {
 		logLevel = "warning"
@@ -450,8 +567,22 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bo
 		return "", fmt.Errorf("bad config: %w", err)
 	}
 
-	fullConfig["outbounds"] = []any{
-		outbound,
+	outbounds := []any{outbound}
+	if fragmentEnabled() && upstreamUsesTLS(outbound) && !hasCustomDialChain(outbound) {
+		chainFragment(outbound)
+		outbounds = append(outbounds, map[string]any{
+			"protocol": "freedom",
+			"tag":      fragmentOutTag,
+			"settings": map[string]any{
+				"fragment": map[string]any{
+					"packets":  fragmentPackets,
+					"length":   fragmentLength,
+					"interval": fragmentInterval,
+				},
+			},
+		})
+	}
+	outbounds = append(outbounds,
 		map[string]any{
 			"protocol": "freedom",
 			"tag":      "direct",
@@ -460,7 +591,8 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bo
 			"protocol": "blackhole",
 			"tag":      "blocked",
 		},
-	}
+	)
+	fullConfig["outbounds"] = outbounds
 
 	fullConfig["routing"] = map[string]any{
 		"domainStrategy": "AsIs",
@@ -474,8 +606,8 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bo
 	}
 
 	name := fmt.Sprintf("config-%d.json", socksPort)
-	if temp {
-		name = fmt.Sprintf("config-rot-%d.json", socksPort)
+	if seq > 0 {
+		name = fmt.Sprintf("config-rot-%d-%d.json", socksPort, seq)
 	}
 	cfgPath := filepath.Join(s.xrayDir, name)
 	cfgData, _ := json.Marshal(fullConfig)
@@ -483,6 +615,22 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, temp bo
 		return "", err
 	}
 	return cfgPath, nil
+}
+
+// chainFragment points an upstream outbound's dial path at the fragment
+// carrier, preserving any existing sockopt keys the subscription set.
+func chainFragment(outbound map[string]any) {
+	ss, ok := outbound["streamSettings"].(map[string]any)
+	if !ok {
+		ss = map[string]any{}
+		outbound["streamSettings"] = ss
+	}
+	so, ok := ss["sockopt"].(map[string]any)
+	if !ok {
+		so = map[string]any{}
+		ss["sockopt"] = so
+	}
+	so["dialerProxy"] = fragmentOutTag
 }
 
 // launchXray starts one xray child in its own process group and rejects

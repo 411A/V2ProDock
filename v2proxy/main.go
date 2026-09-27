@@ -58,6 +58,9 @@ func main() {
 			apiPort = n
 		}
 	}
+	if v := os.Getenv("HEALTH_CHECK_URL"); v != "" && isPlainHTTP(v) {
+		warnLog("HEALTH_CHECK_URL %q uses plain HTTP: DPI RST-injects port-80 even through working tunnels (false downs + churn). Use an https:// generate_204 URL.", v)
+	}
 
 	// Subscription URL resolution: merge SUBSCRIPTION_URLS + SUBSCRIPTION_URL + file > stdin.
 	// Both env vars accept comma/newline/space-separated lists; dead URLs are
@@ -120,6 +123,23 @@ func main() {
 	}
 	// Start only returns when ALL instances hold a working proxy.
 	printSummaryTable(manager.GetStatuses())
+
+	// Stable aggregate endpoints: fixed ports routing per-connection to the
+	// fastest alive instance. Long-polling clients pin these and never care
+	// which upstream is serving underneath.
+	aggSocks, aggHTTP := pickAggregatePorts(
+		aggregatePort("AGGREGATE_SOCKS_PORT", defaultAggSocksPort),
+		aggregatePort("AGGREGATE_HTTP_PORT", defaultAggHttpPort),
+		apiActualPort, manager.usedPorts())
+	var aggSocksAddr, aggHTTPAddr string
+	if aggSocks > 0 {
+		aggSocksAddr = fmt.Sprintf("0.0.0.0:%d", aggSocks)
+	}
+	if aggHTTP > 0 {
+		aggHTTPAddr = fmt.Sprintf("0.0.0.0:%d", aggHTTP)
+	}
+	manager.setAggregate(aggSocksAddr, aggHTTPAddr)
+	startAggregator(manager, aggSocks, aggHTTP)
 
 	bannerLog(fmt.Sprintf("Working proxies: %d/%d", manager.AliveCount(), manager.InstanceCount()))
 

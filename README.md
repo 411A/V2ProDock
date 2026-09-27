@@ -109,9 +109,29 @@ curl http://localhost:27018/proxies
 |----------|--------|-------------|
 | `/proxies` | GET | Alive proxies sorted by latency (lowest first) |
 | `/all` | GET | All instances including down ones |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` + stable `aggregate_socks`/`aggregate_http` endpoints |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
+
+### Stable endpoints (bots & long-polling clients)
+
+Per-instance ports die and come back on every failover — pinning a Telegram
+bot to one of them means rewriting config on each switch. Instead, point
+long-lived clients at the aggregate ports (defaults `SOCKS5 :27017`,
+`HTTP :27016`, inside the published range):
+
+```python
+# One fixed config, forever: every connection is routed to the
+# fastest alive instance at dial time, no restarts needed.
+proxies = {"http": "http://localhost:27016", "https": "socks5://localhost:27017"}
+```
+
+Failover behavior from the client's view: the old instance keeps serving
+while replacements are probed in parallel, the swap itself is a ~1–3s
+rebind, and new connections immediately land on the next healthy instance.
+In-flight long-polls on a truly dead upstream still break (TCP is TCP) —
+reconnect, don't restart the whole gateway. Query `GET /health` once to
+discover the aggregate addresses if you customized the ports.
 
 ## Usage
 
@@ -354,7 +374,10 @@ Environment variables (set in `.env` or via docker-compose):
 | `PROXY_INSTANCES` | `1` | Number of xray instances to run |
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
-| `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity |
+| `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity (must be `https://` — plain HTTP is DPI-killed on bare transports, causing false downs) |
+| `AGGREGATE_SOCKS_PORT` / `AGGREGATE_HTTP_PORT` | `27017` / `27016` | Stable single ports routing to the fastest alive instance (`0` disables) |
+| `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
+| `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |

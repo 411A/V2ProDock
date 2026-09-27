@@ -109,7 +109,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 	// 1. Renderer output must be accepted by the genuine binary, and the
 	//    quick probe through it must report WORKING.
 	good := ProxyConfig{Name: "good", Raw: "real-good", Endpoint: "real-good:1", XrayCfg: realOutbound(srvPort)}
-	cfgPath, err := sel.renderXrayConfig(good, sel.SOCKSPort(), false)
+	cfgPath, err := sel.renderXrayConfig(good, sel.SOCKSPort(), 0)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 	deadSock := freeLoopbackPort(t)
 	closedUpstream := freeLoopbackPort(t) // nothing listens: upstream refused
 	dead := ProxyConfig{Name: "dead", Raw: "real-dead", Endpoint: "real-dead:1", XrayCfg: realOutbound(closedUpstream)}
-	deadCfg, err := sel.renderXrayConfig(dead, deadSock, true)
+	deadCfg, err := sel.renderXrayConfig(dead, deadSock, 99)
 	if err != nil {
 		t.Fatalf("render dead: %v", err)
 	}
@@ -163,6 +163,125 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 	_, _ = srv.Wait()
 	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", sel.SOCKSPort()), target); res.Working {
 		t.Fatal("probe must fail after server death")
+	}
+}
+
+// realTLSOutbound wraps realOutbound with a TLS streamSettings marker so the
+// renderer attaches the fragment chain. The loopback test server speaks
+// plaintext, so this config is for LOAD + CHAIN-WIRING validation only (the
+// binary must accept it); end-to-end TLS runs in production, not loopback.
+// NOTE: no tlsSettings needed — and "allowInsecure" must NEVER appear: Xray
+// 26.x removed it at load time ("migrated to pinnedPeerCertSha256").
+func realTLSOutbound(serverPort int) []byte {
+	return []byte(fmt.Sprintf(
+		`{"protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":%d,"users":[{"id":%q,"alterId":0}]}]},"streamSettings":{"network":"tcp","security":"tls"}}`,
+		serverPort, realTestUUID))
+}
+
+func copyRealXray(t *testing.T, bin, dir string) {
+	t.Helper()
+	cp, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "xray"), cp, 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealXrayFragmentChain(t *testing.T) {
+	bin := needRealXray(t)
+	target := startLocalHTTPTarget(t)
+	srvPort := freeLoopbackPort(t)
+	startRealServer(t, bin, srvPort)
+
+	dir := t.TempDir()
+	copyRealXray(t, bin, dir)
+	t.Setenv("XRAY_FRAGMENT", "1")
+
+	sel := NewProxySelector(dir, target, freeLoopbackPort(t), freeLoopbackPort(t), time.Minute)
+
+	// 1. TLS-marked upstream: the genuine binary must ACCEPT the rendered
+	//    fragment chain (sockopt.dialerProxy + freedom carrier). A wrong
+	//    schema dies here at load ("unknown config id" / bad settings).
+	tlsCfg := ProxyConfig{Name: "tls", Raw: "real-tls", Endpoint: "real-tls:1", XrayCfg: realTLSOutbound(srvPort)}
+	cfgPath, err := sel.renderXrayConfig(tlsCfg, sel.SOCKSPort(), 0)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	defer os.Remove(cfgPath)
+	cmd, err := launchXray(dir, cfgPath)
+	if err != nil {
+		t.Fatalf("genuine xray rejected the fragment chain: %v", err)
+	}
+	defer stopXrayCmdPort(cmd, sel.SOCKSPort())
+	if !waitForPort(sel.SOCKSPort(), 5*time.Second) {
+		t.Fatal("fragment-chained xray never bound")
+	}
+
+	// 2. Plaintext upstream through the SAME renderer with fragment on: no
+	//    chain is attached (nothing to gain), and the tunnel proxies fully.
+	plain := ProxyConfig{Name: "plain", Raw: "real-plain", Endpoint: "real-plain:1", XrayCfg: realOutbound(srvPort)}
+	plainSock := freeLoopbackPort(t)
+	plainCfg, err := sel.renderXrayConfig(plain, plainSock, 7)
+	if err != nil {
+		t.Fatalf("render plain: %v", err)
+	}
+	defer os.Remove(plainCfg)
+	plainCmd, err := launchXray(dir, plainCfg)
+	if err != nil {
+		t.Fatalf("launch plain: %v", err)
+	}
+	defer stopXrayCmdPort(plainCmd, plainSock)
+	if !waitForPort(plainSock, 5*time.Second) {
+		t.Fatal("plain xray never bound")
+	}
+	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", plainSock), target); !res.Working {
+		t.Fatalf("fragment-enabled renderer must still proxy plaintext, got %v", res.Error)
+	}
+}
+
+func TestRealXrayParallelSwitch(t *testing.T) {
+	bin := needRealXray(t)
+	target := startLocalHTTPTarget(t)
+	srvPort := freeLoopbackPort(t)
+	startRealServer(t, bin, srvPort)
+
+	dir := t.TempDir()
+	copyRealXray(t, bin, dir)
+
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, target, socks, httpP, time.Minute)
+	closed1, closed2 := freeLoopbackPort(t), freeLoopbackPort(t)
+	s.UpdateConfigs([]ProxyConfig{
+		{Name: "dead1", Raw: "rp-dead1", Endpoint: "rp-dead1:1", XrayCfg: realOutbound(closed1)},
+		{Name: "dead2", Raw: "rp-dead2", Endpoint: "rp-dead2:1", XrayCfg: realOutbound(closed2)},
+		{Name: "good", Raw: "rp-good", Endpoint: "rp-good:1", XrayCfg: realOutbound(srvPort)},
+	})
+	// Seed serving state on a dead config, then switch: the parallel search
+	// must land the good one, bounded, with exactly one child left.
+	if err := s.startXray(0); err != nil {
+		t.Fatalf("seed start: %v", err)
+	}
+	s.mu.Lock()
+	s.activeIndex = 0
+	s.mu.Unlock()
+
+	start := time.Now()
+	if err := s.SwitchToNextExcluding(nil); err != nil {
+		t.Fatalf("parallel switch with real xray failed: %v", err)
+	}
+	if el := time.Since(start); el > switchBudget {
+		t.Fatalf("parallel switch took %s, budget is %s", el, switchBudget)
+	}
+	if got := s.ActiveConfig(); got == nil || got.Key() != "rp-good:1" {
+		t.Fatalf("expected active rp-good:1, got %+v", got)
+	}
+	if n := len(listXrayPIDs(dir)); n != 1 {
+		t.Fatalf("expected exactly 1 real xray child after switch, found %d", n)
+	}
+	if !s.HealthCheck() {
+		t.Fatal("switched instance must be healthy")
 	}
 }
 
