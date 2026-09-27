@@ -36,6 +36,15 @@ show_status() {
         i=$((i + 1))
     done
     echo ""
+    local agg_socks agg_http
+    agg_socks=$(env_val AGGREGATE_SOCKS_PORT 27017)
+    agg_http=$(env_val AGGREGATE_HTTP_PORT 27016)
+    if [ "$agg_socks" != "0" ] || [ "$agg_http" != "0" ]; then
+        echo -e "${CYAN}Stable endpoints (bots & long-polling clients pin these, never per-instance ports):${NC}"
+        [ "$agg_socks" != "0" ] && echo "  SOCKS5: localhost:$agg_socks (fastest alive, per-connection failover)"
+        [ "$agg_http" != "0" ] && echo "  HTTP:   localhost:$agg_http (fastest alive, per-connection failover)"
+        echo ""
+    fi
     echo -e "${CYAN}Test (first proxy):${NC}"
     echo "  curl --socks5 localhost:$port_base https://api.ipify.org"
     echo "  curl --proxy http://localhost:$((port_base + instances)) https://api.ipify.org"

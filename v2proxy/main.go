@@ -116,17 +116,11 @@ func main() {
 		)
 	}
 
-	debugLog("Starting %d instance(s)...", manager.InstanceCount())
-	if err := manager.Start(); err != nil {
-		errLog("Manager start failed: %v", err)
-		os.Exit(1)
-	}
-	// Start only returns when ALL instances hold a working proxy.
-	printSummaryTable(manager.GetStatuses())
-
-	// Stable aggregate endpoints: fixed ports routing per-connection to the
-	// fastest alive instance. Long-polling clients pin these and never care
-	// which upstream is serving underneath.
+	// Stable aggregate endpoints BEFORE populate: fixed ports routing
+	// per-connection to the fastest alive instance. They must exist while
+	// the pool is still grinding (thin pools take minutes) — with nothing
+	// alive yet they fail fast per connection until instances land.
+	// Long-polling clients pin these and never care which upstream serves.
 	aggSocks, aggHTTP := pickAggregatePorts(
 		aggregatePort("AGGREGATE_SOCKS_PORT", defaultAggSocksPort),
 		aggregatePort("AGGREGATE_HTTP_PORT", defaultAggHttpPort),
@@ -140,6 +134,17 @@ func main() {
 	}
 	manager.setAggregate(aggSocksAddr, aggHTTPAddr)
 	startAggregator(manager, aggSocks, aggHTTP)
+	if aggSocksAddr != "" || aggHTTPAddr != "" {
+		bannerLog(fmt.Sprintf("Stable endpoints (pin bots here): SOCKS5 %s  HTTP %s", aggSocksAddr, aggHTTPAddr))
+	}
+
+	debugLog("Starting %d instance(s)...", manager.InstanceCount())
+	if err := manager.Start(); err != nil {
+		errLog("Manager start failed: %v", err)
+		os.Exit(1)
+	}
+	// Start only returns when ALL instances hold a working proxy.
+	printSummaryTable(manager.GetStatuses())
 
 	bannerLog(fmt.Sprintf("Working proxies: %d/%d", manager.AliveCount(), manager.InstanceCount()))
 

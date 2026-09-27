@@ -313,9 +313,11 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 
 	// Parallel search: workers probe candidates on throwaway ports, first
 	// proven winner stops the search. Serving is untouched until the swap.
+	searchStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), switchBudget)
 	defer cancel()
 	winIdx, winLat := s.searchCandidates(ctx, configs, cands)
+	debugLog("switch scanned %d candidate(s) in %dms", len(cands), time.Since(searchStart).Milliseconds())
 	if winIdx < 0 {
 		debugLog("switch found no working candidate (old keeps serving)")
 		return fmt.Errorf("no working config found")

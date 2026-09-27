@@ -68,6 +68,9 @@ grep -q 'verify_egress' watchdog.sh && ok "egress proof fn present" || bad "veri
 grep -q 'socks5-hostname' watchdog.sh && ok "probes via SOCKS" || bad "socks probe missing"
 grep -q '\-\-interface.*TUN_DEV' watchdog.sh && ok "probes via tun0" || bad "tun probe missing"
 grep -q 'VERIFIED' watchdog.sh && ok "VERIFIED proof logging" || bad "VERIFIED log missing"
+grep -q 'EGRESS UNPROVEN' watchdog.sh && ok "tun-empty distinguished from true mismatch" || bad "must separate UNPROVEN (stalled tunnel) from MISMATCH (misrouting)"
+grep -q 'LAST_VERIFIED' watchdog.sh && ok "VERIFIED logged on change only (no per-poll spam)" || bad "healthy polls must not log VERIFIED every 15s"
+grep -q 'PROOF_FAILS' watchdog.sh && ok "consecutive proof-failure counter" || bad "periodic failures must carry a streak count"
 grep -q 'status.json' watchdog.sh && ok "status.json for /vpn" || bad "status.json missing"
 grep -q 'ensure_ipsec' watchdog.sh && grep -q 'swanctl --load-all' watchdog.sh \
   && ok "watchdog self-heals ipsec state" || bad "watchdog must reload conns if charon restarts"

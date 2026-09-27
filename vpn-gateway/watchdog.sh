@@ -24,6 +24,11 @@ HEV_CONF="${HEV_CONF:-/tmp/hev.yaml}"
 
 HEV_PID=""
 CURRENT_SOCKS=""
+# Log-noise control: VERIFIED is logged only when the proven (upstream, IP)
+# pair CHANGES or recovers (status.json is still rewritten every poll), and
+# consecutive proof failures carry a streak counter instead of bare repeats.
+LAST_VERIFIED=""
+PROOF_FAILS=0
 
 cleanup() {
   log "Shutting down tunnel + VPN daemons..."
@@ -137,19 +142,41 @@ start_tunnel() {
 }
 
 # Egress proof: IP seen THROUGH upstream SOCKS must equal IP seen VIA tun0.
-# Prints egress IP on success.
+# Prints egress IP on success. An EMPTY tun answer (tunnel stalled, upstream
+# UDP-blocked) and a DIFFERING answer (misrouting) are different failures
+# with different fixes — logged distinctly, never lumped together.
 verify_egress() {
   # $1 host:port
   socks="$1"
   via_socks="$(curl -fsS --max-time 8 --socks5-hostname "$socks" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || return 1
   [ -n "$via_socks" ] || return 1
-  via_tun="$(curl -fsS --max-time 8 --interface "$TUN_DEV" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || return 1
+  via_tun="$(curl -fsS --max-time 8 --interface "$TUN_DEV" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || {
+    warn "EGRESS UNPROVEN via $socks: tun gave no response (tunnel stalled? upstream UDP-blocked?). Fail-closed: clients have no direct path."
+    return 1
+  }
+  [ -n "$via_tun" ] || {
+    warn "EGRESS UNPROVEN via $socks: empty tun response."
+    return 1
+  }
   [ "$via_socks" = "$via_tun" ] || {
-    warn "EGRESS MISMATCH: socks=$via_socks tun=$via_tun (tunnel not carrying VPN traffic?)"
+    warn "EGRESS MISMATCH: socks=$via_socks tun=$via_tun (tunnel egress differs from pinned upstream!)"
     return 2
   }
   printf '%s' "$via_tun"
   return 0
+}
+
+# Log a fresh VERIFIED proof only when the (upstream, IP) pair changed or
+# recovered — a healthy tunnel at POLL_SECS=15 would otherwise log ~6k
+# identical lines a day. Resets the failure streak.
+report_verified() {
+  # $1 socks $2 name $3 eip
+  key="$1|$3"
+  if [ "$key" != "$LAST_VERIFIED" ]; then
+    log "VPN egress VERIFIED via $2 ($1): $3"
+    LAST_VERIFIED="$key"
+  fi
+  PROOF_FAILS=0
 }
 
 log "Waiting for alive Xray proxy at $V2PRODOCK_API ..."
@@ -164,7 +191,7 @@ done
 socks="${fastest%%|*}"; pname="${fastest#*|}"
 start_tunnel "$socks" "$pname" || exit 1
 if eip="$(verify_egress "$socks")"; then
-  log "VPN egress VERIFIED via $pname ($socks): $eip"
+  report_verified "$socks" "$pname" "$eip"
   write_status "$socks" "$pname" "$eip" true ""
 else
   warn "Initial egress proof failed (upstream $socks). VPN stays up, retrying in loop; clients have no direct path."
@@ -216,9 +243,10 @@ while true; do
   socks="${fastest%%|*}"; pname="${fastest#*|}"
   if [ "$socks" != "$CURRENT_SOCKS" ]; then
     log "Upstream changed $CURRENT_SOCKS -> $socks ($pname), re-pinning..."
+    PROOF_FAILS=0
     if start_tunnel "$socks" "$pname"; then
       if eip="$(verify_egress "$socks")"; then
-        log "VPN egress VERIFIED via $pname ($socks): $eip"
+        report_verified "$socks" "$pname" "$eip"
         write_status "$socks" "$pname" "$eip" true ""
       else
         warn "Egress proof failed after re-pin to $socks."
@@ -235,10 +263,11 @@ while true; do
     start_tunnel "$socks" "$pname" || { write_status "$socks" "$pname" "" false "tunnel restart failed"; continue; }
   fi
   if eip="$(verify_egress "$socks")"; then
-    log "VPN egress VERIFIED via $pname ($socks): $eip"
+    report_verified "$socks" "$pname" "$eip"
     write_status "$socks" "$pname" "$eip" true ""
   else
-    warn "Periodic egress proof failed for $socks ($pname)."
+    PROOF_FAILS=$((PROOF_FAILS + 1))
+    warn "Periodic egress proof failed for $socks ($pname) — $PROOF_FAILS in a row."
     write_status "$socks" "$pname" "" false "periodic egress proof failed"
   fi
 done
