@@ -376,7 +376,8 @@ Environment variables (set in `.env` or via docker-compose):
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity (must be `https://` — plain HTTP is DPI-killed on bare transports, causing false downs) |
 | `TELEGRAM_PROBE` | `1` | Race an api.telegram.org leg into every probe (`0` = 204-only race) |
-| `AGGREGATE_SOCKS_PORT` / `AGGREGATE_HTTP_PORT` | `27017` / `27016` | Stable single ports routing to the fastest alive instance (`0` disables) |
+| `AGGREGATE_SOCKS_PORT` / `AGGREGATE_HTTP_PORT` | `27017` / `27016` | Stable single ports routing to the best alive instance (`0` disables) |
+| `AGG_MIN_STREAK` | `3` | Aggregate prefers this-consecutive-successes stability over raw latency (`0` = fastest wins) |
 | `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
 | `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |

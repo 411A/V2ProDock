@@ -179,6 +179,14 @@ const telegramProbeURL = "https://api.telegram.org/"
 // with margin while bounding true-down detection to grace + 3 strikes.
 const egressGrace = 90 * time.Second
 
+// ---- Aggregate stability gating ----
+// Lowest-latency-first routes long-polls onto nodes that die mid-poll
+// (production-proven: flappy-fast RSTs 50s getUpdates). Candidates need this
+// many consecutive successes (~minutes of health) to be preferred; fastest
+// wins WITHIN the qualified tier. Nothing qualifying falls back to fastest
+// (never refuse service); 0 disables the gate (legacy pure-latency).
+const aggMinStreakDefault = 3 // AGG_MIN_STREAK overrides
+
 // ---- Startup serving threshold ----
 // Thin pools grind for minutes before EVERY instance lands one. Serve as soon
 // as this many are ready (capped by instance count); stragglers keep healing

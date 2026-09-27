@@ -72,6 +72,20 @@ func hasCustomDialChain(outbound map[string]any) bool {
 	return false
 }
 
+// aggMinStreak floors aggregate candidacy at this many consecutive successes.
+// Absurd values degrade safely to always-fallback (legacy behavior).
+func aggMinStreak() int {
+	v := strings.TrimSpace(os.Getenv("AGG_MIN_STREAK"))
+	if v == "" {
+		return aggMinStreakDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return aggMinStreakDefault
+	}
+	return n
+}
+
 // isPlainHTTP reports a downgrade-prone probe URL. Plain-HTTP inner traffic
 // is RST-injected by DPI on bare transports even when the tunnel is fine,
 // so a primary like this condemns healthy proxies (warn at startup).

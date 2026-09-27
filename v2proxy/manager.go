@@ -178,16 +178,27 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 	}
 }
 
-// pickBestBackend returns the loopback addr of the fastest alive instance
-// (SOCKS or HTTP-bridge side). Alive statuses arrive latency-sorted, so [0]
-// is the current best. False when nothing is servable.
+// pickBestBackend returns the loopback addr of the best alive instance (SOCKS
+// or HTTP-bridge side). Best = fastest among stability-qualified (streak >=
+// AGG_MIN_STREAK): a slow node that holds 50s polls beats a fast one that
+// RSTs them. Nothing qualifying falls back to fastest (never refuse service).
+// False when nothing is servable.
 func (m *ProxyManager) pickBestBackend(httpSide bool) (string, bool) {
 	alive := m.GetAliveStatuses()
 	if len(alive) == 0 {
 		return "", false
 	}
-	insts, _ := m.snapshot()
 	best := alive[0]
+	if minStreak := aggMinStreak(); minStreak > 0 {
+		for _, s := range alive {
+			// Alive is latency-sorted: first qualifier is fastest qualifier.
+			if s.OkStreak >= minStreak {
+				best = s
+				break
+			}
+		}
+	}
+	insts, _ := m.snapshot()
 	if best.Index < 0 || best.Index >= len(insts) {
 		return "", false
 	}

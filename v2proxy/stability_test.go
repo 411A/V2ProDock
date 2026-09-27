@@ -515,6 +515,56 @@ func backendManager(statuses []InstanceStatus, ports ...int) *ProxyManager {
 	return &ProxyManager{instances: insts, statuses: statuses}
 }
 
+func TestPickBestStabilityGate(t *testing.T) {
+	// Flappy-fast (50ms, streak 1) must lose to stable-slow (800ms, streak 10);
+	// gate off (0) or nobody qualified restores fastest-wins.
+	mk := func() *ProxyManager {
+		return backendManager([]InstanceStatus{
+			{Index: 0, Status: "ok", LatMs: 50, OkStreak: 1},
+			{Index: 1, Status: "ok", LatMs: 800, OkStreak: 10},
+			{Index: 2, Status: "ok", LatMs: 100, OkStreak: 0},
+		}, 27801, 27811, 27802, 27812, 27803, 27813)
+	}
+	t.Setenv("AGG_MIN_STREAK", "")
+	if got, _ := mk().pickBestBackend(false); got != "127.0.0.1:27802" {
+		t.Fatalf("default gate must prefer stable-slow, got %s", got)
+	}
+	t.Setenv("AGG_MIN_STREAK", "0")
+	if got, _ := mk().pickBestBackend(false); got != "127.0.0.1:27801" {
+		t.Fatalf("gate off must restore fastest, got %s", got)
+	}
+	t.Setenv("AGG_MIN_STREAK", "50")
+	if got, _ := mk().pickBestBackend(false); got != "127.0.0.1:27801" {
+		t.Fatalf("nothing qualified must fall back to fastest, got %s", got)
+	}
+	// HTTP side follows the same winner.
+	t.Setenv("AGG_MIN_STREAK", "")
+	if got, _ := mk().pickBestBackend(true); got != "127.0.0.1:27812" {
+		t.Fatalf("http side must follow stability winner, got %s", got)
+	}
+}
+
+func TestAggMinStreakParsing(t *testing.T) {
+	t.Setenv("AGG_MIN_STREAK", "")
+	if aggMinStreak() != aggMinStreakDefault {
+		t.Fatal("unset must yield default")
+	}
+	for _, bad := range []string{"abc", "-2"} {
+		t.Setenv("AGG_MIN_STREAK", bad)
+		if aggMinStreak() != aggMinStreakDefault {
+			t.Fatalf("bad %q must yield default", bad)
+		}
+	}
+	t.Setenv("AGG_MIN_STREAK", "0")
+	if aggMinStreak() != 0 {
+		t.Fatal("0 must disable")
+	}
+	t.Setenv("AGG_MIN_STREAK", "5")
+	if aggMinStreak() != 5 {
+		t.Fatal("override must win")
+	}
+}
+
 func TestPickBestBackend(t *testing.T) {
 	m := backendManager([]InstanceStatus{
 		{Index: 0, Status: "ok", LatMs: 300},
