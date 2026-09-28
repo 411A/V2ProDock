@@ -60,9 +60,11 @@ RUN apk --no-cache add \
 # gdate). ts() in the scripts prefers gdate and falls back to .000 without
 # it. The trailing check fails the build if ms timestamps don't really work.
 RUN apk update >/dev/null 2>&1 \
- && mkdir -p /tmp/cu \
+ && mkdir -p /tmp/cu /usr/local/bin \
  && apk fetch --stdout coreutils | tar -xz -C /tmp/cu \
- && mv /tmp/cu/usr/bin/date /usr/local/bin/gdate \
+ && DATE_BIN="$(find /tmp/cu -name date -type f | head -n 1)" \
+ && [ -n "$DATE_BIN" ] \
+ && mv "$DATE_BIN" /usr/local/bin/gdate \
  && chmod +x /usr/local/bin/gdate \
  && rm -rf /tmp/cu /var/cache/apk/* \
  && gdate '+%Y-%m-%d %H:%M:%S.%3N' | grep -qE '\.[0-9]{3}$'
