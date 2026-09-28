@@ -173,7 +173,7 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 // Anything else keeps the loopback guidance.
 func subscriptionHint(err error) string {
 	if err != nil && strings.Contains(err.Error(), "network is unreachable") {
-		return "container has NO route to this host (not a bad URL): run `docker exec v2prodock ip route` (must show a default route), `docker network ls | grep proxy-net` then `docker network inspect <name>` (subnet must not overlap your LAN), then rerun install.sh (fresh_rebuild tears the sandbox down and rebuilds it)"
+		return "container has NO route to this host (not a bad URL): run `docker exec v2prodock ip -br addr; docker exec v2prodock ip route` (need an eth0 address AND a `default` line) and `docker network inspect $(docker network ls --filter name=proxy-net -q)` (internal=true / subnet overlap / an injected compose override explains a missing default - install.sh prints this verdict itself)"
 	}
 	return "inside Docker 127.0.0.1 is the container itself, use host.docker.internal or host LAN IP"
 }

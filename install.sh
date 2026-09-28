@@ -250,15 +250,55 @@ check_subscriptions_reachable() {
     fi
 }
 
+# One-shot fact dump for broken in-container egress: every number the root
+# cause hides in, printed BY the installer instead of "go run these commands"
+# (separate manual diagnostics historically fail - container already gone by
+# the time they are pasted - and "just rerun the rebuild" was proven useless:
+# hydravm 2026-09-28 had a fresh network + fresh containers and STILL no
+# route). The verdict line says which layer is broken, once.
+netns_report() {
+    echo "--- netns facts (v2prodock) ---"
+    docker exec v2prodock ip -br addr 2>&1 | sed 's/^/  addr    /'
+    docker exec v2prodock ip route 2>&1 | sed 's/^/  route   /'
+    local net n
+    net=$(docker inspect v2prodock --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+    for n in $net; do
+        docker network inspect "$n" --format "  net     $n driver={{.Driver}} internal={{.Internal}} {{range .IPAM.Config}}subnet={{.Subnet}} gw={{.Gateway}} {{end}}members={{range $k, $v := .Containers}}{{$v.Name}}={{$v.IPv4Address}} {{end}}" 2>/dev/null
+    done
+    docker inspect v2prodock --format '  endpoint {{json .NetworkSettings.Networks}}' 2>/dev/null
+    echo "  host    ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) bridges=$(ip -br link show type bridge 2>/dev/null | awk '{print $1"("$2")"}' | tr '\n' ' ')"
+    [ -n "${COMPOSE_FILE:-}" ] && echo "  host    COMPOSE_FILE=$COMPOSE_FILE injects extra compose files"
+    ls docker-compose*.yml compose*.yml 2>/dev/null | grep -vx 'docker-compose.yml' | sed 's/^/  host    EXTRA COMPOSE FILE: /'
+    docker info --format '  daemon  ip-forward={{.IPv4Forwarding}} pools={{json .DefaultAddressPools}}' 2>/dev/null
+    local addrs routes
+    addrs=$(docker exec v2prodock ip -br addr 2>/dev/null)
+    routes=$(docker exec v2prodock ip route 2>/dev/null)
+    if ! printf '%s' "$addrs" | grep -qE 'eth0[[:space:]]+inet '; then
+        echo "  VERDICT: eth0 has no IPv4 address - the endpoint never got an IP (IPAM/daemon problem, not the URLs)"
+    elif ! printf '%s' "$routes" | grep -q '^default'; then
+        echo "  VERDICT: eth0 has an address but NO default route - the network was created without a gateway (internal=true or an injected compose override - see EXTRA COMPOSE FILE / COMPOSE_FILE / internal= lines above)"
+    else
+        echo "  VERDICT: netns has address + default route - the loss is OUTSIDE the container (host forward path: check ip_forward above, then 'sudo iptables -L FORWARD -n' and 'sudo ufw status')"
+    fi
+}
+
 # Verify subscriptions are reachable FROM INSIDE the v2prodock container,
-# not just from the host. Host-reachable but container-unreachable (broken
-# bridge sandbox, bridge/LAN subnet overlap, host firewall) otherwise
-# surfaces only as a populate grind full of fetch errors. Warn-only: never
-# fatal (populate retries + runtime failover still apply).
+# not just from the host. Host-reachable but container-unreachable (no
+# default route, dead sandbox, host forward path) otherwise surfaces only
+# as a populate grind full of fetch errors. Preflights the default route
+# first: without it every curl fails identically no matter how healthy the
+# URL is. Warn-only: never fatal (populate retries + runtime failover still
+# apply).
 check_container_egress() {
-    local urls="$1" u failed=0 total=0
+    local urls="$1" u failed=0 total=0 routes
     if ! docker exec v2prodock true 2>/dev/null; then
         echo -e "${RED}[WARN] v2prodock container is not running - cannot verify in-container egress (did 'compose up' fail above?)${NC}"
+        return 0
+    fi
+    routes=$(docker exec v2prodock ip route 2>/dev/null)
+    if ! printf '%s' "$routes" | grep -q '^default'; then
+        echo -e "${RED}[WARN] v2prodock container has NO default route - in-container egress cannot work${NC}"
+        netns_report
         return 0
     fi
     while IFS= read -r u; do
@@ -273,9 +313,7 @@ check_container_egress() {
     done <<< "$urls"
     if [ "$total" -gt 0 ] && [ "$failed" -eq "$total" ]; then
         echo -e "${RED}[WARN] NO subscription reachable from inside v2prodock: container network is broken (NOT the URLs).${NC}"
-        echo "  Diagnose: docker exec v2prodock ip route   # must show a default route"
-        echo "  Diagnose: docker network ls | grep proxy-net, then docker network inspect <name>  # subnet must not overlap your LAN"
-        echo "  Fix:      rerun install.sh (fresh_rebuild tears the sandbox down and rebuilds it)"
+        netns_report
     fi
 }
 
@@ -323,6 +361,9 @@ fresh_rebuild() {
             break
         fi
         echo "  Squatter evicted, retrying compose up (attempt $((_attempt + 1))/3) ..."
+        # Attempt 1 failed DURING container networking setup - its half-built
+        # endpoint must not be inherited. Clean slate before retry.
+        docker compose down --remove-orphans >/dev/null 2>&1 || true
         sleep 2
         _attempt=$((_attempt + 1))
     done
@@ -437,9 +478,15 @@ ensure_host_prereqs() {
     # Containers cannot modprobe for themselves; no-ops when built-in.
     # ppp_async is the N_PPP line discipline - without it every pppd fails
     # with "Couldn't set tty to PPP discipline" (proven in E2E).
+    # Non-root (curl|bash): use passwordless sudo only, never prompt.
+    local mods="tun ppp_generic ppp_async ppp_mppe xt_policy nf_conntrack_pptp nf_nat_pptp"
     if [ "$(id -u)" = "0" ]; then
-        for mod in tun ppp_generic ppp_async ppp_mppe xt_policy nf_conntrack_pptp nf_nat_pptp; do
+        for mod in $mods; do
             modprobe "$mod" 2>/dev/null || true
+        done
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        for mod in $mods; do
+            sudo -n modprobe "$mod" 2>/dev/null || true
         done
     fi
     if [ ! -c /dev/net/tun ]; then

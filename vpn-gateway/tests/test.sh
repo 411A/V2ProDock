@@ -206,6 +206,15 @@ for _img in $(grep -oE 'image: [^ ]+' ../docker-compose.yml | tr -d '\r' | awk '
   grep -q "docker rmi.*$_img" ../install.sh && ok "rebuild deletes image $_img" || bad "install.sh rmi names must mirror compose image: fields ($_img)"
 done
 grep -q 'address already in use' ../install.sh && ok "bind-conflict guidance present" || bad "up-failure path must explain squatter eviction"
+# Egress failure must print the FACTS itself: "go run these commands" dies
+# between paste and execution (container already gone) and "rerun the
+# rebuild" was proven useless (fresh network + fresh containers, still
+# ENETUNREACH - hydravm 2026-09-28).
+grep -q 'netns_report()' ../install.sh && ok "egress failure prints netns facts" || bad "check_container_egress must dump netns facts itself (netns_report)"
+grep -q 'has NO default route' ../install.sh && ok "default-route preflight before curl checks" || bad "check_container_egress must preflight the container default route"
+if grep -q 'rerun install.sh (fresh_rebuild' ../install.sh; then bad "dead-end hint: fresh_rebuild proven NOT to fix ENETUNREACH"; else ok "no proven-useless rebuild hint"; fi
+grep -q 'compose down --remove-orphans >/dev/null 2>&1' ../install.sh && ok "bind-retry starts from a clean slate" || bad "fresh_rebuild must down between bind retries (half-built endpoint must not be inherited)"
+grep -q 'sudo -n modprobe' ../install.sh && ok "modprobe via passwordless sudo for non-root runs" || bad "ensure_host_prereqs must sudo -n modprobe when non-root"
 
 # 7c. log consistency: every line timestamped + tagged, levels uniform.
 # (An untagged line in docker logs is indistinguishable noise.)
