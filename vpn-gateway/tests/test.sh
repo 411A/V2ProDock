@@ -75,6 +75,9 @@ grep -q 'PROOF_HEARTBEAT_N' watchdog.sh && ok "failure heartbeat (transition + e
 grep -q 'quiet' watchdog.sh && ok "quiet periodic verify mode" || bad "hot periodic path must not warn per cycle"
 grep -q 'TUN_FAILS' watchdog.sh && ok "tunnel-restart spam throttled (transition + heartbeat)" || bad "crash-loop restarts must not log per poll"
 grep -q '%H:%M:%S' watchdog.sh && grep -q '%H:%M:%S' entrypoint.sh && ok "ms timestamps on gateway logs" || bad "every gateway log line needs a millisecond timestamp"
+grep -q 'command -v gdate' watchdog.sh && grep -q 'command -v gdate' entrypoint.sh && ok "ts() prefers gdate (real ms)" || bad "ts() must prefer gdate over the .000 fallback"
+grep -q 'usr/local/bin/gdate' Dockerfile && ok "gdate extracted into image" || bad "Dockerfile must bake in gdate"
+! grep -E 'apk add [^&|;]*coreutils([[:space:]]|$)' Dockerfile && ok "no full coreutils (busybox applets unshadowed)" || bad "must not apk-add full coreutils (shadows sed/grep/awk)"
 grep -q 'status.json' watchdog.sh && ok "status.json for /vpn" || bad "status.json missing"
 grep -q 'ensure_ipsec' watchdog.sh && grep -q 'swanctl --load-all' watchdog.sh \
   && ok "watchdog self-heals ipsec state" || bad "watchdog must reload conns if charon restarts"

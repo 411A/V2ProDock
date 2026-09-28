@@ -5,9 +5,15 @@ set -eu
 
 # Millisecond timestamps on every line (docker logs without --timestamps
 # shows nothing otherwise; matches the Go logger's %H:%M:%S.%3N shape).
-# Portable: GNU date prints %N natively, busybox too; anything else falls
-# back to .000 instead of leaking a literal %N into the logs.
+# Prefers gdate (single GNU date binary baked into the image — full
+# coreutils is deliberately NOT installed to avoid shadowing busybox
+# applets). Fallback is .000: busybox date has no %N (proven on the VM:
+# both %N and %3N expand to empty), and a literal leak would be worse.
 ts() {
+  if command -v gdate >/dev/null 2>&1; then
+    gdate '+%Y-%m-%d %H:%M:%S.%3N'
+    return
+  fi
   _s="$(date '+%Y-%m-%d %H:%M:%S')"
   _n="$(date '+%N' 2>/dev/null)"
   case "$_n" in ''|*[!0-9]*) _n="000000000" ;; esac

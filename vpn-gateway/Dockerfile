@@ -54,6 +54,19 @@ RUN apk --no-cache add \
        grep -q "Version:" /tmp/hev-probe.log && \
        rm -f /tmp/hev-probe.log
 
+# Millisecond log timestamps WITHOUT shadowing busybox applets: installing
+# full coreutils would override sed/grep/awk/... system-wide and risk subtle
+# script behavior changes, so only the GNU date binary is extracted (as
+# gdate). ts() in the scripts prefers gdate and falls back to .000 without
+# it. The trailing check fails the build if ms timestamps don't really work.
+RUN apk update >/dev/null 2>&1 \
+ && mkdir -p /tmp/cu \
+ && apk fetch --stdout coreutils | tar -xz -C /tmp/cu \
+ && mv /tmp/cu/usr/bin/date /usr/local/bin/gdate \
+ && chmod +x /usr/local/bin/gdate \
+ && rm -rf /tmp/cu /var/cache/apk/* \
+ && gdate '+%Y-%m-%d %H:%M:%S.%3N' | grep -qE '\.[0-9]{3}$'
+
 COPY entrypoint.sh /entrypoint.sh
 COPY watchdog.sh /watchdog.sh
 COPY gen-mobileconfig.sh /gen-mobileconfig.sh
