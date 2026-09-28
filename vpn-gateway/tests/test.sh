@@ -77,8 +77,7 @@ grep -q 'TUN_FAILS' watchdog.sh && ok "tunnel-restart spam throttled (transition
 grep -q '%H:%M:%S' watchdog.sh && grep -q '%H:%M:%S' entrypoint.sh && ok "ms timestamps on gateway logs" || bad "every gateway log line needs a millisecond timestamp"
 grep -q 'command -v gdate' watchdog.sh && grep -q 'command -v gdate' entrypoint.sh && ok "ts() prefers gdate (real ms)" || bad "ts() must prefer gdate over the .000 fallback"
 grep -q 'usr/local/bin/gdate' Dockerfile && ok "gdate extracted into image" || bad "Dockerfile must bake in gdate"
-grep -q 'find /tmp/cu -name date' Dockerfile && ok "layout-agnostic extraction (no assumed .apk paths)" || bad "extraction must not assume tarball layout"
-! grep -E 'apk add [^&|;]*coreutils([[:space:]]|$)' Dockerfile && ok "no full coreutils (busybox applets unshadowed)" || bad "must not apk-add full coreutils (shadows sed/grep/awk)"
+grep -q 'apk del coreutils' Dockerfile && ok "coreutils removed again (busybox applets unshadowed)" || bad "coreutils must be transient, not a runtime package"
 grep -q 'status.json' watchdog.sh && ok "status.json for /vpn" || bad "status.json missing"
 grep -q 'ensure_ipsec' watchdog.sh && grep -q 'swanctl --load-all' watchdog.sh \
   && ok "watchdog self-heals ipsec state" || bad "watchdog must reload conns if charon restarts"

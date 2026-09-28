@@ -54,19 +54,16 @@ RUN apk --no-cache add \
        grep -q "Version:" /tmp/hev-probe.log && \
        rm -f /tmp/hev-probe.log
 
-# Millisecond log timestamps WITHOUT shadowing busybox applets: installing
-# full coreutils would override sed/grep/awk/... system-wide and risk subtle
-# script behavior changes, so only the GNU date binary is extracted (as
-# gdate). ts() in the scripts prefers gdate and falls back to .000 without
+# Millisecond log timestamps WITHOUT shadowing busybox applets: coreutils is
+# installed only transiently — the GNU date binary is moved out as gdate,
+# then the package is deleted again, so sed/grep/awk/... stay busybox at
+# runtime (a permanent install would shadow them system-wide and risk subtle
+# script behavior changes). ts() prefers gdate, falls back to .000 without
 # it. The trailing check fails the build if ms timestamps don't really work.
-RUN apk update >/dev/null 2>&1 \
- && mkdir -p /tmp/cu /usr/local/bin \
- && apk fetch --stdout coreutils | tar -xz -C /tmp/cu \
- && DATE_BIN="$(find /tmp/cu -name date -type f | head -n 1)" \
- && [ -n "$DATE_BIN" ] \
- && mv "$DATE_BIN" /usr/local/bin/gdate \
- && chmod +x /usr/local/bin/gdate \
- && rm -rf /tmp/cu /var/cache/apk/* \
+RUN apk --no-cache add coreutils \
+ && mv /usr/bin/date /usr/local/bin/gdate \
+ && apk del coreutils \
+ && rm -rf /var/cache/apk/* \
  && gdate '+%Y-%m-%d %H:%M:%S.%3N' | grep -qE '\.[0-9]{3}$'
 
 COPY entrypoint.sh /entrypoint.sh
