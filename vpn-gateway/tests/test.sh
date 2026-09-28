@@ -71,6 +71,10 @@ grep -q 'VERIFIED' watchdog.sh && ok "VERIFIED proof logging" || bad "VERIFIED l
 grep -q 'EGRESS UNPROVEN' watchdog.sh && ok "tun-empty distinguished from true mismatch" || bad "must separate UNPROVEN (stalled tunnel) from MISMATCH (misrouting)"
 grep -q 'LAST_VERIFIED' watchdog.sh && ok "VERIFIED logged on change only (no per-poll spam)" || bad "healthy polls must not log VERIFIED every 15s"
 grep -q 'PROOF_FAILS' watchdog.sh && ok "consecutive proof-failure counter" || bad "periodic failures must carry a streak count"
+grep -q 'PROOF_HEARTBEAT_N' watchdog.sh && ok "failure heartbeat (transition + every-Nth, no per-cycle spam)" || bad "steady-state failures must not log every poll"
+grep -q 'quiet' watchdog.sh && ok "quiet periodic verify mode" || bad "hot periodic path must not warn per cycle"
+grep -q 'TUN_FAILS' watchdog.sh && ok "tunnel-restart spam throttled (transition + heartbeat)" || bad "crash-loop restarts must not log per poll"
+grep -q '%H:%M:%S' watchdog.sh && grep -q '%H:%M:%S' entrypoint.sh && ok "ms timestamps on gateway logs" || bad "every gateway log line needs a millisecond timestamp"
 grep -q 'status.json' watchdog.sh && ok "status.json for /vpn" || bad "status.json missing"
 grep -q 'ensure_ipsec' watchdog.sh && grep -q 'swanctl --load-all' watchdog.sh \
   && ok "watchdog self-heals ipsec state" || bad "watchdog must reload conns if charon restarts"

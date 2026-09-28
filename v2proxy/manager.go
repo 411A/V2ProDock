@@ -294,6 +294,21 @@ func (m *ProxyManager) Start() error {
 		return maps.Clone(used)
 	}
 
+	// Progress logs only when the ready count CHANGES: a thin pool grinding
+	// 0/10 for 7 minutes used to log the identical line every 20s.
+	lastPopLog := -1
+	var popMu sync.Mutex
+	notePopProgress := func() {
+		ready := m.AliveCount()
+		popMu.Lock()
+		defer popMu.Unlock()
+		if ready == lastPopLog {
+			return
+		}
+		lastPopLog = ready
+		infoLog("Populating... %d/%d ready", ready, len(insts))
+	}
+
 	stopTick := make(chan struct{})
 	var tickWg sync.WaitGroup
 	tickWg.Go(func() {
@@ -302,7 +317,7 @@ func (m *ProxyManager) Start() error {
 		for {
 			select {
 			case <-t.C:
-				infoLog("Populating... %d/%d ready", m.AliveCount(), len(insts))
+				notePopProgress()
 			case <-stopTick:
 				return
 			}
@@ -325,7 +340,7 @@ func (m *ProxyManager) Start() error {
 			break
 		}
 		if round > 1 {
-			infoLog("populate round %d: %d/%d ready, retrying the rest...", round, m.AliveCount(), len(insts))
+			notePopProgress()
 			time.Sleep(populateRetryDelay)
 		}
 		pool, err := fetchPoolWithRetry(subURLs)

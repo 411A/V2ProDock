@@ -3,8 +3,18 @@
 # VPN egress == that config's egress. Never routes VPN direct.
 set -eu
 
-log() { echo "[v2prodock-vpn] $*"; }
-warn() { echo "[v2prodock-vpn][WARN] $*" >&2; }
+# Millisecond timestamps on every line (docker logs without --timestamps
+# shows nothing otherwise; matches the Go logger's %H:%M:%S.%3N shape).
+# Portable: GNU date prints %N natively, busybox too; anything else falls
+# back to .000 instead of leaking a literal %N into the logs.
+ts() {
+  _s="$(date '+%Y-%m-%d %H:%M:%S')"
+  _n="$(date '+%N' 2>/dev/null)"
+  case "$_n" in ''|*[!0-9]*) _n="000000000" ;; esac
+  printf '%s.%03d' "$_s" "$((10#$_n / 1000000))"
+}
+log() { echo "$(ts) [v2prodock-vpn] $*"; }
+warn() { echo "$(ts) [v2prodock-vpn][WARN] $*" >&2; }
 
 V2PRODOCK_API="${V2PRODOCK_API:-http://v2prodock:27018/proxies}"
 V2PRODOCK_SOCKS_HOST="${V2PRODOCK_SOCKS_HOST:-v2prodock}"
@@ -24,11 +34,20 @@ HEV_CONF="${HEV_CONF:-/tmp/hev.yaml}"
 
 HEV_PID=""
 CURRENT_SOCKS=""
-# Log-noise control: VERIFIED is logged only when the proven (upstream, IP)
-# pair CHANGES or recovers (status.json is still rewritten every poll), and
-# consecutive proof failures carry a streak counter instead of bare repeats.
+# Log-noise control: steady states NEVER log per cycle. VERIFIED logs only
+# when the proven (upstream, IP) pair CHANGES or recovers; failures log once
+# on transition (0->1) plus one heartbeat every PROOF_HEARTBEAT_Nth while
+# still down (status.json is rewritten every poll regardless, so the API is
+# always current). A healthy tunnel at POLL_SECS=15 would otherwise log ~6k
+# identical lines a day; a dead one did exactly that before this policy.
 LAST_VERIFIED=""
 PROOF_FAILS=0
+API_FAILS=0
+TUN_FAILS=0
+PROOF_HEARTBEAT_N="${PROOF_HEARTBEAT_N:-20}"
+# A 0/garbage heartbeat would divide by zero under set -eu and kill the
+# gateway; degrade to the default instead.
+case "$PROOF_HEARTBEAT_N" in ''|*[!0-9]*|0) PROOF_HEARTBEAT_N=20 ;; esac
 
 cleanup() {
   log "Shutting down tunnel + VPN daemons..."
@@ -95,10 +114,15 @@ tunnel_alive() {
 }
 
 start_tunnel() {
-  # $1 host:port $2 name
-  socks="$1"; name="$2"
+  # $1 host:port $2 name [$3 loud|quiet, default loud]
+  # quiet is for the crash-loop restart path: retrying still happens every
+  # poll, but Pinning/Tunnel-up lines don't (recovery shows up via VERIFIED).
+  socks="$1"; name="$2"; mode="${3:-loud}"
+  note() {
+    if [ "$mode" = "loud" ]; then log "$1"; fi
+  }
   host="${socks%%:*}"; port="${socks##*:}"
-  log "Pinning $TUN_DEV -> SOCKS $socks ($name) ..."
+  note "Pinning $TUN_DEV -> SOCKS $socks ($name) ..."
   render_hev "$host" "$port"
   if [ -n "$HEV_PID" ] && kill -0 "$HEV_PID" 2>/dev/null; then kill "$HEV_PID" 2>/dev/null || true; sleep 1; fi
   pkill -f "$HEV_BIN $HEV_CONF" 2>/dev/null || true
@@ -134,9 +158,9 @@ start_tunnel() {
   ip route replace default dev "$TUN_DEV" table 100 2>/dev/null || warn "ip route table 100 failed"
   CURRENT_SOCKS="$socks"
   if [ "${ENABLE_PPTP:-0}" = "1" ]; then
-    log "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET}${VPN_PPTP_NET:+, $VPN_PPTP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
+    note "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET}${VPN_PPTP_NET:+, $VPN_PPTP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
   else
-    log "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
+    note "Tunnel up: $VPN_NET${VPN_L2TP_NET:+, $VPN_L2TP_NET} --table100--> $TUN_DEV -> $socks (gateway own traffic stays direct, no loop)."
   fi
   return 0
 }
@@ -146,20 +170,33 @@ start_tunnel() {
 # UDP-blocked) and a DIFFERING answer (misrouting) are different failures
 # with different fixes — logged distinctly, never lumped together.
 verify_egress() {
-  # $1 host:port
-  socks="$1"
-  via_socks="$(curl -fsS --max-time 8 --socks5-hostname "$socks" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || return 1
-  [ -n "$via_socks" ] || return 1
-  via_tun="$(curl -fsS --max-time 8 --interface "$TUN_DEV" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || {
-    warn "EGRESS UNPROVEN via $socks: tun gave no response (tunnel stalled? upstream UDP-blocked?). Fail-closed: clients have no direct path."
+  # $1 host:port [$2 loud|quiet, default loud]
+  # rc 0 proven (eip on stdout); 1 socks-side down; 2 MISMATCH; 3 UNPROVEN.
+  # loud warns immediately (rare paths: initial pin, re-pin). quiet stays
+  # silent (hot periodic path — the loop logs transitions + heartbeat
+  # itself, so one stuck tunnel can't fill the log with identical pairs).
+  socks="$1"; mode="${2:-loud}"
+  note() {
+    if [ "$mode" = "loud" ]; then warn "$1"; fi
+  }
+  via_socks="$(curl -fsS --max-time 8 --socks5-hostname "$socks" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || {
+    note "EGRESS CHECK failed via $socks (pinned upstream SOCKS itself down?)"
     return 1
+  }
+  [ -n "$via_socks" ] || {
+    note "EGRESS CHECK failed via $socks (pinned upstream SOCKS empty answer)"
+    return 1
+  }
+  via_tun="$(curl -fsS --max-time 8 --interface "$TUN_DEV" "$EGRESS_URL" 2>/dev/null | tr -d ' \r\n')" || {
+    note "EGRESS UNPROVEN via $socks: tun gave no response (tunnel stalled? upstream UDP-blocked?). Fail-closed: clients have no direct path."
+    return 3
   }
   [ -n "$via_tun" ] || {
-    warn "EGRESS UNPROVEN via $socks: empty tun response."
-    return 1
+    note "EGRESS UNPROVEN via $socks: empty tun response."
+    return 3
   }
   [ "$via_socks" = "$via_tun" ] || {
-    warn "EGRESS MISMATCH: socks=$via_socks tun=$via_tun (tunnel egress differs from pinned upstream!)"
+    note "EGRESS MISMATCH: socks=$via_socks tun=$via_tun (tunnel egress differs from pinned upstream!)"
     return 2
   }
   printf '%s' "$via_tun"
@@ -236,14 +273,21 @@ while true; do
   ensure_ipsec || exit 1
   ensure_pptpd
   if ! fastest="$(api_fastest)"; then
-    warn "API has no alive proxy; keeping last pin $CURRENT_SOCKS (fail-closed, no direct fallback)."
+    API_FAILS=$((API_FAILS + 1))
+    if [ "$API_FAILS" -eq 1 ]; then
+      warn "API has no alive proxy; keeping last pin $CURRENT_SOCKS (fail-closed, no direct fallback)."
+    elif [ $((API_FAILS % PROOF_HEARTBEAT_N)) -eq 0 ]; then
+      warn "API still has no alive proxy; keeping last pin $CURRENT_SOCKS — $API_FAILS in a row."
+    fi
     write_status "$CURRENT_SOCKS" "" "" false "api returned no alive proxy"
     continue
   fi
+  API_FAILS=0
   socks="${fastest%%|*}"; pname="${fastest#*|}"
   if [ "$socks" != "$CURRENT_SOCKS" ]; then
     log "Upstream changed $CURRENT_SOCKS -> $socks ($pname), re-pinning..."
     PROOF_FAILS=0
+    TUN_FAILS=0
     if start_tunnel "$socks" "$pname"; then
       if eip="$(verify_egress "$socks")"; then
         report_verified "$socks" "$pname" "$eip"
@@ -259,15 +303,32 @@ while true; do
     continue
   fi
   if ! tunnel_alive; then
-    warn "Tunnel device/process dead, restarting on $CURRENT_SOCKS ..."
-    start_tunnel "$socks" "$pname" || { write_status "$socks" "$pname" "" false "tunnel restart failed"; continue; }
+    TUN_FAILS=$((TUN_FAILS + 1))
+    if [ "$TUN_FAILS" -eq 1 ]; then
+      warn "Tunnel device/process dead, restarting on $CURRENT_SOCKS ..."
+    elif [ $((TUN_FAILS % PROOF_HEARTBEAT_N)) -eq 0 ]; then
+      warn "Tunnel still dead, restarting on $CURRENT_SOCKS — $TUN_FAILS in a row."
+    fi
+    start_tunnel "$socks" "$pname" quiet || { write_status "$socks" "$pname" "" false "tunnel restart failed"; continue; }
+  else
+    TUN_FAILS=0
   fi
-  if eip="$(verify_egress "$socks")"; then
+  if eip="$(verify_egress "$socks" quiet)"; then
     report_verified "$socks" "$pname" "$eip"
     write_status "$socks" "$pname" "$eip" true ""
   else
+    rc=$?
     PROOF_FAILS=$((PROOF_FAILS + 1))
-    warn "Periodic egress proof failed for $socks ($pname) — $PROOF_FAILS in a row."
+    case $rc in
+      2) reason="MISMATCH" ;;
+      3) reason="UNPROVEN" ;;
+      *) reason="socks-down" ;;
+    esac
+    if [ "$PROOF_FAILS" -eq 1 ]; then
+      warn "Egress proof failing via $socks ($pname): $reason — retrying, heartbeat every ${PROOF_HEARTBEAT_N}th while down."
+    elif [ $((PROOF_FAILS % PROOF_HEARTBEAT_N)) -eq 0 ]; then
+      warn "Egress proof still failing via $socks ($pname): $reason — $PROOF_FAILS in a row."
+    fi
     write_status "$socks" "$pname" "" false "periodic egress proof failed"
   fi
 done

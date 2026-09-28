@@ -4,8 +4,16 @@
 # Strict: fails fast on bad env, never falls back to direct egress.
 set -eu
 
-log() { echo "[v2prodock-vpn] $*"; }
-die() { echo "[v2prodock-vpn][FATAL] $*" >&2; exit 1; }
+# Millisecond timestamps (same policy as watchdog.sh; duplicated because the
+# two scripts run as independent processes).
+ts() {
+  _s="$(date '+%Y-%m-%d %H:%M:%S')"
+  _n="$(date '+%N' 2>/dev/null)"
+  case "$_n" in ''|*[!0-9]*) _n="000000000" ;; esac
+  printf '%s.%03d' "$_s" "$((10#$_n / 1000000))"
+}
+log() { echo "$(ts) [v2prodock-vpn] $*"; }
+die() { echo "$(ts) [v2prodock-vpn][FATAL] $*" >&2; exit 1; }
 
 # VPN_ENABLED=0 lets existing proxy-only users keep `compose up` green.
 case "${VPN_ENABLED:-1}" in
