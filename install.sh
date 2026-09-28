@@ -257,7 +257,10 @@ check_subscriptions_reachable() {
 # fatal (populate retries + runtime failover still apply).
 check_container_egress() {
     local urls="$1" u failed=0 total=0
-    docker exec v2prodock true 2>/dev/null || return 0
+    if ! docker exec v2prodock true 2>/dev/null; then
+        echo -e "${RED}[WARN] v2prodock container is not running - cannot verify in-container egress (did 'compose up' fail above?)${NC}"
+        return 0
+    fi
     while IFS= read -r u; do
         [ -z "$u" ] && continue
         total=$((total + 1))
@@ -271,9 +274,103 @@ check_container_egress() {
     if [ "$total" -gt 0 ] && [ "$failed" -eq "$total" ]; then
         echo -e "${RED}[WARN] NO subscription reachable from inside v2prodock: container network is broken (NOT the URLs).${NC}"
         echo "  Diagnose: docker exec v2prodock ip route   # must show a default route"
-        echo "  Diagnose: docker network inspect v2prodock-proxy-net  # subnet must not overlap your LAN"
-        echo "  Fix:      docker compose down && docker compose up -d --build  # rebuilds the sandbox"
+        echo "  Diagnose: docker network ls | grep proxy-net, then docker network inspect <name>  # subnet must not overlap your LAN"
+        echo "  Fix:      rerun install.sh (fresh_rebuild tears the sandbox down and rebuilds it)"
     fi
+}
+
+# Full teardown + rebuild of THIS project, fully automatic: old containers
+# are stopped and removed (with orphans) along with the project network,
+# survivors are force-removed by ID, then the two project images are deleted
+# before rebuilding — every run starts fresh with no squatting port-holders
+# and no disk-eating dangling layers. If 'up' still hits a held port, the
+# squatter is evicted automatically when it is provably stale (see
+# free_port_squatter) and 'up' is retried.
+# Scope is strictly this compose project plus provably-dead proxies: no
+# prune, no volume removal, no system-wide flags, explicit image names
+# (mirroring the `image:` fields in docker-compose.yml) - other stacks
+# (Hermes, V2RayA, ...) are never touched. Only a container that refuses
+# even 'rm -f' (D-state/daemon-level) still needs a human (hammer below).
+fresh_rebuild() {
+    local _left up_out bind_spec _attempt
+    docker compose down --remove-orphans 2>&1 || true
+    # Survivors of 'down' (stuck stops) are force-removed by ID: still
+    # project scope, still automatic.
+    _left="$(docker compose ps -aq 2>/dev/null)"
+    if [ -n "$_left" ]; then
+        echo "  Evicting stuck project containers..."
+        # shellcheck disable=SC2086
+        docker rm -f $_left 2>/dev/null || true
+        _left="$(docker compose ps -aq 2>/dev/null)"
+    fi
+    if [ -n "$_left" ]; then
+        err "stale project containers refuse even 'rm -f' (unkillable?) - cannot rebuild safely."
+        echo "  Inspect: docker compose ps -a"
+        echo "  Hammer (only remaining manual step): sudo systemctl restart docker, then rerun"
+        exit 1
+    fi
+    docker rmi v2prodock/proxy:latest v2prodock/vpn-gateway:latest 2>/dev/null || true
+    docker compose build 2>&1 || { err "docker compose build failed"; exit 1; }
+    _attempt=1
+    while [ "$_attempt" -le 3 ]; do
+        if up_out=$(docker compose up -d 2>&1); then
+            printf '%s\n' "$up_out"
+            return 0
+        fi
+        printf '%s\n' "$up_out"
+        bind_spec=$(printf '%s' "$up_out" | grep -oE 'failed to bind host port [0-9.]+:[0-9]+/(tcp|udp)' | head -1 | grep -oE '[0-9.]+:[0-9]+/(tcp|udp)' || true)
+        if [ -z "$bind_spec" ] || ! free_port_squatter "$bind_spec"; then
+            break
+        fi
+        echo "  Squatter evicted, retrying compose up (attempt $((_attempt + 1))/3) ..."
+        sleep 2
+        _attempt=$((_attempt + 1))
+    done
+    err "docker compose up failed - fix the error above, then retry"
+    echo "  If 'address already in use' persists: ss -tlnp | grep <port> finds the squatter"
+    echo "  (another stack holding the port? a host-mode binary?) - evict it, then rerun"
+    exit 1
+}
+
+# Evict a port squatter automatically ONLY when it is provably stale: the
+# listener must be a docker-proxy whose container no longer exists (crashed
+# daemon cleanup left it behind - it serves nothing). A proxy whose
+# container is alive (another stack's port!) or any non-proxy process is
+# refused, never killed. Returns 0 when the port is free afterwards.
+free_port_squatter() {
+    # $1 = "IP:port/proto" as reported by the daemon, e.g. 127.0.0.1:27018/tcp
+    local spec="$1" proto="${1##*/}" port="${1%/*}" args="" cid="" pid=""
+    port="${port##*:}"
+    local ssflag="-tlnp"
+    [ "$proto" = "udp" ] && ssflag="-ulnp"
+    command -v ss >/dev/null 2>&1 || return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    local holders
+    holders=$(ss "$ssflag" "( sport = :$port )" 2>/dev/null | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+' | sort -u)
+    [ -z "$holders" ] && return 0
+    for pid in $holders; do
+        # ww = unlimited width: a truncated cmdline would hide container-id
+        # and wrongly refuse a genuinely stale proxy.
+        args=$(ps ww -o args= -p "$pid" 2>/dev/null)
+        case "$args" in
+            *docker-proxy*)
+                cid=$(printf '%s' "$args" | grep -oE 'container-id[= ][a-f0-9]+' | grep -oE '[a-f0-9]+$')
+                # No container-id, or the container still exists = NOT stale:
+                # hands off, whatever it is.
+                if [ -z "$cid" ] || docker inspect "$cid" >/dev/null 2>&1; then
+                    echo -e "${RED}[WARN] port $spec is held by a LIVE holder (pid $pid) - refusing to kill it${NC}"
+                    return 1
+                fi
+                echo "  Evicting stale docker-proxy pid $pid holding $spec (container $cid is gone) ..."
+                kill -9 "$pid" 2>/dev/null || return 1
+                ;;
+            *)
+                echo -e "${RED}[WARN] port $spec is held by a non-proxy process (pid $pid) - refusing to kill it${NC}"
+                return 1
+                ;;
+        esac
+    done
+    return 0
 }
 
 escape_sed_repl() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
@@ -445,7 +542,7 @@ if [ "$DOCKER_MODE" = true ]; then
     case "${1:-}" in
         start)
             ensure_host_prereqs
-            docker compose up -d
+            fresh_rebuild
             ok "Started"
             check_container_egress "$(read_sub_urls)"
             show_status
@@ -470,6 +567,7 @@ if [ "$DOCKER_MODE" = true ]; then
             read -p "Remove everything? [y/N]: " -n 1 -r; echo
             [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
             docker compose down -v
+            docker rmi v2prodock/proxy:latest v2prodock/vpn-gateway:latest 2>/dev/null || true
             rm -rf config .env
             ok "Removed"
             ;;
@@ -584,8 +682,7 @@ if [ "$DOCKER_MODE" = true ]; then
             fi
 
             ensure_host_prereqs
-            docker compose build 2>&1
-            docker compose up -d 2>&1
+            fresh_rebuild
             ok "Started"
             check_container_egress "$sub_urls"
             show_status

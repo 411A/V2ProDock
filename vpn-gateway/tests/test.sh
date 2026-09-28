@@ -196,6 +196,17 @@ grep -q 'xray version' ../Dockerfile && ok "v2prodock build smoke-tests the xray
 grep -q -- '--retry' ../Dockerfile && ok "v2prodock download retries flaky builds" || bad "xray download needs --retry"
 grep -q -- '--tries=3' Dockerfile && grep -q -- '--retry' Dockerfile && ok "vpn-gateway downloads retry" || bad "poptop/hev downloads need retry flags"
 
+# 7c. fresh rebuild discipline (install.sh): every rerun tears THIS project
+# down to zero (containers+orphans+network+images) before rebuilding, so no
+# stale port-holder or dangling layer survives - without touching neighbors.
+grep -q 'fresh_rebuild()' ../install.sh && ok "fresh_rebuild defined" || bad "install.sh needs fresh_rebuild()"
+grep -q 'compose down --remove-orphans' ../install.sh && ok "rebuild removes orphans+network" || bad "fresh_rebuild must down --remove-orphans"
+grep -q 'compose ps -aq' ../install.sh && ok "rebuild aborts on stuck survivors" || bad "fresh_rebuild must refuse to build over stuck containers"
+for _img in $(grep -oE 'image: [^ ]+' ../docker-compose.yml | tr -d '\r' | awk '{print $2}'); do
+  grep -q "docker rmi.*$_img" ../install.sh && ok "rebuild deletes image $_img" || bad "install.sh rmi names must mirror compose image: fields ($_img)"
+done
+grep -q 'address already in use' ../install.sh && ok "bind-conflict guidance present" || bad "up-failure path must explain squatter eviction"
+
 # 7c. log consistency: every line timestamped + tagged, levels uniform.
 # (An untagged line in docker logs is indistinguishable noise.)
 grep -q '^warn() ' watchdog.sh entrypoint.sh && ok "warn() with [WARN] tag in both scripts" || bad "warn() missing (warnings must carry the [WARN] tag)"
@@ -301,6 +312,74 @@ EOF
   rm -rf "$_bw"
 else
   echo "[vpn-test][SKIP] behavioral mocks need bash+curl+jq"
+fi
+
+# 10. free_port_squatter behavioral mocks (install.sh): the auto-evictor must
+# kill a stale docker-proxy, and refuse a live one's proxy or any foreign
+# process. All four OS tools are stubbed; only bash is required.
+if command -v bash >/dev/null 2>&1; then
+  _sq="$(mktemp -d)"
+  # Suite cd's to vpn-gateway, so repo-root install.sh is ../install.sh.
+  sed -n "/^free_port_squatter() {/,/^}/p" ../install.sh > "$_sq/fns.sh"
+  if [ -s "$_sq/fns.sh" ]; then ok "extracted squatter fn for mock run"; else bad "squatter fn extraction failed"; fi
+  mkdir -p "$_sq/bin"
+  cat > "$_sq/bin/ss" <<'EOF'
+#!/bin/sh
+# SS_LINE canned per case; empty = port free.
+printf '%s' "$SS_LINE"
+EOF
+  cat > "$_sq/bin/ps" <<'EOF'
+#!/bin/sh
+printf '%s' "$PS_ARGS"
+EOF
+  cat > "$_sq/bin/docker" <<'EOF'
+#!/bin/sh
+# docker inspect <cid> -> $INSPECT_RC (0 = container alive).
+exit "${INSPECT_RC:-1}"
+EOF
+  chmod +x "$_sq/bin/"*
+  cat > "$_sq/run.sh" <<'EOF'
+RED=''; NC=''
+# kill is a shell builtin: a PATH shim can never override it, so the mock
+# is a function (overrides the builtin) logging every kill attempt.
+kill() { printf '%s\n' "$*" >> "$KILL_LOG"; return 0; }
+. "$FNS"
+EOF
+  _sqrun() { : > "$_sq/kill.log"; PATH="$_sq/bin:/usr/bin:/bin" FNS="$_sq/fns.sh" KILL_LOG="$_sq/kill.log" SS_LINE="$2" PS_ARGS="$3" INSPECT_RC="$4" bash -c ". \"$_sq/run.sh\"; free_port_squatter \"$1\" >/dev/null 2>&1; echo \"rc=\$?\""; }
+  _stale_ss='LISTEN 0 4096 127.0.0.1:27018 0.0.0.0:* users:(("docker-proxy",pid=1234,fd=4))'
+  _stale_ps='docker-proxy -proto tcp -host-ip 127.0.0.1 -host-port 27018 -container-ip 172.18.0.2 -container-port 27018 -container-id deadbeef1234'
+  _out="$(_sqrun '127.0.0.1:27018/tcp' "$_stale_ss" "$_stale_ps" 1)"
+  if [ "$_out" = "rc=0" ] && grep -q -- '-9 1234' "$_sq/kill.log"; then
+    ok "stale proxy (dead container) killed by pid"
+  else
+    bad "stale proxy must die: $_out kill=$(cat "$_sq/kill.log")"
+  fi
+  _out="$(_sqrun '127.0.0.1:27018/tcp' "$_stale_ss" "$_stale_ps" 0)"
+  if [ "$_out" = "rc=1" ] && [ ! -s "$_sq/kill.log" ]; then
+    ok "live container proxy refused (no kill)"
+  else
+    bad "live proxy must be refused: $_out kill=$(cat "$_sq/kill.log")"
+  fi
+  _for_ss='LISTEN 0 4096 127.0.0.1:27018 0.0.0.0:* users:(("python3",pid=777,fd=5))'
+  _out="$(_sqrun '127.0.0.1:27018/tcp' "$_for_ss" 'python3 app.py' 1)"
+  if [ "$_out" = "rc=1" ] && [ ! -s "$_sq/kill.log" ]; then
+    ok "foreign process refused (no kill)"
+  else
+    bad "foreign process must be refused: $_out kill=$(cat "$_sq/kill.log")"
+  fi
+  _out="$(_sqrun '127.0.0.1:27018/tcp' '' '' 1)"
+  [ "$_out" = "rc=0" ] && ok "free port returns 0 silently" || bad "free port must return 0: $_out"
+  # Static: the safety rails must exist around the kill.
+  grep -q 'refusing to kill' ../install.sh && ok "refusal branches present" || bad "evictor must refuse live/foreign holders"
+  grep -q 'command -v ss' ../install.sh && grep -q 'command -v ps' ../install.sh && ok "tool guards present" || bad "evictor must degrade without ss/ps"
+  if grep -Eq '^[[:space:]]*(sudo[[:space:]]+)?systemctl (restart|stop|start) docker' ../install.sh; then
+    bad "daemon restart must never run automatically (echo-only hammer)"
+  else
+    ok "no automatic daemon restart (neighbors safe)"
+  fi
+  rm -rf "$_sq"
+else
+  echo "[vpn-test][SKIP] squatter mocks need bash"
 fi
 
 if [ "$fail" -ne 0 ]; then echo "[vpn-test] FAILED" >&2; exit 1; fi
