@@ -54,18 +54,12 @@ RUN apk --no-cache add \
        grep -q "Version:" /tmp/hev-probe.log && \
        rm -f /tmp/hev-probe.log
 
-# Millisecond log timestamps WITHOUT shadowing busybox applets: coreutils is
-# installed only transiently — the GNU date binary is moved out as gdate,
-# then the package is deleted again, so sed/grep/awk/... stay busybox at
-# runtime (a permanent install would shadow them system-wide and risk subtle
-# script behavior changes). ts() prefers gdate, falls back to .000 without
-# it. The trailing check fails the build if ms timestamps don't really work.
-RUN apk --no-cache add coreutils \
- && mv /usr/bin/date /usr/local/bin/gdate \
- && apk del coreutils \
- && rm -rf /var/cache/apk/* \
- && gdate '+%Y-%m-%d %H:%M:%S.%3N' | grep -qE '\.[0-9]{3}$'
-
+# NOTE: millisecond gateway timestamps were tried and REVERTED (3 failed
+# builds). This image's busybox date has no %N, and Alpine split coreutils
+# into per-tool subpackages (date lives in coreutils-date, not coreutils),
+# so both the tarball-surgery and transient-install approaches died here.
+# If ms is ever retried: apk add coreutils-date (not coreutils). ts() in the
+# scripts prints honest second-precision timestamps instead of a fake .000.
 COPY entrypoint.sh /entrypoint.sh
 COPY watchdog.sh /watchdog.sh
 COPY gen-mobileconfig.sh /gen-mobileconfig.sh

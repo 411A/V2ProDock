@@ -3,21 +3,13 @@
 # VPN egress == that config's egress. Never routes VPN direct.
 set -eu
 
-# Millisecond timestamps on every line (docker logs without --timestamps
-# shows nothing otherwise; matches the Go logger's %H:%M:%S.%3N shape).
-# Prefers gdate (single GNU date binary baked into the image — full
-# coreutils is deliberately NOT installed to avoid shadowing busybox
-# applets). Fallback is .000: busybox date has no %N (proven on the VM:
-# both %N and %3N expand to empty), and a literal leak would be worse.
+# Second-precision timestamps on every line (docker logs without
+# --timestamps shows nothing otherwise). Deliberately NO millisecond
+# fraction: this image's busybox date has no %N (proven on the VM — both %N
+# and %3N expand to empty), and a permanent .000 would fake precision we
+# don't have. (gdate attempts were reverted; see Dockerfile note.)
 ts() {
-  if command -v gdate >/dev/null 2>&1; then
-    gdate '+%Y-%m-%d %H:%M:%S.%3N'
-    return
-  fi
-  _s="$(date '+%Y-%m-%d %H:%M:%S')"
-  _n="$(date '+%N' 2>/dev/null)"
-  case "$_n" in ''|*[!0-9]*) _n="000000000" ;; esac
-  printf '%s.%03d' "$_s" "$((10#$_n / 1000000))"
+  date '+%Y-%m-%d %H:%M:%S'
 }
 log() { echo "$(ts) [v2prodock-vpn] $*"; }
 warn() { echo "$(ts) [v2prodock-vpn][WARN] $*" >&2; }

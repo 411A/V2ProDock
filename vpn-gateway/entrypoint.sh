@@ -4,17 +4,10 @@
 # Strict: fails fast on bad env, never falls back to direct egress.
 set -eu
 
-# Millisecond timestamps (same policy as watchdog.sh; duplicated because the
-# two scripts run as independent processes).
+# Second-precision timestamps (same policy as watchdog.sh; duplicated because
+# the two scripts run as independent processes).
 ts() {
-  if command -v gdate >/dev/null 2>&1; then
-    gdate '+%Y-%m-%d %H:%M:%S.%3N'
-    return
-  fi
-  _s="$(date '+%Y-%m-%d %H:%M:%S')"
-  _n="$(date '+%N' 2>/dev/null)"
-  case "$_n" in ''|*[!0-9]*) _n="000000000" ;; esac
-  printf '%s.%03d' "$_s" "$((10#$_n / 1000000))"
+  date '+%Y-%m-%d %H:%M:%S'
 }
 log() { echo "$(ts) [v2prodock-vpn] $*"; }
 die() { echo "$(ts) [v2prodock-vpn][FATAL] $*" >&2; exit 1; }
