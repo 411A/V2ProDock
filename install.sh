@@ -258,7 +258,8 @@ check_subscriptions_reachable() {
 # route). The verdict line says which layer is broken, once.
 netns_report() {
     echo "--- netns facts (v2prodock) ---"
-    docker exec v2prodock ip -br addr 2>&1 | sed 's/^/  addr    /'
+    # -o, NOT -br: v2prodock runs BusyBox ip (no -br) - it would print usage.
+    docker exec v2prodock ip -o addr 2>&1 | sed 's/^/  addr    /'
     docker exec v2prodock ip route 2>&1 | sed 's/^/  route   /'
     local net n
     net=$(docker inspect v2prodock --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
@@ -271,7 +272,7 @@ netns_report() {
     ls docker-compose*.yml compose*.yml 2>/dev/null | grep -vx 'docker-compose.yml' | sed 's/^/  host    EXTRA COMPOSE FILE: /'
     docker info --format '  daemon  ip-forward={{.IPv4Forwarding}} pools={{json .DefaultAddressPools}}' 2>/dev/null
     local addrs routes
-    addrs=$(docker exec v2prodock ip -br addr 2>/dev/null)
+    addrs=$(docker exec v2prodock ip -o addr 2>/dev/null)
     routes=$(docker exec v2prodock ip route 2>/dev/null)
     if ! printf '%s' "$addrs" | grep -qE 'eth0[[:space:]]+inet '; then
         echo "  VERDICT: eth0 has no IPv4 address - the endpoint never got an IP (IPAM/daemon problem, not the URLs)"

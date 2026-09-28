@@ -129,6 +129,11 @@ services:
       - V2PRODOCK_SOCKS_HOST=v2prodock
       - TUN_DEV=${VPN_TUN_DEV:-tun0}
       - TUN_ADDR=${VPN_TUN_ADDR:-198.18.0.1}
+      # Documented gateway knobs (README + .env.example) that were NEVER
+      # passed through - setting them in .env silently did nothing.
+      - POLL_SECS=${POLL_SECS:-15}
+      - PROOF_HEARTBEAT_N=${PROOF_HEARTBEAT_N:-20}
+      - EGRESS_URL=${EGRESS_URL:-https://api.ipify.org}
       - PERSIST_DIR=/config/vpn
     healthcheck:
       test: ["CMD-SHELL", "swanctl --list-sas >/dev/null 2>&1 || swanctl --list-conns 2>&1 | grep -q ikev2-eap"]

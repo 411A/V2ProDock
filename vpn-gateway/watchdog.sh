@@ -177,6 +177,13 @@ start_tunnel() {
   ip addr replace "${TUN_ADDR}/16" dev "$TUN_DEV" 2>/dev/null || true
   ip link set "$TUN_DEV" up 2>/dev/null || true
   ip link set "$TUN_DEV" mtu "$TUN_MTU" 2>/dev/null || true
+  # Proof source: verify_egress curls --interface tun0 (source TUN_ADDR).
+  # Client pools get from-rules below; without one for TUN_ADDR the proof
+  # source has NO path via tun0 - fib rejects the tun0-bound route lookup
+  # (ENETUNREACH), so egress proof can NEVER verify while clients are fine.
+  # Pref 216: before entrypoint's to-pool 217, away from Docker's 220.
+  ip rule show | grep -q "from ${TUN_ADDR} lookup 100" 2>/dev/null \
+    || ip rule add from "$TUN_ADDR" table 100 pref 216 2>/dev/null || warn "ip rule (proof source) failed"
   # Source-based routing: ONLY VPN client subnets (IKEv2 + L2TP) use tun0.
   # Gateway's own SOCKS connection (src=gw IP) stays on main table -> no loop.
   ip rule show | grep -q "from ${VPN_NET} lookup 100" 2>/dev/null \

@@ -56,6 +56,13 @@ grep -q 'table 100' watchdog.sh entrypoint.sh && ok "policy routing table 100" |
 grep -q 'from "\$VPN_NET" table 100' watchdog.sh && ok "source-based rule (no loop)" || bad "source-based rule missing"
 grep -q 'from "\$VPN_L2TP_NET" table 100' watchdog.sh && ok "l2tp source-based rule" || bad "L2TP net missing table-100 rule"
 grep -q 'from "\$VPN_PPTP_NET" table 100' watchdog.sh && ok "pptp source-based rule" || bad "PPTP net missing table-100 rule"
+# The proof curls --interface tun0 (source TUN_ADDR): without a from-rule
+# for that source the fib lookup rejects tun0-bound sockets (ENETUNREACH)
+# and egress proof NEVER verifies, while VPN clients stay perfectly happy.
+grep -q 'from "\$TUN_ADDR" table 100' watchdog.sh && ok "proof source (TUN_ADDR) routed via tun0" || bad "start_tunnel must add from-TUN_ADDR table100 rule - proof can never verify without it"
+for _k in POLL_SECS PROOF_HEARTBEAT_N EGRESS_URL; do
+  grep -q "${_k}=\${${_k}" ../docker-compose.yml && ok "compose passes $_k to gateway" || bad "documented knob $_k never reaches the gateway container (.env setting is dead)"
+done
 if grep -q 'table 100 pref 220' watchdog.sh entrypoint.sh; then bad "pref 220 collides with Docker per-network rules (PPTP would miss tun0)"; else ok "no pref-220 collision with Docker"; fi
 grep -q 'for _pool in "\$VPN_SUBNET" "\$VPN_L2TP_NET" "\$VPN_PPTP_NET"' entrypoint.sh \
   && grep -q 'ip rule add to "\$_pool" lookup main pref 217' entrypoint.sh \
@@ -230,6 +237,9 @@ else
   done
   [ "$_ov" -eq 1 ] && bad "API port $_api_port is inside a published port range (dual-bind EADDRINUSE)" || ok "API port excluded from published ranges"
 fi
+# v2prodock runs BusyBox ip: '-br' does not exist there (prints usage), so
+# the fact dump / verdict would read garbage. '-o' works on both.
+if grep -q 'docker exec v2prodock ip -br' ../install.sh; then bad "netns_report uses ip -br (BusyBox v2prodock prints usage instead of addresses)"; else ok "netns fact dump uses BusyBox-safe ip -o"; fi
 
 # 7c. log consistency: every line timestamped + tagged, levels uniform.
 # (An untagged line in docker logs is indistinguishable noise.)
