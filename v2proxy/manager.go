@@ -39,6 +39,57 @@ type ProxyManager struct {
 	checkInterval time.Duration
 	aggSocks      string
 	aggHTTP       string
+	// srcBrk rests dead subscription sources across refreshes (single
+	// goroutine use — subscription loop only — so no mutex).
+	srcBrk srcBreaker
+}
+
+// srcBreaker circuit-breaks dead subscription sources across refreshes: a
+// host that is down burns fetchAttempts x fetchTimeout on EVERY refresh
+// while contributing nothing (production: one dead LAN host cost ~20s per
+// 120s refresh plus a WARN each cycle). After srcFailThreshold consecutive
+// failures the source rests for srcSkipCycles refreshes; the next allowed
+// fetch then probes recovery (success resets, failure re-arms).
+type srcBreaker struct {
+	fails map[string]int
+	skip  map[string]int
+}
+
+// allow reports whether url may be fetched this refresh, counting down rests.
+func (b *srcBreaker) allow(url string) bool {
+	left, resting := b.skip[url]
+	if !resting || left <= 0 {
+		return true
+	}
+	b.skip[url] = left - 1
+	return false
+}
+
+// restLeft reports remaining rest cycles (0 = not resting).
+func (b *srcBreaker) restLeft(url string) int {
+	return b.skip[url]
+}
+
+// note records one refresh outcome for url.
+func (b *srcBreaker) note(url string, ok bool) {
+	if ok {
+		delete(b.fails, url)
+		delete(b.skip, url)
+		return
+	}
+	if b.fails == nil {
+		b.fails = make(map[string]int)
+	}
+	b.fails[url]++
+	if b.fails[url] >= srcFailThreshold {
+		if b.skip == nil {
+			b.skip = make(map[string]int)
+		}
+		if _, resting := b.skip[url]; !resting {
+			b.skip[url] = srcSkipCycles
+			warnLog("breaker: subscription %s failed %d in a row, resting it for %d refreshes", url, b.fails[url], srcSkipCycles)
+		}
+	}
 }
 
 func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subURLs []string, checkInterval time.Duration) *ProxyManager {
@@ -480,7 +531,26 @@ func (m *ProxyManager) HealthCheckAll() {
 func (m *ProxyManager) RefreshSubscriptions() {
 	insts, subURLs := m.snapshot()
 
-	pool := FetchMergedSubscriptions(subURLs)
+	// Dead sources rest instead of burning full retry budgets every cycle.
+	allowed := make([]string, 0, len(subURLs))
+	for _, u := range subURLs {
+		if strings.TrimSpace(u) == "" {
+			continue
+		}
+		if !m.srcBrk.allow(u) {
+			debugLog("breaker: skipping %s (%d rest refreshes left)", u, m.srcBrk.restLeft(u))
+			continue
+		}
+		allowed = append(allowed, u)
+	}
+	if len(allowed) == 0 {
+		debugLog("breaker: all sources resting, keeping old configs")
+		return
+	}
+	pool, failed := fetchMergedReport(allowed)
+	for _, u := range allowed {
+		m.srcBrk.note(u, !failed[u])
+	}
 	if len(pool) == 0 {
 		warnLog("refresh got 0 configs from all sources, keeping old")
 		return
@@ -490,6 +560,9 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, probeWorkers)
 	for i, inst := range insts {
+		// Captured BEFORE the swap: reconcile needs the pre-refresh active
+		// to tell "remote list rotated" apart from "proxy died".
+		prevActive := inst.ActiveConfig()
 		configs := make([]ProxyConfig, len(pool))
 		copy(configs, pool)
 		shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
@@ -514,7 +587,7 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		// point at a different proxy), rotate it away if it vanished, and
 		// opportunistically replace it if it got slow — all strictly bounded
 		// so a healthy fast instance costs nothing here.
-		m.reconcileActive(i, inst)
+		m.reconcileActive(i, inst, prevActive)
 	}
 	wg.Wait()
 }
@@ -543,16 +616,32 @@ func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
 
 // reconcileActive re-anchors an ok instance after a refresh swapped its pool
 // (UpdateConfigs already re-anchored the index by key; this handles the rest).
-// Vanished active -> switch now. Slow active (>rotateSlowLatency) -> probe a
-// few fresh candidates on a THROWAWAY port (serving is never interrupted) and
-// rotate only to one proven >=30% faster. Fast present active -> untouched.
-func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector) {
+// Vanished-but-healthy active -> retained (see below). Vanished-and-failing
+// active -> switch now. Slow active (>rotateSlowLatency) -> probe a few fresh
+// candidates on a THROWAWAY port (serving is never interrupted) and rotate
+// only to one proven >=30% faster. Fast present active -> untouched.
+func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyConfig) {
 	active := inst.ActiveConfig()
 	present := active != nil &&
 		slices.ContainsFunc(inst.snapshotConfigs(), func(c ProxyConfig) bool {
 			return c.Key() == active.Key()
 		})
 	if !present {
+		// Vanished but never failed: the remote list ROTATED, the proxy did
+		// not die — keep serving it (re-inserted at the pool head) instead
+		// of forcing a full switch. A truly dead proxy is evicted by the
+		// next health tick (bounded staleness <= 1 interval); a forced
+		// switch on every rotation is certain churn (production: endless
+		// vanish -> rotate -> switch-fail with streaks pinned at 0, which
+		// also flapped the API's fastest and churned the VPN pin). Skipped
+		// when a peer already owns the key (no duplicate serving).
+		if prev != nil && inst.FailCount() == 0 {
+			if _, dup := m.buildExcluding(i)[prev.Key()]; !dup {
+				inst.RetainActive(*prev)
+				debugLog("Instance %d: active %s missing from refresh but healthy, retained", i, shortName(prev.Name))
+				return
+			}
+		}
 		warnLog("Instance %d: active config vanished from pool, rotating...", i)
 		m.markDown(i, "active config vanished from pool")
 		used := m.buildExcluding(i)

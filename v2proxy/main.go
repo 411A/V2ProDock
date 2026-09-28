@@ -43,21 +43,13 @@ func main() {
 	if v := os.Getenv("XRAY_DIR"); v != "" {
 		xrayDir = v
 	}
-	if v := os.Getenv("PORT_BASE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			portBase = n
-		}
-	}
+	portBase = portOrDefault("PORT_BASE", portBase)
 	if v := os.Getenv("PROXY_INSTANCES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			instanceCount = n
 		}
 	}
-	if v := os.Getenv("API_PORT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			apiPort = n
-		}
-	}
+	apiPort = portOrDefault("API_PORT", apiPort)
 	if v := os.Getenv("HEALTH_CHECK_URL"); v != "" && isPlainHTTP(v) {
 		warnLog("HEALTH_CHECK_URL %q uses plain HTTP: DPI RST-injects port-80 even through working tunnels (false downs + churn). Use an https:// generate_204 URL.", v)
 	}
@@ -89,7 +81,9 @@ func main() {
 			errLog("mkdir failed: %v", err)
 			os.Exit(1)
 		}
-		if err := os.WriteFile(filepath.Join(configDir, subscriptionFile), []byte(subURL), 0644); err != nil {
+		// 0600: subscription URLs often carry provider tokens, and configDir
+		// is usually a host-shared volume.
+		if err := os.WriteFile(filepath.Join(configDir, subscriptionFile), []byte(subURL), 0600); err != nil {
 			errLog("write subscription failed: %v", err)
 			os.Exit(1)
 		}

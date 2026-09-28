@@ -14,8 +14,9 @@
 # address) - flushing by $6 would be wrong; this script uses $5 only.
 # Never fails anything: every fallible step ends in `|| true`, exit 0.
 LOG=/var/log/ppp-pptp.log
-TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
-printf '%s [pptp-ip-down] iface=%s local=%s remote=%s\n' \
+# Same local timestamp + tag as the gateway logs (see pptp-ip-up.sh).
+TS="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)"
+printf '%s [v2prodock-vpn] [pptp-ip-down] iface=%s local=%s remote=%s\n' \
   "$TS" "${1:-?}" "${4:-?}" "${5:-?}" >> "$LOG" 2>/dev/null || true
 if [ -n "${5:-}" ] && command -v conntrack >/dev/null 2>&1; then
   conntrack -D -p gre -s "$5" >> "$LOG" 2>&1 || true

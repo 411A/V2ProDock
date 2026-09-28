@@ -185,5 +185,123 @@ grep -q 'MPPE-128' ../.env.example || grep -q 'MPPE' ../.env.example && ok ".env
 grep -q 'ipv4:' watchdog.sh && ok "hev ipv4 set" || bad "hev ipv4 missing"
 grep -q 'udp: udp' watchdog.sh && ok "hev udp enabled (DNS/legacy)" || bad "hev udp missing"
 
+# 7b. compose exposure + liveness (control plane must not face the LAN,
+# health must prove serving, not just process existence).
+grep -q '127.0.0.1:27018:27018' ../docker-compose.yml && ok "API published host-local only (/refresh is unauthenticated)" || bad "API must bind 127.0.0.1 (LAN-wide /refresh = self-DoS)"
+if grep -Eq '"27018:27018"' ../docker-compose.yml; then bad "bare 27018 publish exposes control plane to LAN"; else ok "no LAN-wide API publish"; fi
+grep -q '/health' ../docker-compose.yml && ok "compose healthcheck proves API liveness" || bad "healthcheck must curl /health, not kill -0"
+grep -q 'start_period' ../docker-compose.yml && ok "healthcheck start_period covers thin-pool populates" || bad "healthcheck needs start_period (populate grinds for minutes)"
+grep -q 'max-size' ../docker-compose.yml && ok "log rotation capped (disk-exhaustion safe)" || bad "compose logging needs max-size/max-file"
+grep -q 'xray version' ../Dockerfile && ok "v2prodock build smoke-tests the xray binary" || bad "Dockerfile must run xray version after download"
+grep -q -- '--retry' ../Dockerfile && ok "v2prodock download retries flaky builds" || bad "xray download needs --retry"
+grep -q -- '--tries=3' Dockerfile && grep -q -- '--retry' Dockerfile && ok "vpn-gateway downloads retry" || bad "poptop/hev downloads need retry flags"
+
+# 7c. log consistency: every line timestamped + tagged, levels uniform.
+# (An untagged line in docker logs is indistinguishable noise.)
+grep -q '^warn() ' watchdog.sh entrypoint.sh && ok "warn() with [WARN] tag in both scripts" || bad "warn() missing (warnings must carry the [WARN] tag)"
+if grep -q 'log "WARN' entrypoint.sh watchdog.sh; then bad "WARN: smuggled inside info-level log() (use warn())"; else ok "no WARN: inside info log()"; fi
+grep -q 'set -o pipefail' entrypoint.sh && ok "entrypoint pipefail set" || bad "entrypoint needs set -o pipefail like watchdog"
+grep -q 'trap .rm -f /tmp/eap-secrets.conf' entrypoint.sh && ok "secret temp files trapped for die-paths" || bad "EAP/PSK temp files must be EXIT-trapped (failed boots leak creds in /tmp)"
+grep -q 'chmod 600 "\$SWANCTL_CONF"' entrypoint.sh && ok "swanctl.conf 0600 (holds PSK+EAP secrets)" || bad "swanctl.conf must be chmod 600 after render"
+grep -q 'render_ms_dns' entrypoint.sh && ok "all VPN_DNS servers rendered (no silent 3rd+ drop)" || bad "ms-dns must loop the full DNS list"
+grep -q '^log "Wrote \$OUT' gen-mobileconfig.sh && ok "mobileconfig success line timestamped+tagged" || bad "gen-mobileconfig must log through log(), not bare echo"
+if grep -Eq '^echo "Wrote ' gen-mobileconfig.sh; then bad "bare echo in gen-mobileconfig (log line without timestamp)"; else ok "no bare echo in gen-mobileconfig"; fi
+grep -q "case \"\$POLL_SECS\"" watchdog.sh && ok "POLL_SECS validated (garbage must not CrashLoop the watchdog)" || bad "POLL_SECS needs a numeric guard"
+grep -q 'local ts verified err' watchdog.sh && ok "write_status uses locals (no global leakage)" || bad "write_status must declare locals"
+grep -q "%Y-%m-%d %H:%M:%S" pptp-ip-up.sh && grep -q "%Y-%m-%d %H:%M:%S" pptp-ip-down.sh \
+  && grep -q 'v2prodock-vpn' pptp-ip-up.sh && grep -q 'v2prodock-vpn' pptp-ip-down.sh \
+  && ok "ppp hooks share gateway timestamp+tag (single timeline)" || bad "ppp hooks must use the gateway timestamp format and tag"
+if grep -q 'date -u' pptp-ip-up.sh pptp-ip-down.sh; then bad "ppp hooks on UTC while gateway is local (split timelines)"; else ok "no UTC/local timestamp split in hooks"; fi
+
+# 7b. failure classification + sticky pinning (static)
+grep -q 'set -o pipefail' watchdog.sh && ok "pipefail set (curl|tr must not mask failures)" || bad "watchdog.sh needs set -o pipefail (else tun timeouts misreport as empty)"
+grep -q 'api_snapshot' watchdog.sh && ok "single API snapshot per poll" || bad "api_snapshot missing (one fetch per poll)"
+grep -q 'api_current_alive' watchdog.sh && ok "sticky-pin liveness check present" || bad "api_current_alive missing (fastest-flap causes re-pin churn)"
+
+# 8. Behavioral mocks: run the REAL extracted functions with a stubbed curl
+# and a file:// API snapshot (bash required: only it and the image's busybox
+# ash support set -o pipefail among the shells here).
+if command -v bash >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  _bw="$(mktemp -d)"
+  for _fn in verify_egress api_snapshot api_fastest api_current_alive api_name_for_port; do
+    sed -n "/^${_fn}() {/,/^}/p" watchdog.sh >> "$_bw/fns.sh"
+  done
+  if [ -s "$_bw/fns.sh" ]; then ok "extracted live functions for mock run"; else bad "function extraction failed"; fi
+  # Mock curl: socks leg and tun leg behave per env (ip|empty|fail).
+  # file:// URLs pass through to the real curl (API snapshot tests).
+  _realcurl="$(command -v curl)"
+  cat > "$_bw/curl" <<EOF
+#!/bin/sh
+for a in "\$@"; do case "\$a" in file://*) exec "$_realcurl" "\$@" ;; esac; done
+leg=""
+for a in "\$@"; do
+  case "\$a" in --socks5-hostname) leg="socks" ;; --interface) leg="tun" ;; esac
+done
+case "\$leg" in
+  socks) mode="\$CURL_SOCKS" ;;
+  tun) mode="\$CURL_TUN" ;;
+  *) mode="fail" ;;
+esac
+case "\$mode" in
+  ip) echo '9.9.9.9'; exit 0 ;;
+  empty) exit 0 ;;
+  fail|*) exit 28 ;;
+esac
+EOF
+  chmod +x "$_bw/curl"
+  cat > "$_bw/run.sh" <<'EOF'
+# Sourced, never executed: stubs + the real extracted functions.
+set -o pipefail
+ts() { printf 'TS'; }
+log() { echo "LOG $*"; }
+warn() { echo "WARN $*" >&2; }
+# shellcheck disable=SC1090
+. "$FNS"
+EOF
+  _run() { PATH="$_bw:/usr/bin:/bin" FNS="$_bw/fns.sh" TUN_DEV=tun0 EGRESS_URL=http://example.invalid bash -c ". \"$_bw/run.sh\"; $1"; }
+  # 8a. tun leg TIMES OUT (curl rc=28, silent): must say "no response", never "empty".
+  _out="$(_run 'CURL_SOCKS=ip CURL_TUN=fail verify_egress "v2prodock:27028" loud 2>&1; echo "rc=$?"' )"
+  case "$_out" in *"tun gave no response"*rc=3*) ok "tun timeout classified as no-response (pipefail works)" ;;
+    *) bad "tun timeout misclassified: $_out" ;; esac
+  # 8b. tun leg returns HTTP 200 with EMPTY body: the genuine "empty" case still works.
+  _out="$(_run 'CURL_SOCKS=ip CURL_TUN=empty verify_egress "v2prodock:27028" loud 2>&1; echo "rc=$?"')"
+  case "$_out" in *"empty tun response"*rc=3*) ok "true empty tun body still reported as empty" ;;
+    *) bad "empty-body branch broken: $_out" ;; esac
+  # 8c. both legs agree on an IP: proven, IP on stdout.
+  _out="$(_run 'CURL_SOCKS=ip CURL_TUN=ip verify_egress "v2prodock:27028" loud 2>&1; echo "rc=$?"')"
+  case "$_out" in *"9.9.9.9"*rc=0*) ok "matching legs prove egress" ;;
+    *) bad "proof path broken: $_out" ;; esac
+  # 8d. socks leg itself down: rc 1, distinct message.
+  _out="$(_run 'CURL_SOCKS=fail CURL_TUN=ip verify_egress "v2prodock:27028" loud 2>&1; echo "rc=$?"')"
+  case "$_out" in *"SOCKS itself down"*rc=1*) ok "dead socks leg classified as socks-down" ;;
+    *) bad "socks-down branch broken: $_out" ;; esac
+  # 8e. sticky pinning against a canned API snapshot (real curl, file://).
+  printf '%s' '[{"socks5":"0.0.0.0:27021","name":"Alpha"},{"socks5":"0.0.0.0:27024","name":"Beta"}]' > "$_bw/api.json"
+  _api() { PATH="/usr/bin:/bin" FNS="$_bw/fns.sh" V2PRODOCK_API="file://$_bw/api.json" API_SNAPSHOT="$_bw/snap.json" V2PRODOCK_SOCKS_HOST=v2prodock CURRENT_SOCKS="$2" bash -c ". \"$_bw/run.sh\"; $1"; }
+  _out="$(_api 'api_snapshot && api_fastest' '')"
+  [ "$_out" = "v2prodock:27021|Alpha" ] && ok "api_fastest parses snapshot" || bad "api_fastest wrong: $_out"
+  _api 'api_snapshot >/dev/null && api_current_alive' 'v2prodock:27024' \
+    && ok "current pin in alive set stays" || bad "api_current_alive missed a live pin"
+  _api 'api_snapshot >/dev/null && api_current_alive' 'v2prodock:27099' \
+    && bad "api_current_alive kept a dead pin" || ok "dead pin detected (re-pin allowed)"
+  _out="$(_api 'api_snapshot >/dev/null && api_name_for_port 27024' '')"
+  [ "$_out" = "Beta" ] && ok "sticky pin resolves its name" || bad "api_name_for_port wrong: $_out"
+  # 8f. ms-dns renderer (entrypoint): all servers land, 3rd+ included.
+  sed -n "/^render_ms_dns() {/,/^}/p" entrypoint.sh >> "$_bw/fns.sh"
+  cat > "$_bw/dns.sh" <<'EOF'
+set -o pipefail
+die() { echo "DIE $*" >&2; exit 1; }
+. "$FNS"
+render_ms_dns "$DNSLIST" "$OUT"
+cat "$OUT"
+EOF
+  _out="$(FNS="$_bw/fns.sh" DNSLIST="1.1.1.1,8.8.8.8,9.9.9.9" OUT="$_bw/ms.conf" bash "$_bw/dns.sh")"
+  [ "$_out" = "$(printf 'ms-dns 1.1.1.1\nms-dns 8.8.8.8\nms-dns 9.9.9.9')" ] \
+    && ok "all 3 DNS servers rendered (none dropped)" || bad "ms-dns render wrong: $_out"
+  rm -rf "$_bw"
+else
+  echo "[vpn-test][SKIP] behavioral mocks need bash+curl+jq"
+fi
+
 if [ "$fail" -ne 0 ]; then echo "[vpn-test] FAILED" >&2; exit 1; fi
 echo "[vpn-test] ALL PASS"

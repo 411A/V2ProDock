@@ -2,6 +2,14 @@
 # watchdog: pins tun0->SOCKS to the fastest ALIVE Xray config and proves
 # VPN egress == that config's egress. Never routes VPN direct.
 set -eu
+# pipefail is LOAD-BEARING here, not style: verify_egress classifies failures
+# via `curl ... | tr` pipelines, and without it a curl TIMEOUT exits 0 (tr
+# succeeds on empty input) — every tun stall then misreports as "empty tun
+# response" instead of "tun gave no response", sending diagnosis down a false
+# trail (proven with a mocked curl that times out: pre-pipefail the message
+# was "empty", post-pipefail it is "no response"). Supported by busybox ash.
+# shellcheck disable=SC3040
+set -o pipefail
 
 # Second-precision timestamps on every line (docker logs without
 # --timestamps shows nothing otherwise). Deliberately NO millisecond
@@ -46,6 +54,9 @@ PROOF_HEARTBEAT_N="${PROOF_HEARTBEAT_N:-20}"
 # A 0/garbage heartbeat would divide by zero under set -eu and kill the
 # gateway; degrade to the default instead.
 case "$PROOF_HEARTBEAT_N" in ''|*[!0-9]*|0) PROOF_HEARTBEAT_N=20 ;; esac
+# Same for the poll interval: a non-numeric POLL_SECS fails sleep(1), and
+# under set -eu that exits the watchdog into a container CrashLoop. Clamp.
+case "$POLL_SECS" in ''|*[!0-9]*|0) POLL_SECS=15 ;; esac
 
 cleanup() {
   log "Shutting down tunnel + VPN daemons..."
@@ -60,6 +71,7 @@ trap cleanup TERM INT
 
 write_status() {
   # $1 upstream_socks $2 upstream_name $3 egress_ip $4 verified(true/false) $5 error
+  local ts verified err name_clean err_clean _plain _pptp
   mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
   verified="$4"; err="$5"
@@ -75,15 +87,44 @@ write_status() {
     && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
 }
 
+# One API fetch per poll; api_fastest + api_current_alive both parse the
+# snapshot (two curls per poll would double localhost traffic and could
+# observe two different pool states mid-churn).
+API_SNAPSHOT="${API_SNAPSHOT:-/tmp/vpn-api.json}"
+api_snapshot() {
+  curl -fsS --max-time 8 "$V2PRODOCK_API" > "$API_SNAPSHOT.tmp" 2>/dev/null \
+    && mv -f "$API_SNAPSHOT.tmp" "$API_SNAPSHOT" 2>/dev/null || return 1
+}
+
 # Prints "host:port|name" for fastest alive proxy, or fails.
 api_fastest() {
-  body="$(curl -fsS --max-time 8 "$V2PRODOCK_API" 2>/dev/null)" || return 1
-  socks_raw="$(printf '%s' "$body" | jq -r '.[0].socks5 // empty' 2>/dev/null)" || return 1
-  name="$(printf '%s' "$body" | jq -r '.[0].name // "unknown"' 2>/dev/null)"
+  [ -f "$API_SNAPSHOT" ] || return 1
+  socks_raw="$(jq -r '.[0].socks5 // empty' "$API_SNAPSHOT" 2>/dev/null)" || return 1
+  name="$(jq -r '.[0].name // "unknown"' "$API_SNAPSHOT" 2>/dev/null)"
   [ -n "$socks_raw" ] && [ "$socks_raw" != "null" ] || return 1
   port="${socks_raw##*:}"
   case "$port" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s:%s|%s' "$V2PRODOCK_SOCKS_HOST" "$port" "$name"
+}
+
+# True when the currently pinned port is still in the alive set. The API is
+# latency-sorted, so plain fastest-following restarts hev + rebuilds tun +
+# re-proves on every flap (production: 8 re-pins in 18min while old pins were
+# still alive). Sticky pins trade theoretical-best latency for a tunnel that
+# stays up; the quiet periodic proof still catches a silently dead pin.
+api_current_alive() {
+  [ -n "${CURRENT_SOCKS:-}" ] || return 1
+  [ -f "$API_SNAPSHOT" ] || return 1
+  cur_port="${CURRENT_SOCKS##*:}"
+  case "$cur_port" in ''|*[!0-9]*) return 1 ;; esac
+  jq -e --arg p "$cur_port" 'map(.socks5 // "") | any(endswith(":" + $p))' "$API_SNAPSHOT" >/dev/null 2>&1
+}
+
+# Name of one alive port for status reporting under a sticky pin.
+api_name_for_port() {
+  # $1 port
+  n="$(jq -r --arg p "$1" 'map(select((.socks5 // "") | endswith(":" + $p)))[0].name // empty' "$API_SNAPSHOT" 2>/dev/null)"
+  [ -n "$n" ] && printf '%s' "$n" || printf 'unknown'
 }
 
 render_hev() {
@@ -218,7 +259,7 @@ log "Waiting for alive Xray proxy at $V2PRODOCK_API ..."
 tries=0
 fastest=""
 while [ "$tries" -lt 60 ]; do
-  if fastest="$(api_fastest)"; then break; fi
+  if api_snapshot && fastest="$(api_fastest)"; then break; fi
   tries=$((tries + 1)); sleep 5
 done
 [ -n "$fastest" ] || { write_status "" "" "" false "no alive proxy from $V2PRODOCK_API after 5min"; exit 1; }
@@ -270,7 +311,7 @@ while true; do
   sleep "$POLL_SECS"
   ensure_ipsec || exit 1
   ensure_pptpd
-  if ! fastest="$(api_fastest)"; then
+  if ! api_snapshot || ! fastest="$(api_fastest)"; then
     API_FAILS=$((API_FAILS + 1))
     if [ "$API_FAILS" -eq 1 ]; then
       warn "API has no alive proxy; keeping last pin $CURRENT_SOCKS (fail-closed, no direct fallback)."
@@ -282,6 +323,12 @@ while true; do
   fi
   API_FAILS=0
   socks="${fastest%%|*}"; pname="${fastest#*|}"
+  if [ "$socks" != "$CURRENT_SOCKS" ] && api_current_alive; then
+    # Sticky pin: fastest flapped but our upstream still serves — verify and
+    # report the CURRENT pin below, never the fastest.
+    socks="$CURRENT_SOCKS"
+    pname="$(api_name_for_port "${socks##*:}")"
+  fi
   if [ "$socks" != "$CURRENT_SOCKS" ]; then
     log "Upstream changed $CURRENT_SOCKS -> $socks ($pname), re-pinning..."
     PROOF_FAILS=0

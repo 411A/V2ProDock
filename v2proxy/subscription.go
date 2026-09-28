@@ -189,7 +189,12 @@ func FetchAnySubscription(urls []string) ([]ProxyConfig, string, error) {
 	return nil, "", fmt.Errorf("all %d subscription URLs failed: %s", len(errs), strings.Join(errs, " | "))
 }
 
-func FetchMergedSubscriptions(urls []string) []ProxyConfig {
+// fetchMergedReport fetches every URL in parallel exactly like
+// FetchMergedSubscriptions (same logs, same merge) and additionally reports
+// which sources failed (fetch error or 0 configs), so the refresh loop can
+// circuit-break dead sources instead of paying full retry budgets forever.
+func fetchMergedReport(urls []string) (merged []ProxyConfig, failed map[string]bool) {
+	failed = make(map[string]bool, len(urls))
 	clean := make([]string, 0, len(urls))
 	for _, u := range urls {
 		u = strings.TrimSpace(u)
@@ -198,32 +203,39 @@ func FetchMergedSubscriptions(urls []string) []ProxyConfig {
 		}
 	}
 	if len(clean) == 0 {
-		return nil
+		return nil, failed
 	}
 	if len(clean) == 1 {
 		cfgs, err := FetchSubscription(clean[0])
 		if err != nil {
 			warnLog("subscription fetch failed: %v", err)
-			return nil
+			failed[clean[0]] = true
+			return nil, failed
 		}
 		if len(cfgs) == 0 {
 			warnLog("subscription %s returned 0 proxies", clean[0])
-			return nil
+			failed[clean[0]] = true
+			return nil, failed
 		}
-		return cfgs
+		return cfgs, failed
 	}
 	var mu sync.Mutex
-	var merged []ProxyConfig
 	var wg sync.WaitGroup
 	for _, u := range clean {
 		wg.Go(func() {
 			cfgs, err := FetchSubscription(u)
 			if err != nil {
 				warnLog("subscription %s failed (%v), using other sources", u, err)
+				mu.Lock()
+				failed[u] = true
+				mu.Unlock()
 				return
 			}
 			if len(cfgs) == 0 {
 				warnLog("subscription %s returned 0 proxies, using other sources", u)
+				mu.Lock()
+				failed[u] = true
+				mu.Unlock()
 				return
 			}
 			mu.Lock()
@@ -235,9 +247,14 @@ func FetchMergedSubscriptions(urls []string) []ProxyConfig {
 	wg.Wait()
 	if len(merged) == 0 {
 		warnLog("all %d subscription URLs failed, keeping existing configs", len(clean))
-		return nil
+		return nil, failed
 	}
-	return dedupConfigs(merged)
+	return dedupConfigs(merged), failed
+}
+
+func FetchMergedSubscriptions(urls []string) []ProxyConfig {
+	merged, _ := fetchMergedReport(urls)
+	return merged
 }
 
 func decodeBase64Content(s string) string {

@@ -108,6 +108,23 @@ func aggregatePort(envKey string, def int) int {
 	return n
 }
 
+// portOrDefault parses a TCP port env with fail-safe fallback: garbage,
+// negatives and out-of-range values degrade to the default with a loud
+// warning instead of binding surprises (PORT_BASE=0 scans upward from 0 and
+// can squat a privileged port as root; API_PORT junk breaks /health checks).
+func portOrDefault(envKey string, def int) int {
+	v := strings.TrimSpace(os.Getenv(envKey))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 65535 {
+		warnLog("%s=%q invalid, using default %d", envKey, v, def)
+		return def
+	}
+	return n
+}
+
 // pickAggregatePorts chooses collision-free stable ports. A candidate that is
 // taken (API port, instance SOCKS/HTTP, or bind-busy) scans upward until free.
 // 0 in / 0 out disables that protocol. Candidates below 1024 are skipped

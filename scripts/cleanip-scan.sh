@@ -26,19 +26,28 @@
 # Deps: bash, curl, timeout (coreutils), openssl, awk. python3 enables layer 2
 # (soft — skipped with a notice when absent). No root, no traffic beyond short
 # TCP/TLS handshakes plus 3 tiny HTTPS fetches (DoH x2, ips-v4 x1).
-set -u
+set -uo pipefail
 
-SNI="${1:-}"; PORT="${2:-443}"
-FOR=""; VIA=""; SAMPLES=6
+# Flags first, positionals after: the old order took $1 verbatim, so
+# `./scan.sh --via PROXY host` silently scanned SNI "--via".
+FOR=""; VIA=""; SAMPLES=6; POS=()
 while [[ $# -gt 0 ]]; do case "$1" in
   --for) FOR="${2:-}"; shift 2;;
   --via) VIA="${2:-}"; shift 2;;
   --samples) SAMPLES="${2:-6}"; shift 2;;
-  *) shift;;
+  --) shift; while [[ $# -gt 0 ]]; do POS+=("$1"); shift; done;;
+  -*) echo "unknown flag: $1" >&2; exit 2;;
+  *) POS+=("$1"); shift;;
 esac done
+SNI="${POS[0]:-}"; PORT="${POS[1]:-443}"
 [[ -z "$SNI" ]] && { echo "usage: $0 <sni-host> [port] [--for H] [--via PROXY] [--samples N]"; exit 2; }
 [[ -z "$FOR" ]] && FOR="$SNI"
+# Garbage numerics must degrade to defaults, never to cryptic tool errors
+# (timeout/python/xargs fail confusingly on non-numbers).
+num_or() { [[ "${!1:-}" =~ ^[0-9]+$ ]] && [[ "${!1}" -gt 0 ]] || printf -v "$1" '%s' "$2"; }
 TCP_TIMEOUT="${TCP_TIMEOUT:-3}"; PROBE_JOBS="${PROBE_JOBS:-12}"; MAXCANDS="${MAXCANDS:-220}"
+num_or TCP_TIMEOUT 3; num_or PROBE_JOBS 12; num_or MAXCANDS 220
+num_or SAMPLES 6; num_or PORT 443
 
 # get <url> [curl-args...]: direct first, --via proxy when direct is blocked.
 get() {
@@ -146,5 +155,5 @@ echo "Top clean IPs for SNI=$SNI:"
 printf '  %s\n' "${WINNERS[@]:0:3}"
 BEST=${WINNERS[0]##* }
 echo
-echo "Paste into ~/V2ProDock/.env, then: docker compose up -d --build v2proxy"
+echo "Paste into ~/V2ProDock/.env, then: docker compose up -d --build v2prodock"
 echo "  CLEAN_IP_MAP=\"$FOR=$BEST\""

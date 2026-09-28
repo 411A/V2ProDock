@@ -10,7 +10,12 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "27000-27100:27000-27100"   # Dynamic proxy ports (SOCKS5 + HTTP)
-      - "27018:27018"               # API
+      # API bound to host loopback ONLY: /proxies+/health serve LAN clients
+      # fine over the data ports, but /refresh is an unauthenticated
+      # state-changing endpoint (refresh storm = self-DoS) that must never
+      # face the LAN. Host-side users (README curl, install.sh, Hermes) use
+      # localhost; the vpn sidecar reaches it over the internal network.
+      - "127.0.0.1:27018:27018"     # API (host-local)
     volumes:
       - ./config:/root/config
     environment:
@@ -33,11 +38,16 @@ services:
       - MAX_CONNS=${MAX_CONNS:-128}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NO_PROXY=127.0.0.1,localhost,host.docker.internal,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+    # Real liveness: a wedged Go process still passes `kill -0 1` but serves
+    # nothing. /health answers 200 from boot (degraded while populating),
+    # so this only fails when the API itself is dead. start_period covers
+    # thin-pool populates that grind for minutes before anything is alive.
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1 2>/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${API_PORT:-27018}/health >/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 180s
     deploy:
       resources:
         limits:

@@ -189,6 +189,15 @@ curl http://localhost:27018/vpn
 docker logs -f v2prodock-vpn   # look for: VPN egress VERIFIED via <name>: <ip>
 ```
 
+Steady-state log policy (both services): healthy polls are silent — a line
+means a transition. `VERIFIED` appears only when the proven upstream changes
+or recovers; failures log once on transition plus a heartbeat every 20th poll
+(`PROOF_HEARTBEAT_N`). The pin is sticky: the gateway keeps its upstream while
+it stays alive instead of chasing every fastest-alive flap, so `Upstream
+changed ... re-pinning` is rare by design. A dead subscription source rests
+automatically after 3 failed refreshes (`breaker: ... resting it ...`) and is
+probed again later — no action needed.
+
 ### Device quick setup
 
 | Device | Protocol | Settings | Notes |
@@ -352,7 +361,11 @@ sudo bash install.sh uninstall # Remove everything
 4. Each instance: starts xray, tests configs, keeps the first working one
 5. Health checks run every 60s per instance — 3 strikes switch to next config, except: proxies actively serving client traffic are never killed by probe blips (real bytes outrank synthetic probes), and 429/403 from the probe target itself is inconclusive (target throttling you, not a dead tunnel)
 6. API returns alive proxies sorted by latency — dead ones excluded
-7. Subscriptions re-fetched every 120s for updated server lists
+7. Subscriptions re-fetched every 120s for updated server lists. A refresh
+   never kills a healthy tunnel: an active missing from the new list is
+   retained (rotating remote lists evict by key, not by death) and only a
+   failing one is rotated; a source that fails 3 refreshes in a row rests
+   for 5 cycles instead of burning retry budgets every time
 
 ## Under Hard Censorship
 
@@ -364,7 +377,7 @@ Three layers, three answers (see `AGENT.md` for the full roadmap):
    IP is dead. From the VM on the censored network, run
    `./scripts/cleanip-scan.sh <sni-host> 443`, paste the suggested
    `CLEAN_IP_MAP="blocked.edge=working.ip"` into `.env`, and
-   `docker compose up -d --build v2proxy`. The daemon swaps only the dial
+    `docker compose up -d --build v2prodock`. The daemon swaps only the dial
    address at ingest — SNI, Host header and credentials untouched.
    Candidates come from live sources, not a fixed list: DoH answers for
    your SNI plus fresh random samples from Cloudflare's official ranges
@@ -408,15 +421,25 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
+| `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |
+| `NO_COLOR` / `LOG_COLOR` | unset | Set either to disable log colors (auto-off without a TTY) |
 | `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |
 | `VPN_DOMAIN` | `vpn.local` | Hostname/IP clients connect to (server cert SAN) |
+| `VPN_EXTRA_SANS` | — | Extra SANs (public + LAN IPs), comma-separated |
 | `VPN_SUBNET` | `10.10.10.0/24` | IKEv2 client pool (forwarded to tun0 only) |
 | `VPN_L2TP_NET` | `10.10.11.0/24` | L2TP client pool (forwarded to tun0 only) |
+| `VPN_L2TP_LOCAL` / `VPN_L2TP_RANGE` | `10.10.11.1` / `10.10.11.10-10.10.11.100` | L2TP server address + client range (must sit inside the /24) |
+| `VPN_ALLOW_PLAIN_L2TP` | `0` | `1` = allow bare L2TP without IPsec (CLEARTEXT — old firmware only) |
 | `VPN_ENABLE_PPTP` | `0` | `1` = serve PPTP on TCP 1723+GRE (ancient LAN devices only, MPPE-128 mandatory) |
 | `VPN_PPTP_NET` | `10.10.12.0/24` | PPTP client pool (forwarded to tun0 only) |
-| `VPN_DNS` | `1.1.1.1,8.8.8.8` | DNS pushed to clients (also via proxy) |
+| `VPN_PPTP_LOCAL` / `VPN_PPTP_RANGE` | `10.10.12.1` / `10.10.12.10-10.10.12.100` | PPTP server address + client range (must sit inside the /24) |
+| `VPN_DNS` | `1.1.1.1,8.8.8.8` | DNS pushed to clients, all servers used (also via proxy) |
 | `VPN_USER` / `VPN_PASSWORD` | — | EAP-MSCHAPv2 + PPP creds (or `VPN_USERS=u1:p1,u2:p2`) |
 | `VPN_IPSEC_PSK` | — | IPsec pre-shared key for L2TP clients |
+| `VPN_TUN_DEV` / `VPN_TUN_ADDR` | `tun0` / `198.18.0.1` | Gateway tunnel device + address (TUN_MTU stays 1500) |
+| `POLL_SECS` | `15` | Gateway poll interval (garbage degrades to 15, never CrashLoops) |
+| `PROOF_HEARTBEAT_N` | `20` | Log every Nth consecutive proof failure while down (1st always logs) |
+| `EGRESS_URL` | `https://api.ipify.org` | IP-echo URL the gateway proves its egress against |
 
 ### Subscription URL
 

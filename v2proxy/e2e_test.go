@@ -219,14 +219,17 @@ func TestReconcileVanishedActiveRotates(t *testing.T) {
 	if before <= 0 {
 		t.Fatal("no managed child after start")
 	}
-	// Refresh drops A entirely: reconcile must switch to B and serve it.
+	// Refresh drops A entirely while A is actually failing: reconcile must
+	// switch to B and serve it.
+	prev := s.ActiveConfig()
+	s.failCount = healthFailThreshold // poison: A is dying, not just rotated away
 	s.UpdateConfigs([]ProxyConfig{e2eCand("B", "e2e-b:1", "good")})
 	m := &ProxyManager{
 		instances: []*ProxySelector{s},
 		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
 		xrayDir:   dir,
 	}
-	m.reconcileActive(0, s)
+	m.reconcileActive(0, s, prev)
 	got := s.ActiveConfig()
 	if got == nil || got.Key() != "e2e-b:1" {
 		t.Fatalf("expected rotation to e2e-b:1, got %+v", got)
@@ -236,6 +239,42 @@ func TestReconcileVanishedActiveRotates(t *testing.T) {
 	}
 	if n := stubCount(dir); n != 1 {
 		t.Fatalf("expected exactly 1 stub xray after rotation, found %d", n)
+	}
+}
+
+func TestReconcileVanishedHealthyActiveRetained(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good")})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatal(err)
+	}
+	before := s.currentPID()
+	if before <= 0 {
+		t.Fatal("no managed child after start")
+	}
+	// Refresh drops A while A is healthy: keep serving A, same child, no
+	// switch (the production churn was rotating these every refresh).
+	prev := s.ActiveConfig()
+	s.UpdateConfigs([]ProxyConfig{e2eCand("B", "e2e-b:1", "good")})
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
+		xrayDir:   dir,
+	}
+	m.reconcileActive(0, s, prev)
+	got := s.ActiveConfig()
+	if got == nil || got.Key() != "e2e-a:1" {
+		t.Fatalf("expected healthy active e2e-a:1 retained, got %+v", got)
+	}
+	if s.currentPID() != before {
+		t.Fatal("retained active must not restart xray")
+	}
+	if n := stubCount(dir); n != 1 {
+		t.Fatalf("expected exactly 1 stub xray after retain, found %d", n)
 	}
 }
 
@@ -256,7 +295,7 @@ func TestReconcileFastActiveUntouched(t *testing.T) {
 		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
 		xrayDir:   dir,
 	}
-	m.reconcileActive(0, s) // same pool: must cost zero disruption
+	m.reconcileActive(0, s, s.ActiveConfig()) // same pool: must cost zero disruption
 	if s.currentPID() != before {
 		t.Fatal("fast present active must not be restarted by refresh")
 	}

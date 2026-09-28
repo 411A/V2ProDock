@@ -27,7 +27,7 @@ RUN apk --no-cache add \
        /etc/swanctl/private /var/log /config/vpn /etc/pptpd /etc/ppp \
     && apk add --no-cache --virtual .pptpd-build build-base bsd-compat-headers wget \
     && cd /tmp \
-    && wget -q "https://sourceforge.net/projects/poptop/files/pptpd/pptpd-1.4.0/pptpd-1.4.0.tar.gz/download" -O pptpd.tar.gz \
+    && wget -q --tries=3 --timeout=30 "https://sourceforge.net/projects/poptop/files/pptpd/pptpd-1.4.0/pptpd-1.4.0.tar.gz/download" -O pptpd.tar.gz \
     && tar -xzf pptpd.tar.gz \
     && cd pptpd-1.4.0 \
     && ./configure \
@@ -46,8 +46,8 @@ RUN apk --no-cache add \
          *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
        esac && \
        HEV_VER="2.17.1" && \
-       curl -fSL "https://github.com/heiher/hev-socks5-tunnel/releases/download/${HEV_VER}/hev-socks5-tunnel-${HEV_ARCH}" \
-         -o /usr/local/bin/hev-socks5-tunnel && \
+        curl -fSL --retry 3 --retry-delay 2 --max-time 120 "https://github.com/heiher/hev-socks5-tunnel/releases/download/${HEV_VER}/hev-socks5-tunnel-${HEV_ARCH}" \
+          -o /usr/local/bin/hev-socks5-tunnel && \
        chmod +x /usr/local/bin/hev-socks5-tunnel && \
        test -s /usr/local/bin/hev-socks5-tunnel && \
        /usr/local/bin/hev-socks5-tunnel > /tmp/hev-probe.log 2>&1 || test $? -eq 255 && \

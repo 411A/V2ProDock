@@ -42,6 +42,13 @@ type ProxySelector struct {
 	// tempSeq makes throwaway config filenames unique even if the kernel
 	// ever hands two workers the same ephemeral port number.
 	tempSeq atomic.Uint64
+	// tempPIDs tracks in-flight throwaway-probe xray PIDs so the orphan
+	// watchdog never murders a live probe: a probe matches the orphan
+	// cmdline pattern (config-rot-*.json) but owns no serving handle, so an
+	// unguarded prune kills it mid-search and manufactures "no working
+	// config found" out of a pool that has working proxies.
+	tempPIDsMu sync.Mutex
+	tempPIDs   map[int]bool
 }
 
 func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
@@ -74,6 +81,31 @@ func (s *ProxySelector) LastLatency() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastLatency
+}
+
+// FailCount reports consecutive health failures on the current upstream (0 =
+// never failed it). Used by refresh to tell "remote list rotated" apart from
+// "proxy actually dying".
+func (s *ProxySelector) FailCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failCount
+}
+
+// RetainActive re-inserts cfg at the pool head when a refresh dropped a
+// still-healthy upstream (rotating remote lists evict by key, not by death).
+// If the key is somehow present already, it just re-anchors to it.
+func (s *ProxySelector) RetainActive(cfg ProxyConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.configs {
+		if s.configs[i].Key() == cfg.Key() {
+			s.activeIndex = i
+			return
+		}
+	}
+	s.configs = append([]ProxyConfig{cfg}, s.configs...)
+	s.activeIndex = 0
 }
 
 func (s *ProxySelector) UpdateConfigs(configs []ProxyConfig) {
@@ -558,10 +590,18 @@ func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
 		_ = os.Remove(cfgPath)
 		return HealthResult{Error: err}
 	}
+	// Registered BEFORE releasing tempMu: the watchdog prune runs on its own
+	// tick and would otherwise see a live probe with no serving handle.
+	if cmd.Process != nil {
+		s.trackTemp(cmd.Process.Pid)
+	}
 	open := waitForPort(port, switchPortWait)
 	s.tempMu.Unlock()
 	defer func() {
 		stopXrayCmdPort(cmd, port)
+		if cmd.Process != nil {
+			s.untrackTemp(cmd.Process.Pid)
+		}
 		_ = os.Remove(cfgPath)
 	}()
 
@@ -569,6 +609,35 @@ func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
 		return HealthResult{Error: fmt.Errorf("temp xray port never opened")}
 	}
 	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), s.testURL)
+}
+
+// trackTemp/untrackTemp/tempPIDSnapshot guard the in-flight throwaway-probe
+// set merged into the watchdog keep set (see managedPIDs).
+func (s *ProxySelector) trackTemp(pid int) {
+	s.tempPIDsMu.Lock()
+	defer s.tempPIDsMu.Unlock()
+	if s.tempPIDs == nil {
+		s.tempPIDs = make(map[int]bool)
+	}
+	if pid > 0 {
+		s.tempPIDs[pid] = true
+	}
+}
+
+func (s *ProxySelector) untrackTemp(pid int) {
+	s.tempPIDsMu.Lock()
+	defer s.tempPIDsMu.Unlock()
+	delete(s.tempPIDs, pid)
+}
+
+func (s *ProxySelector) tempPIDSnapshot() map[int]bool {
+	s.tempPIDsMu.Lock()
+	defer s.tempPIDsMu.Unlock()
+	out := make(map[int]bool, len(s.tempPIDs))
+	for pid := range s.tempPIDs {
+		out[pid] = true
+	}
+	return out
 }
 
 // renderXrayConfig writes the full xray config for one upstream. seq > 0
@@ -659,7 +728,9 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	}
 	cfgPath := filepath.Join(s.xrayDir, name)
 	cfgData, _ := json.Marshal(fullConfig)
-	if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
+	// 0600: rendered configs embed upstream UUIDs/passwords, and xrayDir is
+	// often a host-shared volume (./config) — never world-readable.
+	if err := os.WriteFile(cfgPath, cfgData, 0600); err != nil {
 		return "", err
 	}
 	return cfgPath, nil

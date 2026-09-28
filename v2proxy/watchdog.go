@@ -81,6 +81,19 @@ func listXrayPIDs(xrayDir string) map[int]bool {
 	return out
 }
 
+// orphanVictims is the pure victim-selection core of the prune: every found
+// PID absent from the keep set. Pure so the exemption logic stays
+// unit-testable without /proc.
+func orphanVictims(found, keep map[int]bool) []int {
+	victims := make([]int, 0)
+	for pid := range found {
+		if !keep[pid] {
+			victims = append(victims, pid)
+		}
+	}
+	return victims
+}
+
 // pruneOrphanXray group-kills matching xray processes absent from the live set.
 // Each victim is re-verified against a fresh live() snapshot just before the
 // kill so a concurrently spawned child is never harmed. Returns kill count.
@@ -89,20 +102,14 @@ func pruneOrphanXray(xrayDir string, live func() map[int]bool) int {
 	if len(found) == 0 {
 		return 0
 	}
-	keep := live()
-	victims := make([]int, 0)
-	for pid := range found {
-		if !keep[pid] {
-			victims = append(victims, pid)
-		}
-	}
+	victims := orphanVictims(found, live())
 	if len(victims) == 0 {
 		return 0
 	}
 	// Grace window: a child spawned after the scan assigns its handle under
 	// s.mu within milliseconds; re-check so it lands in the keep set.
 	time.Sleep(500 * time.Millisecond)
-	keep = live()
+	keep := live()
 	killed := 0
 	for _, pid := range victims {
 		if keep[pid] {
@@ -134,6 +141,11 @@ func (m *ProxyManager) managedPIDs() map[int]bool {
 	out := make(map[int]bool, len(insts))
 	for _, inst := range insts {
 		if pid := inst.currentPID(); pid > 0 {
+			out[pid] = true
+		}
+		// In-flight throwaway probes own no serving handle but are live
+		// managed children all the same — exempt them from the prune.
+		for pid := range inst.tempPIDSnapshot() {
 			out[pid] = true
 		}
 	}

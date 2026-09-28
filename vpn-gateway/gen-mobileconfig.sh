@@ -2,12 +2,21 @@
 # Generates /config/vpn/apple.mobileconfig so iOS/tvOS/macOS can install
 # the CA + IKEv2 EAP profile in one tap. Re-runnable.
 set -eu
+
+# Same timestamped tag as entrypoint/watchdog: this script's output is
+# pasted straight into `docker logs v2prodock-vpn`, where an untagged line
+# is indistinguishable noise.
+ts() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+log() { echo "$(ts) [v2prodock-vpn] $*"; }
+
 PERSIST_DIR="${PERSIST_DIR:-/config/vpn}"
 VPN_DOMAIN="${VPN_DOMAIN:-vpn.local}"
 VPN_USER_SHOW="${VPN_USER_SHOW:-${VPN_USER:-vpnuser}}"
 OUT="${OUT:-$PERSIST_DIR/apple.mobileconfig}"
 
-[ -f "$PERSIST_DIR/ca.crt" ] || { echo "CA not ready yet ($PERSIST_DIR/ca.crt missing)" >&2; exit 1; }
+[ -f "$PERSIST_DIR/ca.crt" ] || { echo "$(ts) [v2prodock-vpn][FATAL] CA not ready yet ($PERSIST_DIR/ca.crt missing)" >&2; exit 1; }
 # Portable base64 without line wraps: openssl handles both GNU/BSD.
 CA_B64="$(openssl base64 -A -in "$PERSIST_DIR/ca.crt")"
 UUID1="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo 11111111-1111-1111-1111-111111111111)"
@@ -62,4 +71,4 @@ cat > "$OUT" <<EOF
 </dict>
 </plist>
 EOF
-echo "Wrote $OUT (install on device, then enter VPN password at connect)."
+log "Wrote $OUT (install on device, then enter VPN password at connect)."

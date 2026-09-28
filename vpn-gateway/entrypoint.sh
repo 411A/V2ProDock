@@ -3,6 +3,11 @@
 # ONLY via working Xray configs (through tun0 -> SOCKS -> v2prodock).
 # Strict: fails fast on bad env, never falls back to direct egress.
 set -eu
+# pipefail: same load-bearing reason as watchdog.sh (a masked pipeline failure
+# misdiagnoses). All boot-time pipes here are second-command-dominated, so
+# this changes no current branch — it future-proofs the next one.
+# shellcheck disable=SC3040
+set -o pipefail
 
 # Second-precision timestamps (same policy as watchdog.sh; duplicated because
 # the two scripts run as independent processes).
@@ -10,7 +15,13 @@ ts() {
   date '+%Y-%m-%d %H:%M:%S'
 }
 log() { echo "$(ts) [v2prodock-vpn] $*"; }
+warn() { echo "$(ts) [v2prodock-vpn][WARN] $*" >&2; }
 die() { echo "$(ts) [v2prodock-vpn][FATAL] $*" >&2; exit 1; }
+
+# Secret hygiene: EAP/PSK temp files hold plaintext creds. The success path
+# removes them; this trap covers every die() exit so a failed boot never
+# leaves credentials in /tmp (same fs survives `docker restart`).
+trap 'rm -f /tmp/eap-secrets.conf /tmp/psk-secret.conf /tmp/swanctl.rendered' EXIT
 
 # VPN_ENABLED=0 lets existing proxy-only users keep `compose up` green.
 case "${VPN_ENABLED:-1}" in
@@ -190,7 +201,7 @@ if certs_ok; then
   log "Reusing persisted certs from $PERSIST_DIR"
 else
   if [ -f "$PERSIST_DIR/ca.crt" ]; then
-    log "WARN: existing CA unusable (missing CA:TRUE or bad chain) - regenerating all certs."
+    warn "existing CA unusable (missing CA:TRUE or bad chain) - regenerating all certs."
     mv -f "$PERSIST_DIR/ca.crt" "$PERSIST_DIR/ca.crt.bak" 2>/dev/null || true
   fi
   log "Generating CA + server cert for $VPN_DOMAIN (this happens once)..."
@@ -242,7 +253,7 @@ log "Certs installed into swanctl store."
 # Apple profile for legacy devices (best-effort, never fatal to VPN boot).
 if [ -x /gen-mobileconfig.sh ]; then
   OUT="$PERSIST_DIR/apple.mobileconfig" PERSIST_DIR="$PERSIST_DIR" VPN_DOMAIN="$VPN_DOMAIN" /gen-mobileconfig.sh 2>&1 || \
-    log "WARN: mobileconfig generation failed (VPN still boots)."
+    warn "mobileconfig generation failed (VPN still boots)."
 fi
 
 # ---- render swanctl.conf ----
@@ -278,6 +289,9 @@ awk '
   /# __IPSEC_PSK__/ { while ((getline l < "/tmp/psk-secret.conf") > 0) print l; next }
   { print }
 ' /tmp/swanctl.rendered > "$SWANCTL_CONF"
+# Holds the L2TP PSK + every EAP secret in cleartext: group/other must never
+# read it (the ./config volume is shared with the host).
+chmod 600 "$SWANCTL_CONF"
 grep -q "id = " "$SWANCTL_CONF" || die "swanctl render failed: no EAP users"
 grep -q "ike-l2tp" "$SWANCTL_CONF" || die "swanctl render failed: no L2TP PSK"
 rm -f /tmp/eap-secrets.conf /tmp/psk-secret.conf /tmp/swanctl.rendered
@@ -290,19 +304,32 @@ if [ "$cur_fwd" = "1" ]; then
 elif echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then
   log "ip_forward enabled."
 else
-  log "WARN: ip_forward=$cur_fwd and /proc is read-only here; ensure compose sysctls net.ipv4.ip_forward=1 is set. Continuing (charon/iptables still validated)."
+  warn "ip_forward=$cur_fwd and /proc is read-only here; ensure compose sysctls net.ipv4.ip_forward=1 is set. Continuing (charon/iptables still validated)."
 fi
 
 # ---- L2TP configs (xl2tpd + pppd + chap-secrets) ----
 sed -e "s|__L2TP_RANGE__|${L2TP_RANGE}|g" \
     -e "s|__L2TP_LOCAL__|${L2TP_LOCAL}|g" \
     /xl2tpd.conf.tmpl > /etc/xl2tpd/xl2tpd.conf
-DNS1="${VPN_DNS%%,*}"; DNS_REST="${VPN_DNS#*,}"
-[ "$DNS_REST" = "$VPN_DNS" ] && DNS_REST=""
-{
-  printf 'ms-dns %s\n' "$DNS1"
-  [ -n "$DNS_REST" ] && printf 'ms-dns %s\n' "${DNS_REST%%,*}"
-} > /tmp/ms-dns.conf
+# Every DNS in the comma list gets an ms-dns line (pppd accepts many; the
+# old code silently dropped the 3rd+ server).
+render_ms_dns() {
+  # $1 = comma-separated DNS list, $2 = output file
+  _rest="$1"
+  : > "$2"
+  while [ -n "$_rest" ]; do
+    _one="${_rest%%,*}"
+    if [ "$_rest" = "$_one" ]; then _rest=""; else _rest="${_rest#*,}"; fi
+    _one="$(printf '%s' "$_one" | tr -d ' \t\r\n')"
+    [ -n "$_one" ] || continue
+    case "$_one" in *[!0-9.]*) die "VPN_DNS entries must be IPs (got '$_one')." ;; esac
+    printf 'ms-dns %s\n' "$_one" >> "$2"
+  done
+  [ -s "$2" ] || die "VPN_DNS produced no usable server."
+  unset _rest _one
+}
+DNS1="${VPN_DNS%%,*}"
+render_ms_dns "$VPN_DNS" /tmp/ms-dns.conf
 awk '
   /# __MS_DNS__/ { while ((getline l < "/tmp/ms-dns.conf") > 0) print l; next }
   { print }
@@ -341,12 +368,7 @@ if [ "$ENABLE_PPTP" = "1" ]; then
       /pptpd.conf.tmpl > /etc/pptpd/pptpd.conf
   grep -q "localip $VPN_PPTP_LOCAL" /etc/pptpd/pptpd.conf || die "pptpd.conf render failed (localip)."
   grep -q "remoteip $PPTP_SHORT_RANGE" /etc/pptpd/pptpd.conf || die "pptpd.conf render failed (remoteip)."
-  DNS1="${VPN_DNS%%,*}"; DNS_REST="${VPN_DNS#*,}"
-  [ "$DNS_REST" = "$VPN_DNS" ] && DNS_REST=""
-  {
-    printf 'ms-dns %s\n' "$DNS1"
-    [ -n "$DNS_REST" ] && printf 'ms-dns %s\n' "${DNS_REST%%,*}"
-  } > /tmp/ms-dns-pptp.conf
+  render_ms_dns "$VPN_DNS" /tmp/ms-dns-pptp.conf
   awk '
     /# __MS_DNS__/ { while ((getline l < "/tmp/ms-dns-pptp.conf") > 0) print l; next }
     { print }
@@ -371,7 +393,7 @@ fi
 for _pool in "$VPN_SUBNET" "$VPN_L2TP_NET" "$VPN_PPTP_NET"; do
   ip rule show 2>/dev/null | grep -q "to ${_pool} lookup main" \
     || ip rule add to "$_pool" lookup main pref 217 2>/dev/null \
-    || log "WARN: cannot add to-pool routing exception for $_pool"
+    || warn "cannot add to-pool routing exception for $_pool"
 done
 
 # ---- iptables: VPN clients may ONLY leave via tun0 (never direct) ----
@@ -405,11 +427,11 @@ if [ "$ALLOW_PLAIN_L2TP" = "0" ]; then
   elif iptables -A INPUT -p udp --dport 1701 -m policy --dir in --pol none -j DROP 2>/dev/null; then
     log "L2TP locked to IPsec (bare L2TP dropped)."
   else
-    log "WARN: xt_policy unavailable - cannot refuse bare L2TP at packet level. L2TP logins still need PPP creds, but set VPN_ALLOW_PLAIN_L2TP consciously."
+    warn "xt_policy unavailable - cannot refuse bare L2TP at packet level. L2TP logins still need PPP creds, but set VPN_ALLOW_PLAIN_L2TP consciously."
   fi
 else
   iptables -D INPUT -p udp --dport 1701 -m policy --dir in --pol none -j DROP 2>/dev/null || true
-  log "WARN: VPN_ALLOW_PLAIN_L2TP=1 - bare L2TP ACCEPTED. PPP logins AND all user traffic cross the internet in CLEARTEXT. Use only for routers that cannot do IPsec, with a unique strong password."
+  warn "VPN_ALLOW_PLAIN_L2TP=1 - bare L2TP ACCEPTED. PPP logins AND all user traffic cross the internet in CLEARTEXT. Use only for routers that cannot do IPsec, with a unique strong password."
 fi
 iptables -C INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 1701 -j ACCEPT
 # PPTP control channel (TCP 1723). Only opened when PPTP is enabled; GRE
@@ -419,7 +441,7 @@ iptables -C INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null || iptables -A INPUT
 if [ "$ENABLE_PPTP" = "1" ]; then
   iptables -C INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 1723 -j ACCEPT
   iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
-  log "WARN: VPN_ENABLE_PPTP=1 - PPTP is cryptographically BROKEN (MSCHAPv2/MPPE). Keep the PPTP leg on a trusted LAN only; internet egress stays via the working proxy. MPPE-128 is mandatory."
+  warn "VPN_ENABLE_PPTP=1 - PPTP is cryptographically BROKEN (MSCHAPv2/MPPE). Keep the PPTP leg on a trusted LAN only; internet egress stays via the working proxy. MPPE-128 is mandatory."
 else
   iptables -D INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null || true
   log "PPTP disabled (VPN_ENABLE_PPTP=0): TCP 1723 not served."

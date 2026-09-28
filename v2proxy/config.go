@@ -60,7 +60,22 @@ func downloadXray(xrayDir, xrayBin string) error {
 	url := fmt.Sprintf(xrayDownloadURLTmpl, osName2, archName)
 	infoLog("Downloading xray: %s", url)
 
-	resp, err := http.Get(url)
+	var err error
+	for attempt := 1; attempt <= xrayDownloadAttempts; attempt++ {
+		if err = fetchXrayZip(url, xrayDir, xrayBin); err == nil {
+			return nil
+		}
+		warnLog("xray download attempt %d/%d failed: %v", attempt, xrayDownloadAttempts, err)
+	}
+	return err
+}
+
+// fetchXrayZip performs one download+extract+verify pass. The HTTP client
+// carries an explicit timeout: plain http.Get has none, so a blackholed
+// route wedged boot forever with zero log output.
+func fetchXrayZip(url, xrayDir, xrayBin string) error {
+	client := &http.Client{Timeout: xrayDownloadTimeout}
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}

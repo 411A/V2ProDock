@@ -120,6 +120,12 @@ var fallbackHealthURLs = []string{
 // ---- Refresh loop ----
 const subscriptionRefreshInterval = 120 * time.Second
 
+// ---- Dead-source circuit breaker (refresh loop) ----
+const (
+	srcFailThreshold = 3 // consecutive refresh failures before a source rests
+	srcSkipCycles    = 5 // refreshes a dead source is skipped (then probed again)
+)
+
 // ---- xray process lifecycle ----
 const (
 	xrayCrashDetect  = 100 * time.Millisecond // wait after start to catch instant crashes (bind fails surface in ms)
@@ -213,3 +219,10 @@ const (
 
 // ---- xray download ----
 const xrayDownloadURLTmpl = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-%s-%s.zip"
+
+const xrayDownloadAttempts = 2 // whole fetch+extract passes before boot fails
+
+// Bounds one download attempt (plain http.Get has NO timeout: a blackholed
+// route wedged boot forever). Var, not const, so tests can shrink it against
+// a hanging stub server.
+var xrayDownloadTimeout = 3 * time.Minute
