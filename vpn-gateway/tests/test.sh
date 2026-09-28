@@ -79,6 +79,10 @@ grep -q 'EGRESS UNPROVEN' watchdog.sh && ok "tun-empty distinguished from true m
 grep -q 'LAST_VERIFIED' watchdog.sh && ok "VERIFIED logged on change only (no per-poll spam)" || bad "healthy polls must not log VERIFIED every 15s"
 grep -q 'PROOF_FAILS' watchdog.sh && ok "consecutive proof-failure counter" || bad "periodic failures must carry a streak count"
 grep -q 'PROOF_HEARTBEAT_N' watchdog.sh && ok "failure heartbeat (transition + every-Nth, no per-cycle spam)" || bad "steady-state failures must not log every poll"
+# A pin can stay "alive" per the API while breaking the proof URL or tun
+# path - rotation is the only escape from a live-but-unusable pin.
+grep -q 'PROOF_ROTATE_FAILS' watchdog.sh && grep -q 'CURRENT_SOCKS=""' watchdog.sh \
+  && ok "sustained proof failure drops the pin (re-pin/rebuild)" || bad "proof-failure rotation missing - a live-but-unusable pin sticks forever"
 grep -q 'quiet' watchdog.sh && ok "quiet periodic verify mode" || bad "hot periodic path must not warn per cycle"
 grep -q 'TUN_FAILS' watchdog.sh && ok "tunnel-restart spam throttled (transition + heartbeat)" || bad "crash-loop restarts must not log per poll"
 grep -q '%H:%M:%S' watchdog.sh && grep -q '%H:%M:%S' entrypoint.sh && ok "timestamps on gateway logs" || bad "every gateway log line needs a timestamp"
@@ -222,6 +226,9 @@ grep -q 'has NO default route' ../install.sh && ok "default-route preflight befo
 if grep -q 'rerun install.sh (fresh_rebuild' ../install.sh; then bad "dead-end hint: fresh_rebuild proven NOT to fix ENETUNREACH"; else ok "no proven-useless rebuild hint"; fi
 grep -q 'compose down --remove-orphans >/dev/null 2>&1' ../install.sh && ok "bind-retry starts from a clean slate" || bad "fresh_rebuild must down between bind retries (half-built endpoint must not be inherited)"
 grep -q 'sudo -n modprobe' ../install.sh && ok "modprobe via passwordless sudo for non-root runs" || bad "ensure_host_prereqs must sudo -n modprobe when non-root"
+grep -q 'modules-load.d/v2prodock' ../install.sh && ok "kernel modules persist across reboot" || bad "must write /etc/modules-load.d (PPTP GRE helpers vanish on reboot without it)"
+grep -q 'sudo -n ufw' ../install.sh && ok "ufw opens applied via passwordless sudo" || bad "ufw auto-open must work without prompting (root or sudo -n)"
+if grep -q 'stay blocked until you open' ../install.sh; then bad "ufw FUD: Docker-published ports BYPASS ufw - they were never blocked"; else ok "ufw message accurate (Docker bypasses it)"; fi
 # The API port must never sit inside a published range: the daemon would
 # program that host port twice (0.0.0.0 from the range + 127.0.0.1 for the
 # API) - second bind EADDRINUSE on every pristine start, aborted start =

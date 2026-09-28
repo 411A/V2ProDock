@@ -487,14 +487,24 @@ ensure_host_prereqs() {
     # with "Couldn't set tty to PPP discipline" (proven in E2E).
     # Non-root (curl|bash): use passwordless sudo only, never prompt.
     local mods="tun ppp_generic ppp_async ppp_mppe xt_policy nf_conntrack_pptp nf_nat_pptp"
+    local mp=""
     if [ "$(id -u)" = "0" ]; then
-        for mod in $mods; do
-            modprobe "$mod" 2>/dev/null || true
-        done
+        mp="modprobe"
     elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        mp="sudo -n modprobe"
+    fi
+    if [ -n "$mp" ]; then
         for mod in $mods; do
-            sudo -n modprobe "$mod" 2>/dev/null || true
+            $mp "$mod" 2>/dev/null || true
         done
+        # Persist across reboot: modprobe alone loses the PPTP GRE helpers on
+        # the next boot (nf_nat_pptp/nf_conntrack_pptp vanish, GRE stalls).
+        # /etc/modules-load.d is systemd's native way to load them at boot.
+        if [ "$(id -u)" = "0" ] || sudo -n true 2>/dev/null; then
+            printf '%s\n' $mods \
+                | { if [ "$(id -u)" = "0" ]; then tee /etc/modules-load.d/v2prodock.conf >/dev/null; else sudo -n tee /etc/modules-load.d/v2prodock.conf >/dev/null; fi; } \
+                2>/dev/null || true
+        fi
     fi
     if [ ! -c /dev/net/tun ]; then
         echo -e "${RED}[WARN] /dev/net/tun missing on this host - VPN cannot work (try: modprobe tun)${NC}"
@@ -503,17 +513,15 @@ ensure_host_prereqs() {
     if [ "$vpn_on" != "1" ]; then
         return 0
     fi
-    # Docker publishes the ports, but a default-deny host firewall still
-    # blocks them before packets reach Docker. What each opening is for:
-    #   UDP 500  - IKE handshake: opens every IPsec connection (IKEv2 and L2TP/IPsec alike)
-    #   UDP 4500 - IPsec payloads, UDP-encapsulated (NAT-T): ALL IKEv2/L2TP bytes
-    #              ride here, so raw ESP (IP protocol 50) is NOT required anywhere
-    #   UDP 1701 - L2TP control/data: always wrapped in the IPsec above
-    #              (bare L2TP is refused by default, opt-in only)
-    #   TCP 1723 - PPTP control channel, ONLY when VPN_ENABLE_PPTP=1
-    #   GRE      - PPTP data (IP protocol 47, NOT TCP/UDP, so no port rule can
-    #              cover it - it needs a protocol rule). PPTP crypto is broken,
-    #              so 1723+GRE stay confined to the LAN, never the internet.
+    # Reality check on ufw: Docker-published ports DNAT in PREROUTING and hit
+    # the DOCKER chain at the TOP of FORWARD, ahead of ufw's DROP - bridge
+    # mode works even with ufw fully loaded (Docker bypasses ufw; a known
+    # caveat, not a blocker). The opens below matter for (a) the
+    # docker-compose.host.yml fallback, where ports bind the host directly
+    # and ufw's INPUT applies, and (b) defense-in-depth if Docker's chains
+    # are ever flushed. Open them silently when root / passwordless sudo is
+    # available; otherwise print them as an optional checklist - never as
+    # "your ports are blocked".
     local pptp_on="0" n
     if [ -f "$DIR/.env" ]; then
         pptp_on=$(grep -E "^VPN_ENABLE_PPTP=" "$DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '[:space:]')
@@ -521,29 +529,30 @@ ensure_host_prereqs() {
     # Private ranges PPTP is confined to (RFC 1918 - covers any home/CGNAT LAN).
     local pptp_nets="192.168.0.0/16 10.0.0.0/8 172.16.0.0/12"
     if command -v ufw &>/dev/null; then
+        local fw_cmd=""
         if [ "$(id -u)" = "0" ]; then
-            for p in 500 4500 1701; do ufw allow "$p/udp" >/dev/null 2>&1 || true; done
-            ok "Host firewall (ufw): UDP 500 (IKE handshake) + 4500 (IPsec data) + 1701 (L2TP-in-IPsec) allowed"
+            fw_cmd="ufw"
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            fw_cmd="sudo -n ufw"
+        fi
+        if [ -n "$fw_cmd" ]; then
+            for p in 500 4500 1701; do $fw_cmd allow "$p/udp" >/dev/null 2>&1 || true; done
+            ok "Host firewall (ufw): UDP 500 (IKE) + 4500 (IPsec NAT-T) + 1701 (L2TP) opened"
             if [ "$pptp_on" = "1" ]; then
                 for n in $pptp_nets; do
-                    ufw allow from "$n" to any port 1723 proto tcp >/dev/null 2>&1 || true
-                    ufw allow proto gre from "$n" >/dev/null 2>&1 || true
+                    $fw_cmd allow from "$n" to any port 1723 proto tcp >/dev/null 2>&1 || true
+                    $fw_cmd allow proto gre from "$n" >/dev/null 2>&1 || true
                 done
                 ok "Host firewall (ufw): PPTP confined to LAN (TCP 1723 + GRE from private ranges only)"
             fi
         else
-            echo -e "${CYAN}Host firewall (ufw) is active - Docker's ports stay blocked until you open them:${NC}"
-            echo "  sudo ufw allow 500/udp    # IKE handshake: opens every IPsec connection (IKEv2 + L2TP/IPsec)"
-            echo "  sudo ufw allow 4500/udp   # IPsec payloads: all VPN bytes ride here (raw ESP proto 50 NOT needed)"
-            echo "  sudo ufw allow 1701/udp   # L2TP control/data (travels inside the IPsec above)"
+            echo "Host firewall (ufw) active (no passwordless sudo): bridge mode works regardless - Docker-published ports bypass ufw."
+            echo "Open them for the docker-compose.host.yml fallback / defense-in-depth:"
+            echo "  sudo ufw allow 500,4500,1701/udp"
             if [ "$pptp_on" = "1" ]; then
-                echo -e "  ${RED}PPTP is on (VPN_ENABLE_PPTP=1) but its crypto is broken - LAN-only, never the internet:${NC}"
-                echo "  sudo ufw allow proto gre from 192.168.0.0/16  # PPTP data (IP proto 47, not a port)"
-                echo "  sudo ufw allow proto gre from 10.0.0.0/8      # (one rule per private range you use)"
-                echo "  sudo ufw allow proto gre from 172.16.0.0/12"
-                echo "  sudo ufw allow from 192.168.0.0/16 to any port 1723 proto tcp  # PPTP control channel"
-                echo "  sudo ufw allow from 10.0.0.0/8 to any port 1723 proto tcp"
-                echo "  sudo ufw allow from 172.16.0.0/12 to any port 1723 proto tcp"
+                echo -e "  ${RED}PPTP on (VPN_ENABLE_PPTP=1, crypto broken) - LAN only, never the internet:${NC}"
+                echo "  sudo ufw allow proto gre from 192.168.0.0/16   # + 10.0.0.0/8 + 172.16.0.0/12 (one per range used)"
+                echo "  sudo ufw allow from 192.168.0.0/16 to any port 1723 proto tcp   # + the same two ranges"
             fi
         fi
     elif command -v firewall-cmd &>/dev/null; then

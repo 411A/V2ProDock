@@ -54,6 +54,14 @@ PROOF_HEARTBEAT_N="${PROOF_HEARTBEAT_N:-20}"
 # A 0/garbage heartbeat would divide by zero under set -eu and kill the
 # gateway; degrade to the default instead.
 case "$PROOF_HEARTBEAT_N" in ''|*[!0-9]*|0) PROOF_HEARTBEAT_N=20 ;; esac
+# A pin can stay "alive" per the API (gstatic probes pass) while breaking
+# the proof URL or the tun path (proven: node blocking api.ipify.org left
+# the gateway UNPROVEN for 10+ minutes on a "healthy" pin). After this many
+# consecutive proof failures, drop the pin so the next cycle re-pins to the
+# fastest alive node - or rebuilds the tunnel when the fastest IS this pin
+# (heals a wedged tun/hev too). Constant on purpose: env knobs that compose
+# forgets to pass are worse than none. 10 x 15s = 2.5min.
+PROOF_ROTATE_FAILS=10
 # Same for the poll interval: a non-numeric POLL_SECS fails sleep(1), and
 # under set -eu that exits the watchdog into a container CrashLoop. Clamp.
 case "$POLL_SECS" in ''|*[!0-9]*|0) POLL_SECS=15 ;; esac
@@ -382,5 +390,10 @@ while true; do
       warn "Egress proof still failing via $socks ($pname): $reason — $PROOF_FAILS in a row."
     fi
     write_status "$socks" "$pname" "" false "periodic egress proof failed"
+    if [ "$PROOF_FAILS" -ge "$PROOF_ROTATE_FAILS" ]; then
+      warn "Proof failing $PROOF_FAILS times straight via $socks ($pname) - dropping pin to force re-pin/rebuild."
+      CURRENT_SOCKS=""
+      PROOF_FAILS=0
+    fi
   fi
 done
