@@ -63,7 +63,7 @@ const (
 const (
 	defaultAggSocksPort = 27017 // AGGREGATE_SOCKS_PORT overrides
 	defaultAggHttpPort  = 27016 // AGGREGATE_HTTP_PORT overrides
-	aggPublishedMax     = 27100 // compose publishes 27000-27100; above is container-only
+	aggPublishedMax     = 27100 // compose publishes 27000-27017 + 27019-27100 (API holds 27018)
 )
 
 // ---- DPI fragmentation (opt-in; binary-verified schema, off by default) ----

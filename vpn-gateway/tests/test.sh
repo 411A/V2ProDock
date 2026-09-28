@@ -215,6 +215,21 @@ grep -q 'has NO default route' ../install.sh && ok "default-route preflight befo
 if grep -q 'rerun install.sh (fresh_rebuild' ../install.sh; then bad "dead-end hint: fresh_rebuild proven NOT to fix ENETUNREACH"; else ok "no proven-useless rebuild hint"; fi
 grep -q 'compose down --remove-orphans >/dev/null 2>&1' ../install.sh && ok "bind-retry starts from a clean slate" || bad "fresh_rebuild must down between bind retries (half-built endpoint must not be inherited)"
 grep -q 'sudo -n modprobe' ../install.sh && ok "modprobe via passwordless sudo for non-root runs" || bad "ensure_host_prereqs must sudo -n modprobe when non-root"
+# The API port must never sit inside a published range: the daemon would
+# program that host port twice (0.0.0.0 from the range + 127.0.0.1 for the
+# API) - second bind EADDRINUSE on every pristine start, aborted start =
+# half-programmed netns = container ENETUNREACH (proven: hydravm 4/4).
+_api_port=$(grep -oE '127\.0\.0\.1:[0-9]+:[0-9]+' ../docker-compose.yml | tr -d '\r' | head -1 | cut -d: -f2)
+if [ -z "$_api_port" ]; then
+  bad "compose must publish the API on 127.0.0.1:<port>:<port>"
+else
+  _ov=0
+  for _r in $(grep -oE '"[0-9]+-[0-9]+:[0-9]+-[0-9]+"' ../docker-compose.yml | tr -d '"\r'); do
+    _h=${_r%%:*}; _lo=${_h%%-*}; _hi=${_h#*-}
+    if [ "$_api_port" -ge "$_lo" ] && [ "$_api_port" -le "$_hi" ]; then _ov=1; fi
+  done
+  [ "$_ov" -eq 1 ] && bad "API port $_api_port is inside a published port range (dual-bind EADDRINUSE)" || ok "API port excluded from published ranges"
+fi
 
 # 7c. log consistency: every line timestamped + tagged, levels uniform.
 # (An untagged line in docker logs is indistinguishable noise.)

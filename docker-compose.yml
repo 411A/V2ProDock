@@ -9,7 +9,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "27000-27100:27000-27100"   # Dynamic proxy ports (SOCKS5 + HTTP)
+      # Data ports SPLIT around the API port. Publishing 27018 twice (range
+      # + API line below) makes the daemon program one host port as both
+      # 0.0.0.0 and 127.0.0.1: the second bind fails 'address already in
+      # use' on EVERY pristine start, and the aborted start leaves the
+      # netns half-programmed (no default route = ENETUNREACH from the
+      # container). 27018 is reserved to the API alone.
+      - "27000-27017:27000-27017"   # spare low ports (aggregates live at 27016-27017)
+      - "27019-27100:27019-27100"   # Dynamic proxy ports (SOCKS5 + HTTP, PORT_BASE=27019+)
       # API bound to host loopback ONLY: /proxies+/health serve LAN clients
       # fine over the data ports, but /refresh is an unauthenticated
       # state-changing endpoint (refresh storm = self-DoS) that must never

@@ -350,7 +350,7 @@ fresh_rebuild() {
     docker rmi v2prodock/proxy:latest v2prodock/vpn-gateway:latest 2>/dev/null || true
     docker compose build 2>&1 || { err "docker compose build failed"; exit 1; }
     _attempt=1
-    while [ "$_attempt" -le 3 ]; do
+    while :; do
         if up_out=$(docker compose up -d 2>&1); then
             printf '%s\n' "$up_out"
             return 0
@@ -360,12 +360,18 @@ fresh_rebuild() {
         if [ -z "$bind_spec" ] || ! free_port_squatter "$bind_spec"; then
             break
         fi
-        echo "  Squatter evicted, retrying compose up (attempt $((_attempt + 1))/3) ..."
-        # Attempt 1 failed DURING container networking setup - its half-built
+        # free_port_squatter prints its own "Evicting ..." only when it
+        # actually kills; at rest the conflicting holder can also be this
+        # compose's OWN dual-publish of one port (no external listener).
+        if [ "$_attempt" -ge 3 ]; then
+            break
+        fi
+        _attempt=$((_attempt + 1))
+        echo "  Retrying compose up (attempt $_attempt/3) ..."
+        # A failed start aborts mid networking-setup - its half-built
         # endpoint must not be inherited. Clean slate before retry.
         docker compose down --remove-orphans >/dev/null 2>&1 || true
         sleep 2
-        _attempt=$((_attempt + 1))
     done
     err "docker compose up failed - fix the error above, then retry"
     echo "  If 'address already in use' persists: ss -tlnp | grep <port> finds the squatter"
