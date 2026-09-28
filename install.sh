@@ -250,6 +250,32 @@ check_subscriptions_reachable() {
     fi
 }
 
+# Verify subscriptions are reachable FROM INSIDE the v2prodock container,
+# not just from the host. Host-reachable but container-unreachable (broken
+# bridge sandbox, bridge/LAN subnet overlap, host firewall) otherwise
+# surfaces only as a populate grind full of fetch errors. Warn-only: never
+# fatal (populate retries + runtime failover still apply).
+check_container_egress() {
+    local urls="$1" u failed=0 total=0
+    docker exec v2prodock true 2>/dev/null || return 0
+    while IFS= read -r u; do
+        [ -z "$u" ] && continue
+        total=$((total + 1))
+        if docker exec v2prodock curl -sf --max-time 8 -o /dev/null "$u" 2>/dev/null; then
+            ok "In-container reachable: $u"
+        else
+            echo -e "${RED}[WARN] In-container CANNOT reach $u (host can!) - container has no egress${NC}"
+            failed=$((failed + 1))
+        fi
+    done <<< "$urls"
+    if [ "$total" -gt 0 ] && [ "$failed" -eq "$total" ]; then
+        echo -e "${RED}[WARN] NO subscription reachable from inside v2prodock: container network is broken (NOT the URLs).${NC}"
+        echo "  Diagnose: docker exec v2prodock ip route   # must show a default route"
+        echo "  Diagnose: docker network inspect v2prodock-proxy-net  # subnet must not overlap your LAN"
+        echo "  Fix:      docker compose down && docker compose up -d --build  # rebuilds the sandbox"
+    fi
+}
+
 escape_sed_repl() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 
 # Set KEY=VALUE in .env (adds if missing). Safe for URLs containing & | \.
@@ -421,6 +447,7 @@ if [ "$DOCKER_MODE" = true ]; then
             ensure_host_prereqs
             docker compose up -d
             ok "Started"
+            check_container_egress "$(read_sub_urls)"
             show_status
             ;;
         stop)
@@ -560,6 +587,7 @@ if [ "$DOCKER_MODE" = true ]; then
             docker compose build 2>&1
             docker compose up -d 2>&1
             ok "Started"
+            check_container_egress "$sub_urls"
             show_status
             ;;
     esac

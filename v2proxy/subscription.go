@@ -139,7 +139,7 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 		break
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("failed to fetch subscription %s (tried %v): %w — hint: inside Docker 127.0.0.1 is the container itself, use host.docker.internal or host LAN IP", subURL, subscriptionCandidates(subURL), lastErr)
+		return nil, fmt.Errorf("failed to fetch subscription %s (tried %v): %w — hint: %s", subURL, subscriptionCandidates(subURL), lastErr, subscriptionHint(lastErr))
 	}
 
 	// Clean up content: strip trailing/leading whitespace and carriage returns
@@ -162,6 +162,20 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 		proxies = append(proxies, *proxy)
 	}
 	return proxies, nil
+}
+
+// subscriptionHint picks the actionable guidance for a fetch failure.
+// "network is unreachable" means the container itself has NO route to the
+// host (broken bridge sandbox, bridge/LAN subnet overlap, or host firewall)
+// — no URL rewriting will ever fix that, so the classic loopback guidance
+// would send the operator down a false trail (proven in production: a host
+// that curls fine from the host failing ENETUNREACH from the container).
+// Anything else keeps the loopback guidance.
+func subscriptionHint(err error) string {
+	if err != nil && strings.Contains(err.Error(), "network is unreachable") {
+		return "container has NO route to this host (not a bad URL): run `docker exec v2prodock ip route` (must show a default route), `docker network inspect v2prodock-proxy-net` (subnet must not overlap your LAN), then rebuild the sandbox with `docker compose down && docker compose up -d --build`"
+	}
+	return "inside Docker 127.0.0.1 is the container itself, use host.docker.internal or host LAN IP"
 }
 
 func FetchAnySubscription(urls []string) ([]ProxyConfig, string, error) {

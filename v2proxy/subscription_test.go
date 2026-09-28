@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/base64"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +67,30 @@ func TestSplitURLs(t *testing.T) {
 	if len(splitURLs("  , \n ")) != 0 {
 		t.Errorf("expected empty for blank input")
 	}
+}
+
+func TestSubscriptionHint(t *testing.T) {
+	// Production case: the host curls fine, the container has no route.
+	// The hint must say so instead of blaming the URL (loopback rewrite).
+	unreach := subscriptionHint(errors.New(`Get "http://192.168.1.87:27141/subscription.txt": dial tcp 192.168.1.87:27141: connect: network is unreachable`))
+	if !strings.Contains(unreach, "NO route") || !strings.Contains(unreach, "docker compose down") {
+		t.Fatalf("unreachable hint must name the container network + rebuild, got %q", unreach)
+	}
+	if strings.Contains(unreach, "127.0.0.1") {
+		t.Fatalf("unreachable hint must not suggest loopback rewrites, got %q", unreach)
+	}
+	// Ordinary failures keep the classic guidance.
+	timeoutHint := subscriptionHint(errors.New(`context deadline exceeded`))
+	if !strings.Contains(timeoutHint, "host.docker.internal") {
+		t.Fatalf("timeout hint must keep loopback guidance, got %q", timeoutHint)
+	}
+	if got := subscriptionHint(nil); !strings.Contains(got, "host.docker.internal") {
+		t.Fatalf("nil error must keep loopback guidance, got %q", got)
+	}
+	// NOTE: no live-fetch assertion here on purpose — FetchSubscription fans
+	// out to loopback-fallback hosts whose candidates can blackhole for full
+	// fetchTimeouts on some networks (proven: 69s locally). The wiring
+	// (FetchSubscription -> subscriptionHint) is one format line above.
 }
 
 func TestFetchAnyNoURLs(t *testing.T) {
