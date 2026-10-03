@@ -617,9 +617,12 @@ func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
 // reconcileActive re-anchors an ok instance after a refresh swapped its pool
 // (UpdateConfigs already re-anchored the index by key; this handles the rest).
 // Vanished-but-healthy active -> retained (see below). Vanished-and-failing
-// active -> switch now. Slow active (>rotateSlowLatency) -> probe a few fresh
-// candidates on a THROWAWAY port (serving is never interrupted) and rotate
-// only to one proven >=30% faster. Fast present active -> untouched.
+// active -> switch now. Slow active (>rotateSlowLatency, measured FRESHLY) ->
+// probe a few fresh candidates on a THROWAWAY port (serving is never
+// interrupted) and rotate only to one proven >=30% faster. Serving live traffic
+// or holding a stale measurement -> untouched: rotation rebinds the serving
+// port and would cut real connections, which is a far worse failure than slow.
+// Fast present active -> untouched.
 func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyConfig) {
 	active := inst.ActiveConfig()
 	present := active != nil &&
@@ -652,6 +655,29 @@ func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyCo
 		if cfg := inst.ActiveConfig(); cfg != nil {
 			m.markOK(i, cfg.Name, inst.LastLatency())
 		}
+		return
+	}
+	// Real bytes outrank synthetic optimization. A rotation is stopXray() +
+	// startXray() on the SAME serving ports (selector.go), which severs every
+	// in-flight connection on this instance — a Telegram long-poll dies
+	// mid-response and the client raises RemoteProtocolError, while the proxy
+	// honestly keeps reporting "ok". HealthCheck already refuses to strike a
+	// serving instance (selector.go); this path had no such guard, so a busy
+	// instance was severable on every refresh tick. A slow-but-serving tunnel
+	// beats a faster one that cuts live connections.
+	if inst.ServingTraffic() {
+		debugLog("Instance %d: serving client traffic, slow rotation skipped (active %s at %dms)",
+			i, shortName(active.Name), inst.LastLatency().Milliseconds())
+		return
+	}
+	// A stale measurement cannot prove "slow": HealthCheck skips probes for a
+	// serving instance, so lastLatency stays frozen at its last real reading.
+	// Judging it against rotateSlowLatency now would rotate on the strength of
+	// a forgotten number. Once traffic stops the probes resume and the figure
+	// goes fresh again.
+	if !inst.LatencyFresh(rotateLatencyMaxAge) {
+		debugLog("Instance %d: latency for %s is stale, rotation deferred to a fresh measurement",
+			i, shortName(active.Name))
 		return
 	}
 	if inst.LastLatency() < rotateSlowLatency {

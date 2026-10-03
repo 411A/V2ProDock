@@ -85,6 +85,12 @@ const (
 	rotateMaxCandidates  = 3                       // fresh candidates tried per rotation, then stop
 	rotateBudget         = 20 * time.Second        // aggregate cap for one rotation attempt
 	watchdogPortDialWait = 300 * time.Millisecond  // TCP sanity-dial timeout per instance port
+	// How old a latency measurement may be and still justify a rotation. Idle
+	// instances are measured every healthCheckInterval (60s), so 3x leaves room
+	// for two skipped ticks; a busier one goes unmeasured for as long as it
+	// keeps serving (HealthCheck deliberately skips those probes) and must NOT
+	// be rotated on a forgotten number.
+	rotateLatencyMaxAge = 3 * healthCheckInterval
 )
 
 // ---- Subscription fetching ----

@@ -304,6 +304,161 @@ func TestReconcileFastActiveUntouched(t *testing.T) {
 	}
 }
 
+// expireEgress backdates any recorded flow for these ports past the grace
+// window. Ports are handed out by the OS (:0) and CAN be recycled between
+// tests, so a note left behind by an earlier test could otherwise satisfy a
+// later test's "no live traffic" precondition by accident — silently turning
+// its assertions into no-ops.
+func expireEgress(ports ...int) {
+	egressNotes.mu.Lock()
+	defer egressNotes.mu.Unlock()
+	for _, p := range ports {
+		if _, ok := egressNotes.lastOK[p]; ok {
+			egressNotes.lastOK[p] = time.Now().Add(-2 * egressGrace)
+		}
+	}
+}
+
+// A busy instance must never be rotated for being slow: rotation is
+// stopXray()+startXray() on the SAME serving ports, so it severs live
+// connections (a Telegram long-poll dies mid-response -> RemoteProtocolError)
+// while the proxy still reports "ok". HealthCheck's passive branch is the
+// precedent; the refresh rotation path must honour the same evidence.
+func TestReconcileSlowServingActiveRetained(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatal(err)
+	}
+	// Force the rotation-eligible branch: slow + freshly measured + serving.
+	s.mu.Lock()
+	s.lastLatency = rotateSlowLatency + time.Second
+	s.lastProbe = time.Now()
+	s.mu.Unlock()
+	noteEgress(socks) // real client bytes: the instance is serving
+	if !s.ServingTraffic() {
+		t.Fatal("precondition: ServingTraffic must see the noted egress")
+	}
+	before := s.currentPID()
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
+		xrayDir:   dir,
+	}
+	m.reconcileActive(0, s, s.ActiveConfig())
+	if got := s.ActiveConfig(); got == nil || got.Key() != "e2e-a:1" {
+		t.Fatalf("serving instance must not be rotated for slowness, got %+v", got)
+	}
+	if s.currentPID() != before {
+		t.Fatal("serving instance must not restart xray: live connections were cut")
+	}
+}
+
+// The passive branch must NOT fabricate a measurement: it keeps skipping the
+// probe (that is the whole point), so the latency figure stays frozen and
+// LatencyFresh must report it as stale rather than let a forgotten number
+// qualify a rotation.
+func TestPassiveHealthLeavesLatencyStale(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good")})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatal(err)
+	}
+	if !s.LatencyFresh(rotateLatencyMaxAge) {
+		t.Fatal("precondition: start measurement must be fresh")
+	}
+	noteEgress(socks)
+	// Age the measurement past the window, then let the passive branch run.
+	s.mu.Lock()
+	s.lastProbe = time.Now().Add(-2 * rotateLatencyMaxAge)
+	s.mu.Unlock()
+	if !s.HealthCheck() {
+		t.Fatal("serving instance must stay healthy")
+	}
+	if s.LatencyFresh(rotateLatencyMaxAge) {
+		t.Fatal("skipped probe must not make an old measurement look fresh")
+	}
+}
+
+// Stale measurement alone (instance idle again) must also block rotation:
+// "slow" may not be inferred from a number nobody measured recently.
+func TestReconcileStaleLatencyNotRotated(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.lastLatency = rotateSlowLatency + time.Second
+	s.lastProbe = time.Now().Add(-2 * rotateLatencyMaxAge)
+	s.mu.Unlock()
+	before := s.currentPID()
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
+		xrayDir:   dir,
+	}
+	m.reconcileActive(0, s, s.ActiveConfig())
+	if got := s.ActiveConfig(); got == nil || got.Key() != "e2e-a:1" {
+		t.Fatalf("stale measurement must not trigger rotation, got %+v", got)
+	}
+	if s.currentPID() != before {
+		t.Fatal("stale-measurement instance must not restart xray")
+	}
+}
+
+// A freshly measured, idle, genuinely slow instance MUST still rotate —
+// the guards exist to protect live traffic, not to freeze the pool.
+func TestReconcileSlowIdleActiveStillRotates(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
+	if err := s.StartWithBest(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.lastLatency = rotateSlowLatency + time.Second
+	s.lastProbe = time.Now()
+	s.mu.Unlock()
+	expireEgress(socks, httpP)
+	if s.ServingTraffic() {
+		t.Fatal("precondition: instance must look idle, got ServingTraffic=true")
+	}
+	if !s.LatencyFresh(rotateLatencyMaxAge) {
+		t.Fatal("precondition: measurement must be fresh")
+	}
+	m := &ProxyManager{
+		instances: []*ProxySelector{s},
+		statuses:  []InstanceStatus{{Index: 0, Status: "ok"}},
+		xrayDir:   dir,
+	}
+	m.reconcileActive(0, s, s.ActiveConfig())
+	// Must rotate: A is fresh+slow, B is a working fast candidate and clears
+	// the 30% margin. If the guards ever degenerate into "never rotate", the
+	// pool silently freezes on one bad upstream and this is what notices.
+	if got := s.ActiveConfig(); got == nil || got.Key() != "e2e-b:1" {
+		t.Fatalf("fresh+slow idle instance must still rotate to e2e-b:1, got %+v", got)
+	}
+	if n := stubCount(dir); n != 1 {
+		t.Fatalf("rotation must leave exactly 1 stub xray, found %d", n)
+	}
+}
+
 // ---- HTTP bridge behavior ----
 
 func proxyClient(t *testing.T, bridgeAddr string) *http.Client {

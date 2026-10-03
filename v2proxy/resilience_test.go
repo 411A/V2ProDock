@@ -362,5 +362,18 @@ func TestBudgetsSane(t *testing.T) {
 	if quickProbeTimeout > healthCheckTimeout {
 		t.Fatalf("quick probe (%s) must be cheaper than full check (%s)", quickProbeTimeout, healthCheckTimeout)
 	}
+	// The staleness window only means something relative to how often an idle
+	// instance is actually measured: below ~2 checks a single skipped tick
+	// freezes rotation, far above and a forgotten number still qualifies one.
+	// Pinned absolutely so a well-meaning "raise it" cannot quietly disable the
+	// guard (the rotation tests age lastProbe relative to this constant and so
+	// cannot catch a wrong value on their own).
+	if rotateLatencyMaxAge < 2*healthCheckInterval || rotateLatencyMaxAge > 6*healthCheckInterval {
+		t.Fatalf("rotateLatencyMaxAge out of sane range: %s (checks every %s)",
+			rotateLatencyMaxAge, healthCheckInterval)
+	}
+	if rotateSlowLatency <= 0 || rotateSlowLatency > healthCheckInterval {
+		t.Fatalf("rotateSlowLatency must be a positive sub-interval threshold: %s", rotateSlowLatency)
+	}
 	fmt.Println("budgets ok")
 }

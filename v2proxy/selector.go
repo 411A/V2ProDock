@@ -29,6 +29,14 @@ type ProxySelector struct {
 	checkInterval time.Duration
 	lastCheck     time.Time
 	lastLatency   time.Duration
+	// lastProbe is when lastLatency was last MEASURED on the serving port,
+	// deliberately distinct from lastCheck: the passive branch of HealthCheck
+	// skips the probe and must keep skipping it for a serving instance, so
+	// lastCheck keeps moving while lastLatency stays frozen at its last real
+	// measurement. Without this stamp a forgotten number reads as current, and
+	// a stale "> rotateSlowLatency" would keep a busy instance eligible for
+	// rotation forever — the rotation that severed its live connections.
+	lastProbe time.Time
 	// Stability signals for long-polling clients: a 2s proxy that stays up an
 	// hour beats a 200ms one that dies every 5 minutes, but latency alone
 	// cannot see that. okStreak counts CONSECUTIVE successful health checks
@@ -81,6 +89,26 @@ func (s *ProxySelector) LastLatency() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastLatency
+}
+
+// LatencyFresh reports whether lastLatency was actually measured within
+// maxAge. A stale measurement cannot prove "slow": the caller must not compare
+// a number measured hours ago against a live threshold. Zero lastProbe (never
+// probed) is stale by definition.
+func (s *ProxySelector) LatencyFresh(maxAge time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastProbe.IsZero() {
+		return false
+	}
+	return time.Since(s.lastProbe) <= maxAge
+}
+
+// ServingTraffic reports whether real client bytes have flowed through this
+// instance within egressGrace — the same evidence HealthCheck uses to refuse a
+// synthetic strike, exposed so the rotation paths can honour it too.
+func (s *ProxySelector) ServingTraffic() bool {
+	return egressActive([]int{s.httpPort, s.socksPort}, egressGrace)
 }
 
 // FailCount reports consecutive health failures on the current upstream (0 =
@@ -249,6 +277,7 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 		if result.Working {
 			s.activeIndex = i
 			s.lastLatency = result.Latency
+			s.lastProbe = time.Now()
 			s.failCount = 0
 			s.okStreak = 0
 			s.activeSince = time.Now()
@@ -274,7 +303,7 @@ func (s *ProxySelector) HealthCheck() bool {
 	// Passive proof first: real client bytes flowed through this instance
 	// within grace — it is responsive BY DEFINITION, so no synthetic probe
 	// may strike it. Skipping also spares probe traffic on busy instances.
-	if egressActive([]int{s.httpPort, s.socksPort}, egressGrace) {
+	if s.ServingTraffic() {
 		s.lastCheck = time.Now()
 		s.failCount = 0
 		s.okStreak++
@@ -287,6 +316,7 @@ func (s *ProxySelector) HealthCheck() bool {
 	result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
 	s.lastCheck = time.Now()
 	s.lastLatency = result.Latency
+	s.lastProbe = s.lastCheck
 
 	if result.Working {
 		s.failCount = 0
@@ -422,6 +452,7 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 	}
 	s.activeIndex = cur
 	s.lastLatency = winLat
+	s.lastProbe = time.Now()
 	s.failCount = 0
 	s.okStreak = 0
 	s.activeSince = time.Now()
