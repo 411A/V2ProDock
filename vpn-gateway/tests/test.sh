@@ -423,5 +423,137 @@ else
   echo "[vpn-test][SKIP] squatter mocks need bash"
 fi
 
+# 11. verify_project_containers (install.sh): must report the real state of the
+# containers compose owns, and do NOTHING else. Read-only is the whole safety
+# argument — an earlier revision scanned every container on the host and
+# removed strays by image pattern, which is a sharp instrument pointed at
+# other people's stacks over a wrong diagnosis.
+if command -v bash >/dev/null 2>&1; then
+  _vc="$(mktemp -d)"
+  sed -n "/^PROJECT_CONTAINERS=/p; /^verify_project_containers() {/,/^}/p" ../install.sh > "$_vc/fns.sh"
+  [ -s "$_vc/fns.sh" ] && ok "extracted verify fn for mock run" || bad "verify fn extraction failed"
+  mkdir -p "$_vc/bin"
+  cat > "$_vc/bin/docker" <<'EOF'
+#!/bin/sh
+# docker inspect --format <tpl> <name> -> canned per-name state, logged.
+case "${1:-}" in
+    inspect)
+        printf 'inspect %s\n' "$*" >> "$LOG"
+        case "${4:-}" in
+            v2prodock)     echo '/v2prodock|running|unless-stopped' ;;
+            v2prodock-vpn) echo '/v2prodock-vpn|exited|no' ;;
+            *) exit 1 ;;
+        esac
+        exit 0 ;;
+    *) printf 'MUTATION %s\n' "$*" >> "$LOG"; exit 0 ;;
+esac
+EOF
+  chmod +x "$_vc/bin/"*
+  cat > "$_vc/run.sh" <<'EOF'
+RED=''; NC=''
+ok() { echo "OK $1"; }
+err() { echo "ERR $1"; }
+. /tmp/vc-fns-placeholder
+EOF
+  sed -i "s#/tmp/vc-fns-placeholder#$_vc/fns.sh#" "$_vc/run.sh"
+  : > "$_vc/log"
+  _vcout="$(PATH="$_vc/bin:/usr/bin:/bin" LOG="$_vc/log" bash -c ". \"$_vc/run.sh\"; verify_project_containers" 2>&1)"
+  case "$_vcout" in
+    *"v2prodock: running (restart=unless-stopped)"*) ok "running container reported with its policy" ;;
+    *) bad "running state not reported: $_vcout" ;;
+  esac
+  case "$_vcout" in
+    *"v2prodock-vpn: exited (restart=no)"*) ok "non-running container reported truthfully" ;;
+    *) bad "exited state not reported: $_vcout" ;;
+  esac
+  case "$_vcout" in
+    *"restart='no'"*) ok "missing restart policy flagged (no reboot survival)" ;;
+    *) bad "restart policy gap must be flagged: $_vcout" ;;
+  esac
+  case "$_vcout" in
+    *"not running"*) ok "non-running container flagged" ;;
+    *) bad "non-running container must be flagged: $_vcout" ;;
+  esac
+  # The safety property: inspect only. Any create/rm/stop/update/kill would
+  # land in the log as a MUTATION line.
+  if grep -q MUTATION "$_vc/log"; then
+    bad "verify must be read-only, it called: $(grep MUTATION "$_vc/log")"
+  else
+    ok "verify is read-only (docker inspect only)"
+  fi
+  [ "$(grep -c '^inspect ' "$_vc/log")" = "2" ] \
+    && ok "inspects exactly the two compose containers" \
+    || bad "verify must inspect only PROJECT_CONTAINERS, got: $(grep -c '^inspect ' "$_vc/log") calls"
+  rm -rf "$_vc"
+else
+  echo "[vpn-test][SKIP] verify mocks need bash"
+fi
+
+# 12. Container identity contract (docker-compose.yml + install.sh). This
+# project creates containers through compose and nowhere else, so the compose
+# file IS the naming/restart guarantee — these guards keep it true. They catch
+# the real regression (someone adds a service and forgets container_name /
+# restart, and that container silently never returns after a reboot).
+# CR-stripped copies first: this suite runs on Windows checkouts too, where a
+# CRLF compose file makes every $ anchor silently stop matching.
+cf=$(mktemp); tr -d '\r' < ../docker-compose.yml > "$cf"
+is=$(mktemp); tr -d '\r' < ../install.sh > "$is"
+sb=$(mktemp)   # only the services: block — a top-level `networks:` section has
+               # the same 2-space shape as a service name and skews every count
+awk '/^services:/{ins=1;next} /^[^[:space:]#]/{ins=0} ins' "$cf" > "$sb"
+_svc=$(grep -cE '^  [a-z0-9_-]+:[[:space:]]*$' "$sb" || true)
+_cn=$(grep -cE '^[[:space:]]*container_name:[[:space:]]*v2prodock' "$sb" || true)
+_rs=$(grep -cE '^[[:space:]]*restart:[[:space:]]*unless-stopped[[:space:]]*$' "$sb" || true)
+_im=$(grep -cE '^[[:space:]]*image:[[:space:]]*v2prodock/' "$sb" || true)
+[ "$_svc" -gt 0 ] && ok "compose declares $_svc service(s)" || bad "no services found in compose"
+[ "$_svc" = "$_cn" ] \
+  && ok "every compose service pins a v2prodock* container_name ($_svc)" \
+  || bad "every service needs container_name: v2prodock* (services=$_svc named=$_cn — a random name is unmanageable)"
+[ "$_svc" = "$_rs" ] \
+  && ok "every compose service sets restart: unless-stopped ($_svc)" \
+  || bad "every service needs restart: unless-stopped (services=$_svc with-policy=$_rs — no policy = stays down through reboots)"
+[ "$_svc" = "$_im" ] \
+  && ok "every compose image is project-namespaced v2prodock/* ($_svc)" \
+  || bad "every service image must start with v2prodock/ (services=$_svc namespaced=$_im)"
+# install.sh's name list must not drift from the compose file, or `status`
+# would report on containers that no longer exist.
+_shn=$(sed -n 's/^PROJECT_CONTAINERS="\(.*\)"$/\1/p' "$is")
+for n in $(sed -n 's/^[[:space:]]*container_name:[[:space:]]*//p' "$sb" | tr -d '"'); do
+  case " $_shn " in
+    *" $n "*) ok "install.sh knows container '$n'" ;;
+    *) bad "install.sh PROJECT_CONTAINERS is missing '$n' (drift from compose)" ;;
+  esac
+done
+# verify must stay read-only forever: it is the only code in this project that
+# inspects containers it did not just create.
+if grep -v '^[[:space:]]*#' "$is" | sed -n '/^verify_project_containers() {/,/^}/p' \
+   | grep -Eq 'docker[[:space:]]+(rm|stop|kill|update|run|create|start|restart)\b'; then
+  bad "verify_project_containers must only inspect — never mutate or remove"
+else
+  ok "verify_project_containers inspects only"
+fi
+grep -q 'verify_project_containers' "$is" \
+  && ok "installer reports real container state" \
+  || bad "install.sh must verify the containers it just started"
+# POSIX sh: no process substitution. Slice the status branch out first.
+_st=$(sed -n '/^        status)/,/^            ;;/p' "$is")
+case "$_st" in
+  *verify_project_containers*) ok "status reports container state" ;;
+  *) bad "status must show container state" ;;
+esac
+# Docker has no `docker rename` for containers: an unnamed container can only
+# be reported or removed, never adopted under a better name. Guard against a
+# future "fix" that reaches for the impossible call.
+grep -v '^[[:space:]]*#' "$is" | grep -Eq 'docker[[:space:]]+rename' \
+  && bad "there is no 'docker rename' for containers — that call cannot work" \
+  || ok "no fictional 'docker rename' call"
+# Never touch containers outside this project, by any means.
+if grep -v '^[[:space:]]*#' "$is" | grep -Eq 'docker[[:space:]]+(rm|kill)[[:space:]].*\$\(docker[[:space:]]+ps'; then
+  bad "must never bulk-remove containers discovered by scanning the host"
+else
+  ok "no bulk removal by host scan"
+fi
+rm -f "$cf" "$is" "$sb"
+
 if [ "$fail" -ne 0 ]; then echo "[vpn-test] FAILED" >&2; exit 1; fi
 echo "[vpn-test] ALL PASS"

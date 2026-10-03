@@ -318,6 +318,40 @@ check_container_egress() {
     fi
 }
 
+# The containers compose creates for this project (docker-compose.yml
+# `container_name:`). This is the project's whole footprint on the host: it
+# creates containers through compose and nowhere else, so two names are the
+# complete list — `docker ps --filter name=v2prodock` finds the entire stack,
+# and no other stack's container can ever match.
+PROJECT_CONTAINERS="v2prodock v2prodock-vpn"
+
+# Report what the daemon actually has for those two containers: the naming and
+# restart policy docker-compose.yml declares, checked against reality instead
+# of assumed. `compose up -d` returning 0 only proves the create call
+# succeeded — it cannot tell a live container from one that came up and died,
+# and it says nothing about the restart policy that decides whether the stack
+# returns after a reboot.
+# READ-ONLY BY CONSTRUCTION: `docker inspect` only. Nothing here creates,
+# repairs, stops or removes anything, and it never looks at containers this
+# project does not own — a host-wide scan would be guessing at other stacks'
+# business (Hermes, mem0, qdrant, postgres, ...) and got that wrong before.
+verify_project_containers() {
+    local want line name state policy
+    for want in $PROJECT_CONTAINERS; do
+        if ! line=$(docker inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}' "$want" 2>/dev/null); then
+            err "container '$want' does not exist - run: bash install.sh start"
+            continue
+        fi
+        IFS='|' read -r name state policy <<< "$line"
+        name=${name#/}
+        printf '  %s: %s (restart=%s)\n' "$name" "${state:-?}" "${policy:-none}"
+        [ "$state" = "running" ] || echo -e "${RED}[WARN] $name is '${state:-unknown}', not running${NC}"
+        # No restart policy = the container never comes back after a reboot,
+        # which is what leaves clients talking to a proxy nobody is running.
+        [ "$policy" = "unless-stopped" ] || echo -e "${RED}[WARN] $name has restart='${policy:-none}' - it will NOT come back after a reboot${NC}"
+    done
+}
+
 # Full teardown + rebuild of THIS project, fully automatic: old containers
 # are stopped and removed (with orphans) along with the project network,
 # survivors are force-removed by ID, then the two project images are deleted
@@ -354,6 +388,10 @@ fresh_rebuild() {
     while :; do
         if up_out=$(docker compose up -d 2>&1); then
             printf '%s\n' "$up_out"
+            # Prove the stack is really there: 'up' returning 0 only means the
+            # create call succeeded, not that the containers are alive and set
+            # to survive the next reboot.
+            verify_project_containers
             return 0
         fi
         printf '%s\n' "$up_out"
@@ -616,6 +654,8 @@ if [ "$DOCKER_MODE" = true ]; then
             ;;
         status)
             docker compose ps
+            echo ""
+            verify_project_containers
             echo ""
             docker logs --tail 10 v2prodock 2>&1
             echo ""

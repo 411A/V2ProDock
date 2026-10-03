@@ -10,17 +10,20 @@ go.sum text diff=golang
 *.sh text eol=lf linguist-vendored
 
 # Docker (excluded from language stats)
+# eol=lf, not just `text`: a CRLF compose file breaks every $-anchored check
+# in the test suite on a Windows checkout (it silently stops matching instead
+# of failing loudly), and the installed stack is only ever run on Linux.
 Dockerfile text diff=dockerfile linguist-vendored
-docker-compose.yml text linguist-vendored
+docker-compose.yml text eol=lf linguist-vendored
+*.yml text eol=lf linguist-vendored
+*.yaml text eol=lf linguist-vendored
 
 # Markdown (excluded from language stats)
 *.md text diff=markdown linguist-vendored
 
 # Config (excluded from language stats)
 *.json text linguist-vendored
-*.yml text linguist-vendored
-*.yaml text linguist-vendored
-.env.example text linguist-vendored
+.env.example text eol=lf linguist-vendored
 
 # VPN gateway templates: rendered into live configs at container boot, so
 # they must stay tracked and visible (Dockerfile COPYs them - ignoring them

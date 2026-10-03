@@ -353,6 +353,25 @@ sudo bash install.sh logs      # Follow logs
 sudo bash install.sh uninstall # Remove everything
 ```
 
+### Container names
+
+This project creates containers through Docker Compose and nowhere else, and
+every service pins both a name and a restart policy:
+
+| container      | image                      | restart           |
+| -------------- | -------------------------- | ----------------- |
+| `v2prodock`    | `v2prodock/proxy`          | `unless-stopped`  |
+| `v2prodock-vpn`| `v2prodock/vpn-gateway`    | `unless-stopped`  |
+
+So `docker ps --filter name=v2prodock` shows the entire stack and nothing
+else, and both containers come back on their own after a reboot — a container
+with no restart policy silently never returns, which is what leaves clients
+talking to a proxy nobody is running.
+
+`install.sh status` (and every install) prints each container's real state and
+restart policy as the daemon reports it, rather than treating a successful
+`compose up` as proof that the stack is healthy.
+
 ## How It Works
 
 1. Fetches subscription URL(s) and parses vless/vmess/trojan/shadowsocks links
