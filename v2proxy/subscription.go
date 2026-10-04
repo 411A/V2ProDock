@@ -97,10 +97,19 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 			lastErr = err
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, fetchMaxBody))
+		// fetchMaxBody+1 so an over-cap response is DETECTED rather than silently
+		// truncated: io.ReadAll(io.LimitReader(...)) returns no error when the
+		// limit is hit, it just returns the first N bytes, so an oversized
+		// subscription became a confusing JSON parse error instead of a cap
+		// message. One extra byte is the cheapest possible overflow probe.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, fetchMaxBody+1))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
+			continue
+		}
+		if len(body) > fetchMaxBody {
+			lastErr = fmt.Errorf("response exceeds the %d-byte cap (subscription too large)", fetchMaxBody)
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {

@@ -207,6 +207,12 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+	// Header phase gets the absolute anti-stall budget (a stalled server never
+	// sends headers, and this is what recycles the slot). The body must NOT
+	// inherit it: a large JSON/download that outlives 60s was cut mid-transfer
+	// with only a debugLog, and since the status line is already committed the
+	// client cannot even be told — it just sees a short body and resumes.
+	_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		debugLog("copy response body failed: %v", err)
 	}
@@ -286,7 +292,23 @@ func setKeepAlive(c net.Conn) {
 	}
 }
 
+// relay splices two connections until either side finishes, with an IDLE
+// deadline (relayIdleDeadline) re-armed after every successful hop.
 func relay(dst, src net.Conn, onFirstByte func()) {
+	relayWithIdle(dst, src, onFirstByte, relayIdleDeadline)
+}
+
+// relayWithIdle is relay with the idle budget injectable so the behaviour is
+// testable in milliseconds instead of minutes.
+//
+// The deadline must be re-armed per hop. A single SetDeadline at entry is an
+// ABSOLUTE wall: every connection older than the budget was severed mid-stream
+// regardless of how well it was transferring, so large JSON/binary bodies that
+// simply took longer than the wall arrived truncated and the client had to
+// resume. That is not a blackhole detector, it is a transfer-size limit wearing
+// an idle constant's name. Re-arming per hop makes it mean what it says: only a
+// peer that stops moving entirely trips it.
+func relayWithIdle(dst, src net.Conn, onFirstByte func(), idle time.Duration) {
 	// Both ends: a blackholed upstream must surface here (relay unblocks,
 	// both sides close, client reconnects) instead of hanging to the deadline.
 	setKeepAlive(dst)
@@ -294,9 +316,12 @@ func relay(dst, src net.Conn, onFirstByte func()) {
 	defer func() { _ = dst.Close() }()
 	defer func() { _ = src.Close() }()
 
-	deadline := time.Now().Add(relayIdleDeadline)
-	_ = dst.SetDeadline(deadline)
-	_ = src.SetDeadline(deadline)
+	arm := func() {
+		d := time.Now().Add(idle)
+		_ = dst.SetDeadline(d)
+		_ = src.SetDeadline(d)
+	}
+	arm()
 
 	bufp := relayBufPool.Get().(*[]byte)
 	defer relayBufPool.Put(bufp)
@@ -310,11 +335,20 @@ func relay(dst, src net.Conn, onFirstByte func()) {
 				onFirstByte = nil
 			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				debugLog("relay write ended stream: %v", writeErr)
 				return
 			}
 		}
 		if readErr != nil {
+			// EOF and reset are the ordinary end of a proxied stream and stay
+			// quiet. A timeout is the one that matters, and it used to be
+			// swallowed completely — which is why a truncated download looked
+			// like a server problem with no trace on our side.
+			if !errors.Is(readErr, io.EOF) {
+				debugLog("relay read ended stream after %s idle: %v", idle, readErr)
+			}
 			return
 		}
+		arm()
 	}
 }

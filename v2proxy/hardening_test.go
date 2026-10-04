@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,6 +72,50 @@ func TestFetchXrayZipTimeoutBounded(t *testing.T) {
 	}
 	if el := time.Since(start); el > 20*time.Second {
 		t.Fatalf("timeout took %s, must be bounded near %s", el, xrayDownloadTimeout)
+	}
+}
+
+// An over-cap subscription must be REJECTED, never silently truncated:
+// io.ReadAll(io.LimitReader(body, cap)) returns the first N bytes and NO error
+// at the cap, so the truncation used to surface as an unreadable-JSON error
+// with nothing pointing at the size limit.
+func TestFetchOneURLRejectsOverCapBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		chunk := strings.Repeat("a", 64<<10)
+		for range (fetchMaxBody / len(chunk)) + 2 {
+			if _, err := w.Write([]byte(chunk)); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	body, err := fetchOneURL(&http.Client{Timeout: 30 * time.Second}, srv.URL)
+	if err == nil {
+		t.Fatalf("over-cap response must error, got %d bytes back", len(body))
+	}
+	if body != "" {
+		t.Fatalf("truncated body must not be returned to the parser, got %d bytes", len(body))
+	}
+	if !strings.Contains(err.Error(), "cap") {
+		t.Fatalf("error must name the size cap, got: %v", err)
+	}
+}
+
+// Just under the cap must still come back whole: the overflow probe must not
+// reject a legitimately large (but legal) subscription.
+func TestFetchOneURLAllowsLargeLegalBody(t *testing.T) {
+	payload := `{"links":"` + strings.Repeat("b", 1<<20) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	t.Cleanup(srv.Close)
+	body, err := fetchOneURL(&http.Client{Timeout: 30 * time.Second}, srv.URL)
+	if err != nil {
+		t.Fatalf("1 MiB payload must be accepted: %v", err)
+	}
+	if body != payload {
+		t.Fatalf("payload altered: got %d bytes, want %d", len(body), len(payload))
 	}
 }
 

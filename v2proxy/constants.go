@@ -155,13 +155,25 @@ const defaultInstanceCount = 1
 const (
 	defaultMaxConns         = 128 // concurrent proxied connections (MAX_CONNS env overrides)
 	relayBufSize            = 32 * 1024
-	proxySlotWait           = 5 * time.Second  // wait for a connection slot before 503
-	bridgeDialTimeout       = 5 * time.Second  // upstream SOCKS dial budget: fail fast with 503, never hang
-	bridgeUpstreamDeadline  = 60 * time.Second // total budget per plain-HTTP relay so slots recycle
-	relayIdleDeadline       = 5 * time.Minute  // idle deadline on relayed CONNECT streams
+	proxySlotWait           = 5 * time.Second // wait for a connection slot before 503
+	bridgeDialTimeout       = 5 * time.Second // upstream SOCKS dial budget: fail fast with 503, never hang
 	bridgeReadHeaderTimeout = 10 * time.Second
 	bridgeIdleTimeout       = 120 * time.Second
 	bridgeMaxHeaderBytes    = 4096
+)
+
+// Time budgets, vars rather than consts ONLY so tests can shrink them to
+// milliseconds (same precedent as xrayDownloadTimeout).
+var (
+	// Absolute budget for the HEADER phase of a plain-HTTP exchange: a stalled
+	// server never sends headers, and this is what recycles the connection
+	// slot. It must not outlive the header phase or it truncates bodies (see
+	// handlePlainHTTP).
+	bridgeUpstreamDeadline = 60 * time.Second
+	// IDLE deadline for streamed bytes, re-armed after every hop. Applies to
+	// relayed CONNECT streams and to the plain-HTTP body phase. Never a total
+	// transfer budget: that severs healthy long downloads mid-payload.
+	relayIdleDeadline = 5 * time.Minute
 )
 
 // ---- Half-open connection detection (long-poll survival) ----

@@ -6,11 +6,16 @@ package main
 // tests in xray_real_test.go.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -502,6 +507,183 @@ func TestRelayFirstByteHook(t *testing.T) {
 	<-done
 	if n := atomic.LoadInt32(&fired); n < 1 {
 		t.Fatalf("first-byte hook never fired (n=%d)", n)
+	}
+}
+
+// A stream that KEEPS MOVING must never be cut, no matter how long it runs.
+// relayIdleDeadline is an idle budget, not a transfer-size limit: the old code
+// armed one absolute deadline at entry, so any connection older than it was
+// severed mid-payload and large bodies arrived truncated (clients had to
+// resume). Kept fast by injecting the budget.
+func TestRelayKeepsLongStreamAlive(t *testing.T) {
+	const (
+		idle   = 300 * time.Millisecond
+		chunks = 8
+		chunk  = "0123456789abcdef" // 16 bytes
+		want   = chunks * len(chunk)
+	)
+	dial := func(t *testing.T, ln net.Listener) (net.Conn, net.Conn) {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, s
+	}
+	la, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer la.Close()
+	lb, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lb.Close()
+	in, relaySrc := dial(t, la)
+	relayDst, out := dial(t, lb)
+	defer in.Close()
+	defer out.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		relayWithIdle(relayDst, relaySrc, nil, idle)
+	}()
+	// The stream deliberately runs ~4x the idle budget in total. A per-hop
+	// re-arm keeps it alive; a single absolute deadline severs it at `idle`.
+	go func() {
+		for range chunks {
+			time.Sleep(idle / 2)
+			if _, err := in.Write([]byte(chunk)); err != nil {
+				return
+			}
+		}
+		in.Close()
+	}()
+	_ = out.SetDeadline(time.Now().Add(idle * chunks))
+	got, ok := readN(out, want)
+	if !ok {
+		t.Fatalf("stream cut mid-payload: got %d/%d bytes (a moving stream must never be truncated)", len(got), want)
+	}
+	if string(got) != strings.Repeat(chunk, chunks) {
+		t.Fatalf("payload corrupted: %q", got)
+	}
+	<-done
+}
+
+// The idle deadline must still exist: a peer that stops moving entirely has to
+// be dropped, or every blackholed connection pins a slot forever. Guards against
+// "fixing" the truncation by simply removing the timeout.
+func TestRelayDropsSilentStream(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	client, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	// Neither end ever writes: only the idle deadline can end this relay.
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		relayWithIdle(server, client, nil, idle)
+	}()
+	select {
+	case <-done:
+	case <-time.After(idle * 20):
+		t.Fatal("silent stream was never dropped: idle deadline not enforced")
+	}
+	if el := time.Since(start); el < idle/2 {
+		t.Fatalf("dropped after %s, before the %s idle budget - deadline not armed", el, idle)
+	}
+}
+
+// staticDialer hands handlePlainHTTP one pre-made conn instead of dialling a
+// real SOCKS server, so the bridge's own deadline policy is testable directly.
+type staticDialer struct{ c net.Conn }
+
+func (d staticDialer) Dial(_, _ string) (net.Conn, error) { return d.c, nil }
+
+// The plain-HTTP bridge must not let the header-phase budget cut the body. A
+// JSON/download slower than bridgeUpstreamDeadline used to be severed
+// mid-transfer, and because the status line was already committed downstream
+// the client could not even be told - it just saw a short body and resumed.
+func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
+	oldHeader, oldIdle := bridgeUpstreamDeadline, relayIdleDeadline
+	bridgeUpstreamDeadline = 300 * time.Millisecond
+	relayIdleDeadline = 10 * time.Second
+	defer func() { bridgeUpstreamDeadline, relayIdleDeadline = oldHeader, oldIdle }()
+
+	const body = "0123456789abcdef"
+	upstream, proxySide := net.Pipe()
+	defer upstream.Close()
+	go func() {
+		br := bufio.NewReader(upstream)
+		// Drain the forwarded request head (net.Pipe is unbuffered: an unread
+		// request would block the write forever).
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(line) == "" {
+				break
+			}
+		}
+		_, _ = fmt.Fprintf(upstream, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+		time.Sleep(3 * bridgeUpstreamDeadline) // outlives the header budget
+		_, _ = io.WriteString(upstream, body)
+		_ = upstream.Close()
+	}()
+
+	initConnSem()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handlePlainHTTP(w, r, staticDialer{proxySide}, 0)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	// Talk to the bridge the way a real client does: a proxied request carries
+	// an absolute URI and the transport never resolves the target itself.
+	proxyURL, err := url.Parse("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+	resp, err := client.Get("http://example.invalid/data.json")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("body read failed: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("body truncated: got %q (%d bytes), want %q (%d) - the header budget must not cut the body",
+			got, len(got), body, len(body))
 	}
 }
 
