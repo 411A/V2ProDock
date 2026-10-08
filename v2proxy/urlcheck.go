@@ -54,7 +54,12 @@ const (
 	checkMaxBody      = 8 << 10 // request body cap
 	checkCacheTTL     = 60 * time.Second
 	checkCacheEntries = 128 // bounded: key eviction is oldest-write, never unbounded
-	checkBudget       = 45 * time.Second
+	// checkBudget MUST stay well under the API server's WriteTimeout
+	// (apiWriteTimeout), because the handler does all its work BEFORE the first
+	// write: a budget above the write deadline means a deep check spends the
+	// whole xray allowance and then returns NO response at all, because the
+	// encode lands after the connection deadline.
+	checkBudget = 6 * time.Second
 )
 
 // CheckedProxy is one upstream's verdict for the requested URL.
@@ -68,18 +73,40 @@ type CheckedProxy struct {
 
 // URLCheckResult is the /check payload.
 type URLCheckResult struct {
-	Key        string         `json:"key"`        // registrable domain: the caller's "same URL"
-	ProbedURL  string         `json:"probed_url"` // what was actually fetched
-	Alive      []CheckedProxy `json:"alive"`      // instances already serving
-	Pool       []CheckedProxy `json:"pool"`       // pool candidates probed on demand
-	Checked    int            `json:"checked"`    // probes performed
-	Failed     int            `json:"failed"`     // probes that did not reach it
-	DurationMS int64          `json:"duration_ms"`
-	Cached     bool           `json:"cached"`
-	Truncated  bool           `json:"truncated"` // depth cap hit before the pool was exhausted
+	Key       string         `json:"key"`        // registrable domain: the caller's "same URL"
+	ProbedURL string         `json:"probed_url"` // what was actually fetched
+	Alive     []CheckedProxy `json:"alive"`      // instances already serving
+	Pool      []CheckedProxy `json:"pool"`       // pool candidates probed on demand
+	// Depth is how deep this answer went (0 = alive instances only). It is part
+	// of the answer's IDENTITY, not a detail: a depth-0 entry must never answer
+	// a depth-32 request, or the caller gets a shallow answer labelled
+	// truncated:false.
+	Depth      int   `json:"depth"`
+	Checked    int   `json:"checked"` // probes performed
+	Failed     int   `json:"failed"`  // probes that did not reach it
+	DurationMS int64 `json:"duration_ms"`
+	Cached     bool  `json:"cached"`
+	Truncated  bool  `json:"truncated"` // depth cap hit before the pool was exhausted
 	// Err is set when the check completed but degraded (e.g. the pool stage was
 	// cut short). A 200 with Err is still a usable answer about the ALIVE set.
 	Err string `json:"error,omitempty"`
+}
+
+// MarshalJSON guarantees empty lists serialize as [], never null. Constructing
+// the struct with nil slices used to emit "alive":null, which a JS caller
+// reading res.alive.length cannot survive - and "no proxy can reach it" is a
+// normal answer, not an exceptional one. Doing it here rather than only in the
+// constructor means every construction path is safe, including future ones.
+func (r URLCheckResult) MarshalJSON() ([]byte, error) {
+	type alias URLCheckResult // avoid recursion
+	a := alias(r)
+	if a.Alive == nil {
+		a.Alive = []CheckedProxy{}
+	}
+	if a.Pool == nil {
+		a.Pool = []CheckedProxy{}
+	}
+	return json.Marshal(a)
 }
 
 // checkTarget is a normalized, safety-vetted probe destination.
@@ -141,6 +168,43 @@ func normalizeCheckTarget(raw string) (checkTarget, error) {
 	}, nil
 }
 
+// isNonPublicIP reports whether an IP literal is anything other than a routable
+// public address. net.IP.IsPrivate covers RFC1918 + fc00::/7 only, which left
+// real metadata endpoints reachable: RFC 6598 CGNAT (100.64/10 — the range
+// Alibaba's IMDS sits in), the RFC 2544 benchmark range (198.18/15, used by
+// Tailscale), the broadcast and reserved 240/4 blocks, and 192.0.0.192
+// (Oracle/Tencent IMDS).
+func isNonPublicIP(ip net.IP) bool {
+	switch {
+	case ip.IsLoopback(), ip.IsUnspecified(), ip.IsMulticast(),
+		ip.IsPrivate(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(),
+		ip.IsInterfaceLocalMulticast():
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		switch {
+		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // RFC 6598 CGNAT
+			return true
+		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // RFC 2544 benchmark
+			return true
+		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0 && v4[3] == 192: // Oracle/Tencent IMDS
+			return true
+		case v4[0] >= 240: // reserved 240/4 + 255.255.255.255 broadcast
+			return true
+		}
+		return false
+	}
+	// IPv6: ::/128, ::1 covered above; also refuse the documentation and
+	// discard-only ranges so they cannot be used as a covert channel either.
+	if len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc { // fc00::/7 unique-local
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 { // 2001:db8::/32
+		return true
+	}
+	return ip.IsUnspecified()
+}
+
 // registrableDomain returns the eTLD+1 of host. The public suffix list is the
 // only correct way to do this: last-two-labels turns www.example.co.uk into
 // "co.uk", which would merge unrelated sites.
@@ -161,11 +225,7 @@ func registrableDomain(host string) string {
 // for its own private network.
 func validateCheckHost(host string) error {
 	if ip := net.ParseIP(host); ip != nil {
-		// IsPrivate covers RFC1918 + fc00::/7; the rest are loopback, link-local
-		// (which is how 169.254.169.254 metadata is reached), unspecified and
-		// multicast.
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		if isNonPublicIP(ip) {
 			return fmt.Errorf("refusing non-public target %q: the probe dials from the upstream, so this would scan the upstream's own network", host)
 		}
 		return nil
@@ -284,13 +344,15 @@ func (m *ProxyManager) CheckURL(ctx context.Context, rawURL string, depth int) (
 		depth = checkMaxDepth
 	}
 	// Cache on the exact probe URL: two paths under one domain key are two
-	// different measurements.
+	// different measurements. The cache is built by NewProxyManager - a lazy
+	// nil-assign here raced with every concurrent first request.
 	cacheKey := target.ProbeURL
 	if m.urlChecks == nil {
 		m.urlChecks = newURLCheckCache()
 	}
-	if res, ok := m.urlChecks.get(cacheKey); ok && res.Checked >= m.checkedFor(res) {
-		// A deeper earlier result still satisfies a shallower request.
+	if res, ok := m.urlChecks.get(cacheKey); ok && res.Depth >= depth {
+		// A deeper earlier result still satisfies a shallower request; a
+		// shallower one must NOT satisfy a deeper request.
 		return res, nil
 	}
 	f, leader := m.urlChecks.begin(cacheKey)
@@ -309,18 +371,19 @@ func (m *ProxyManager) CheckURL(ctx context.Context, rawURL string, depth int) (
 	return res, err
 }
 
-// checkedFor is the probe count a cached result represents, so a deeper cached
-// answer can answer a shallower request.
-func (m *ProxyManager) checkedFor(res URLCheckResult) int {
-	return len(res.Alive) + len(res.Pool)
-}
-
 func (m *ProxyManager) runURLCheck(ctx context.Context, target checkTarget, depth int) (URLCheckResult, error) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, checkBudget)
 	defer cancel()
 
-	res := URLCheckResult{Key: target.Key, ProbedURL: target.ProbeURL}
+	// Non-nil so the wire format is `[]`, not `null`: a JS caller doing
+	// res.alive.length on null is a runtime error, and "no proxy can reach it"
+	// is a normal answer.
+	res := URLCheckResult{
+		Key: target.Key, ProbedURL: target.ProbeURL,
+		Alive: []CheckedProxy{}, Pool: []CheckedProxy{},
+		Depth: depth,
+	}
 
 	// 1. Instances already serving: probed on their live SOCKS port, so this
 	//    costs zero processes and answers most callers outright.
@@ -355,11 +418,10 @@ func (m *ProxyManager) runURLCheck(ctx context.Context, target checkTarget, dept
 	//    instance's snapshot minus whatever it already serves: a SAMPLE, not
 	//    an exhaustive search - a 600-config pool cannot be swept per request.
 	if depth > 0 && ctx.Err() == nil {
-		res.Pool, res.Truncated = m.probePoolForURL(ctx, target, depth)
-		for range res.Pool {
-			res.Checked++
-		}
-		res.Failed += depth - len(res.Pool)
+		var probed int
+		res.Pool, probed, res.Truncated = m.probePoolForURL(ctx, target, depth)
+		res.Checked += probed
+		res.Failed += probed - len(res.Pool)
 	}
 
 	res.DurationMS = time.Since(start).Milliseconds()
@@ -371,10 +433,10 @@ func (m *ProxyManager) runURLCheck(ctx context.Context, target checkTarget, dept
 
 // probePoolForURL probes up to depth pool candidates against target, in
 // parallel, using the same worker budget as a failover switch.
-func (m *ProxyManager) probePoolForURL(ctx context.Context, target checkTarget, depth int) (working []CheckedProxy, truncated bool) {
+func (m *ProxyManager) probePoolForURL(ctx context.Context, target checkTarget, depth int) (working []CheckedProxy, probed int, truncated bool) {
 	insts, _ := m.snapshot()
 	if len(insts) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	src := insts[0]
 	cands := src.snapshotConfigs()
@@ -386,9 +448,19 @@ func (m *ProxyManager) probePoolForURL(ctx context.Context, target checkTarget, 
 		cands = cands[:depth]
 		truncated = true
 	}
-	workers := min(switchWorkerCount(), len(cands))
+	// Drop the already-serving config AFTER truncation, and count only what is
+	// actually attempted. The old arithmetic reported Failed as
+	// depth-len(working), which invented a failure for the skipped candidate
+	// and misreported every probe when the pool was smaller than depth.
+	candidates := make([]ProxyConfig, 0, len(cands))
+	for _, cfg := range cands {
+		if cfg.Key() != activeKey {
+			candidates = append(candidates, cfg)
+		}
+	}
+	workers := min(switchWorkerCount(), len(candidates))
 	if workers < 1 {
-		return nil, truncated
+		return nil, 0, truncated
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -402,10 +474,12 @@ func (m *ProxyManager) probePoolForURL(ctx context.Context, target checkTarget, 
 					return
 				}
 				r := src.probeTempPortURL(cfg, target.ProbeURL)
+				mu.Lock()
+				probed++
 				if !r.Working {
+					mu.Unlock()
 					continue
 				}
-				mu.Lock()
 				working = append(working, CheckedProxy{
 					Name: cfg.Name, Endpoint: cfg.Key(), Instance: -1,
 					LatencyMS: r.Latency.Milliseconds(), Source: "pool",
@@ -415,10 +489,7 @@ func (m *ProxyManager) probePoolForURL(ctx context.Context, target checkTarget, 
 		}()
 	}
 send:
-	for _, cfg := range cands {
-		if cfg.Key() == activeKey {
-			continue
-		}
+	for _, cfg := range candidates {
 		select {
 		case queue <- cfg:
 		case <-ctx.Done():
@@ -427,7 +498,7 @@ send:
 	}
 	close(queue)
 	wg.Wait()
-	return working, truncated
+	return working, probed, truncated
 }
 
 // ---- HTTP surface ----

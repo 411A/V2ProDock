@@ -151,7 +151,8 @@ const defaultInstanceCount = 1
 
 // ---- SOCKS5 -> HTTP bridge ----
 const (
-	defaultMaxConns         = 128 // concurrent proxied connections (MAX_CONNS env overrides)
+	defaultMaxConns         = 128  // concurrent proxied connections (MAX_CONNS env overrides)
+	maxConnsCap             = 4096 // hard ceiling on MAX_CONNS: the semaphore is filled once per slot, so an unclamped value stalled boot for ~25s at 1e9
 	relayBufSize            = 32 * 1024
 	proxySlotWait           = 5 * time.Second // wait for a connection slot before 503
 	bridgeDialTimeout       = 5 * time.Second // upstream SOCKS dial budget: fail fast with 503, never hang

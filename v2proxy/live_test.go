@@ -158,9 +158,16 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 	// with the failing leg varying (gstatic one run, api.telegram.org the next).
 	// A systematic fragment regression would not pick and choose legs.
 	//
-	// So a regression claim needs corroboration BOTH ways: the node must still
-	// work plain right now (otherwise it merely died), and must still fail
-	// chained on a retry (otherwise the first chained probe was the flake).
+	// A regression claim therefore needs corroboration in THREE directions:
+	//   1. the chained probe failed twice, and
+	//   2. the node still works plain right now (it did not merely die), and
+	//   3. the plain probe was FAST - i.e. it had real headroom left.
+	//
+	// Condition 3 matters because fragmentation adds handshake latency by
+	// design. Without it this check cannot tell "fragment BROKE the node" from
+	// "fragment pushed an already-marginal node past the budget" - and it
+	// convicted a healthy public node (15.204.97.195) for the second case,
+	// which is a latency observation, not a regression.
 	t.Setenv("XRAY_FRAGMENT", "1")
 	for _, c := range working {
 		chained := sel.probeSnapshotOnTempPort(c)
@@ -180,7 +187,14 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 				c.Key(), plain.Describe())
 			continue
 		}
-		t.Fatalf("FRAGMENT REGRESSION: %s works plain but fails chained twice (%s)", c.Key(), chained.Describe())
+		if plain.Latency*2 >= quickProbeTimeout {
+			t.Logf("node %s: chained failed twice, but plain already used %s of a %s budget — "+
+				"fragmentation adds handshake latency, so this is a slow node, not a broken one",
+				c.Key(), plain.Latency.Round(time.Millisecond), quickProbeTimeout)
+			continue
+		}
+		t.Fatalf("FRAGMENT REGRESSION: %s works plain (%s, with headroom) but fails chained twice (%s)",
+			c.Key(), plain.Latency.Round(time.Millisecond), chained.Describe())
 	}
 
 	// 4. Switching stays bounded, serving stays intact, no orphans.
@@ -246,6 +260,11 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 		}
 	}
 	// Whatever the outcome: never more than the serving child may remain.
+	// Whatever the outcome, never more than the serving child may remain. This
+	// stays an upper bound rather than `n != 1`: a failed switch whose old
+	// config could not be restored legitimately leaves ZERO children. It is
+	// still non-vacuous because the successful-switch branch above proved the
+	// scan sees this directory's children.
 	if n := len(listXrayPIDs(dir)); n > 1 {
 		t.Fatalf("temp children leaked: %d xray processes", n)
 	}

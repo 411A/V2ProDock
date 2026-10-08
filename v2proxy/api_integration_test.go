@@ -113,6 +113,13 @@ func TestAPIProxiesExposeStability(t *testing.T) {
 	// survive JSON encoding on every /proxies entry.
 	m, api := startTestStack(t, 27800, 1)
 	m.markOK(0, "stable-one", 5*time.Millisecond)
+	// Seed NON-ZERO stability values: asserting the zero value could not detect
+	// a dropped or renamed JSON tag, because 0 is also what a missing field
+	// decodes to. This is the property the test claims to cover.
+	m.mu.Lock()
+	m.statuses[0].OkStreak = 7
+	m.statuses[0].ActiveSince = time.Unix(1700000000, 0).UTC().Format(time.RFC3339)
+	m.mu.Unlock()
 	resp, err := testClient().Get(api + "/proxies")
 	if err != nil {
 		t.Fatal(err)
@@ -125,8 +132,11 @@ func TestAPIProxiesExposeStability(t *testing.T) {
 	if len(alive) != 1 {
 		t.Fatalf("/proxies returned %d entries, want 1", len(alive))
 	}
-	if alive[0].OkStreak != 0 {
-		t.Fatalf("OkStreak = %d, want 0 (never health-checked)", alive[0].OkStreak)
+	if alive[0].OkStreak != 7 {
+		t.Fatalf("ok_streak did not survive JSON: got %d, want 7", alive[0].OkStreak)
+	}
+	if alive[0].ActiveSince == "" {
+		t.Fatal("active_since did not survive JSON")
 	}
 }
 

@@ -89,7 +89,16 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 		if attempt > 0 {
 			time.Sleep(fetchBackoffBase * time.Duration(1<<attempt))
 		}
-		req, _ := http.NewRequest("GET", subURL, nil)
+		req, err := http.NewRequest("GET", subURL, nil)
+		if err != nil {
+			// NewRequest returns a nil request on a parse error. Discarding
+			// that error (as `req, _ :=` did) meant the next line dereferenced
+			// nil and aborted the WHOLE daemon - one unparseable character in
+			// SUBSCRIPTION_URLS was a process kill, and nothing in the package
+			// recovers from a panic.
+			lastErr = fmt.Errorf("invalid url %q: %w", subURL, err)
+			continue
+		}
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "text/plain,*/*")
 		resp, err := client.Do(req)

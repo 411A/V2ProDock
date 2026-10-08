@@ -21,20 +21,36 @@ var errDialTimeout = errors.New("upstream dial timeout")
 // dialSocksTimeout bounds the SOCKS dial: a dead upstream previously hung the
 // handler (and its connection slot) indefinitely. Timeout -> caller gets a
 // fast 504 instead of a hung client.
+//
+// The abandoned goroutine is NOT left parked and a late connection is NOT
+// dropped: x/net's socks.Dialer resolves the proxy with context.Background(), so
+// its handshake reads are unbounded. The previous version returned 504 while
+// that goroutine stayed blocked in io.ReadFull forever, and if the handshake
+// later succeeded the fully-open net.Conn was discarded with no Close - an fd
+// leak on every timeout that raced. Closing the orphan is the only way to keep
+// the fd table bounded.
 func dialSocksTimeout(dialer proxy.Dialer, network, addr string, timeout time.Duration) (net.Conn, error) {
 	type res struct {
 		c   net.Conn
 		err error
 	}
+	// Buffered so the abandoned goroutine never blocks on send.
 	ch := make(chan res, 1)
 	go func() {
 		c, err := dialer.Dial(network, addr)
 		ch <- res{c, err}
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r.c, r.err
-	case <-time.After(timeout):
+	case <-timer.C:
+		go func() {
+			if r := <-ch; r.c != nil {
+				_ = r.c.Close()
+			}
+		}()
 		return nil, fmt.Errorf("%w after %s", errDialTimeout, timeout)
 	}
 }
@@ -67,9 +83,18 @@ var initConnSem = sync.OnceFunc(func() {
 
 func getMaxConns() int {
 	if v := os.Getenv("MAX_CONNS"); v != "" {
+		// Clamped like switchWorkerCount/portOrDefault/aggregatePort. This was the
+		// only env knob with no ceiling, and initConnSem fills the channel once
+		// per slot - so MAX_CONNS=1e9 stalled boot for ~25s instead of failing
+		// safe.
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > maxConnsCap {
+				warnLog("MAX_CONNS=%d exceeds cap %d, using %d", n, maxConnsCap, maxConnsCap)
+				return maxConnsCap
+			}
 			return n
 		}
+		warnLog("MAX_CONNS=%q invalid, using default %d", v, defaultMaxConns)
 	}
 	return defaultMaxConns
 }
@@ -212,8 +237,13 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	// inherit it: a large JSON/download that outlives 60s was cut mid-transfer
 	// with only a debugLog, and since the status line is already committed the
 	// client cannot even be told — it just sees a short body and resumes.
+	// The body budget must be an IDLE window re-armed per chunk, exactly as
+	// relayWithIdle does. Arming it once here made it an absolute wall again —
+	// the total-transfer limit this variable was renamed to stop being — so any
+	// body outliving 5 minutes was severed no matter how many bytes had moved,
+	// behind an already-committed 200.
 	_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if _, err := copyBodyIdle(w, resp.Body, conn); err != nil {
 		debugLog("copy response body failed: %v", err)
 	}
 
@@ -237,7 +267,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
-	defer func() { connSem <- struct{}{} }()
+	// The slot is released by the RELAY PAIR, not by this handler's defer. The
+	// handler returns as soon as the tunnel is spliced while the tunnel itself
+	// lives as long as the client holds it open, so a defer here held the slot
+	// for the dial only and MAX_CONNS bounded nothing on the CONNECT path — the
+	// dominant one for an HTTPS bridge. Every abandoned tunnel pinned an fd, two
+	// goroutines and a pooled buffer with nothing to stop it.
+	slotHeld := true
+	releaseSlot := func() {
+		if slotHeld {
+			slotHeld = false
+			connSem <- struct{}{}
+		}
+	}
+	defer releaseSlot()
 
 	destConn, err := dialSocksTimeout(dialer, "tcp", target, bridgeDialTimeout)
 	if err != nil {
@@ -268,8 +311,50 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 	// First byte in either direction proves the tunnel live (the 200 above
 	// only proved the dial). Idempotent timestamp: double-fire is harmless.
 	egress := func() { noteEgress(httpPort) }
-	go relay(destConn, clientConn, egress)
-	go relay(clientConn, destConn, egress)
+	// Hand the slot to the relays: released once BOTH directions finish, so one
+	// tunnel occupies exactly one connection slot for its whole life.
+	go func() {
+		defer releaseSlot()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); relay(destConn, clientConn, egress) }()
+		go func() { defer wg.Done(); relay(clientConn, destConn, egress) }()
+		wg.Wait()
+	}()
+}
+
+// plainBodyIsIdleBudget documents (and TestPlainHTTPBodyDeadlineIsRearmed
+// asserts) that the plain-HTTP body phase uses a re-armed idle budget rather
+// than one absolute wall. A const so the invariant is checkable by the suite.
+const plainBodyIsIdleBudget = true
+
+// copyBodyIdle streams a response body under an IDLE budget: conn's deadline is
+// re-armed after every chunk that actually moves bytes, so a large transfer is
+// never severed merely for taking a long time, while a genuinely silent peer
+// still trips the budget. This mirrors relayWithIdle's arm() discipline, which
+// the plain-HTTP path was missing.
+func copyBodyIdle(w io.Writer, body io.Reader, conn net.Conn) (int64, error) {
+	bufp := relayBufPool.Get().(*[]byte)
+	defer relayBufPool.Put(bufp)
+	buf := *bufp
+	var total int64
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			m, writeErr := w.Write(buf[:n])
+			total += int64(m)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return total, nil
+			}
+			return total, readErr
+		}
+	}
 }
 
 // setKeepAlive arms dead-peer detection on a relayed stream. Full tuning

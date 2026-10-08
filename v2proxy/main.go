@@ -37,7 +37,10 @@ func main() {
 	if v := os.Getenv("SUBSCRIPTION_URL"); v != "" {
 		subURL = v
 	}
-	if v := os.Getenv("HEALTH_CHECK_URL"); v != "" {
+	if v := strings.TrimSpace(os.Getenv("HEALTH_CHECK_URL")); v != "" {
+		// Trimmed: probeLegs substitutes its default only on the EMPTY string,
+		// so a stray space from a .env/compose file became the probe target
+		// and every candidate was rejected as "unsupported protocol scheme".
 		testURL = v
 	}
 	if v := os.Getenv("XRAY_DIR"); v != "" {

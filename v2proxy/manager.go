@@ -43,8 +43,14 @@ type ProxyManager struct {
 	// concurrent identical requests onto one round of probing. Lazily built
 	// because NewProxyManager is also built directly by tests.
 	urlChecks *urlCheckCache
-	// srcBrk rests dead subscription sources across refreshes (single
-	// goroutine use — subscription loop only — so no mutex).
+	// srcBrk rests dead subscription sources across refreshes. It NEEDS a
+	// mutex: the comment claiming "subscription loop only" was false, because
+	// POST /refresh runs RefreshSubscriptions in its own goroutine (api.go), so
+	// the ticker and an API-triggered refresh routinely overlapped and wrote
+	// these maps concurrently - a `fatal error: concurrent map writes` that
+	// takes the daemon down. A VALUE field with an internal mutex (not a
+	// pointer) so the zero value is usable: tests build &ProxyManager{...}
+	// literals, and a nil pointer here was a segfault.
 	srcBrk srcBreaker
 }
 
@@ -55,12 +61,15 @@ type ProxyManager struct {
 // failures the source rests for srcSkipCycles refreshes; the next allowed
 // fetch then probes recovery (success resets, failure re-arms).
 type srcBreaker struct {
+	mu    sync.Mutex
 	fails map[string]int
 	skip  map[string]int
 }
 
 // allow reports whether url may be fetched this refresh, counting down rests.
 func (b *srcBreaker) allow(url string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	left, resting := b.skip[url]
 	if !resting || left <= 0 {
 		return true
@@ -71,11 +80,15 @@ func (b *srcBreaker) allow(url string) bool {
 
 // restLeft reports remaining rest cycles (0 = not resting).
 func (b *srcBreaker) restLeft(url string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.skip[url]
 }
 
 // note records one refresh outcome for url.
 func (b *srcBreaker) note(url string, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if ok {
 		delete(b.fails, url)
 		delete(b.skip, url)
@@ -104,6 +117,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		portBase:      portBase,
 		checkInterval: checkInterval,
 		statuses:      make([]InstanceStatus, instanceCount),
+		urlChecks:     newURLCheckCache(),
 	}
 
 	// Port layout: all SOCKS5 ports first, then all HTTP ports.

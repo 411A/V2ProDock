@@ -333,7 +333,7 @@ func TestCheckEndpointReportsNoneWorking(t *testing.T) {
 	// Nothing serves the host: a working 200 with an empty list, NOT an error.
 	// "No proxy can reach it" is a real answer the caller asked for.
 	_, base := checkStack(t, map[string]int{}, 1)
-	res := postCheck(t, base, "https://filtered.example/", 0)
+	res := postCheck(t, base, "http://filtered.example/", 0)
 	if len(res.Alive) != 0 || len(res.Pool) != 0 {
 		t.Fatalf("expected no working proxies, got %+v", res)
 	}
@@ -513,7 +513,6 @@ func TestCheckDoesNotMutatePool(t *testing.T) {
 		}
 		pids[i] = inst.currentPID()
 	}
-	shared := newProbeShared()
 	if _, err := m.CheckURL(context.Background(), "http://unreachable.example/", 0); err != nil {
 		t.Fatalf("CheckURL: %v", err)
 	}
@@ -525,10 +524,12 @@ func TestCheckDoesNotMutatePool(t *testing.T) {
 		if got != before[i] {
 			t.Errorf("instance %d active changed %q -> %q", i, before[i], got)
 		}
-		if len(shared.bad) != 0 {
-			t.Errorf("check poisoned the shared ledger: %v", shared.bad)
+		// The comment promised "same child" too; the previous version
+		// collected the PID and threw it away, so only half the invariant was
+		// ever checked.
+		if got := inst.currentPID(); got != pids[i] {
+			t.Errorf("instance %d child changed %d -> %d", i, pids[i], got)
 		}
-		_ = pids[i]
 	}
 }
 

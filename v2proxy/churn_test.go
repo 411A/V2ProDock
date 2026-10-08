@@ -112,7 +112,7 @@ func TestManagedPIDsIncludesTemp(t *testing.T) {
 // ---- dead-source circuit breaker ----
 
 func TestSrcBreakerTransitions(t *testing.T) {
-	b := &srcBreaker{}
+	b := srcBreaker{} // zero value is usable: the mutex is internal and note() creates the maps
 	dead := "http://192.0.2.9/sub.txt"
 	if !b.allow(dead) {
 		t.Fatal("fresh source must be allowed")

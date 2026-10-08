@@ -226,8 +226,16 @@ func TestLifecycleStartSwitchNoOrphans(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected switch error when every candidate is dead")
 	}
+	// At most one child may remain. ZERO is also a correct outcome here: every
+	// candidate was dead, so tryRestoreLocked has nothing to restore and the
+	// instance is deliberately left with no child rather than a broken one - so
+	// this must stay an upper bound, not `n != 1`.
+	//
+	// It is not vacuous even though an upper bound: this same test asserted
+	// stubCount(dir) == 1 immediately after StartWithBest, which proves the
+	// /proc matcher can see this directory's children at all.
 	if n := stubCount(dir); n > 1 {
-		t.Fatalf("expected <=1 stub xray after failed switch, found %d (orphans!)", n)
+		t.Fatalf("orphaned children after a failed switch: %d", n)
 	}
 }
 
@@ -430,6 +438,14 @@ func TestReconcileStaleLatencyNotRotated(t *testing.T) {
 	s.lastLatency = rotateSlowLatency + time.Second
 	s.lastProbe = time.Now().Add(-2 * rotateLatencyMaxAge)
 	s.mu.Unlock()
+	// This test is about the STALENESS guard, but reconcileActive checks
+	// ServingTraffic FIRST and returns before reaching it. Ports are OS-issued
+	// and recycled, so a note from an earlier test could silently short-circuit
+	// the guard under test.
+	expireEgress(socks, httpP)
+	if s.ServingTraffic() {
+		t.Fatal("precondition: instance must look idle, got ServingTraffic=true")
+	}
 	before := s.currentPID()
 	m := &ProxyManager{
 		instances: []*ProxySelector{s},

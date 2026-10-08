@@ -612,15 +612,27 @@ func (s *ProxySelector) probeCandidateOnTempPort(cfg ProxyConfig) HealthResult {
 // launch is serialized on tempMu so two workers can never share an ephemeral
 // port or config file.
 func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
-	return s.probeTempPortURL(cfg, s.testURL)
+	return s.probeTempPort(cfg, s.testURL, false)
 }
 
-// probeTempPortURL is probeSnapshotOnTempPort with an EXPLICIT target URL, so
-// a caller can ask "can this upstream reach THAT url" (the /check endpoint)
-// without disturbing the instance's configured health probe. Read-only: it
-// never touches activeIndex, the shared probe ledger, or the serving port, so
-// a check against a target nobody can reach can never cull the pool.
+// probeTempPortURL is probeSnapshotOnTempPort with an EXPLICIT target URL and a
+// SINGLE-TARGET probe (no fallback race). It exists for /check, where the
+// question is "can this upstream reach THAT url" - and a liveness race answers
+// a different question. It never touches activeIndex, the shared probe ledger,
+// or the serving port, so a check against a target nobody can reach can never
+// cull the pool.
+//
+// The race is deliberately NOT used here: racing the requested URL against
+// cp.cloudflare.com and api.telegram.org means a node where the target is
+// filtered but Telegram answers reports "working" - the exact false negative /
+// check exists to eliminate.
 func (s *ProxySelector) probeTempPortURL(cfg ProxyConfig, probeURL string) HealthResult {
+	return s.probeTempPort(cfg, probeURL, true)
+}
+
+// probeTempPort is the shared core. race selects the health semantics (fallback
+// legs raced, for liveness) versus single-target grading (for /check).
+func (s *ProxySelector) probeTempPort(cfg ProxyConfig, probeURL string, singleTarget bool) HealthResult {
 	s.tempMu.Lock()
 	// Ephemeral port: bind :0, read back the port, release.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -662,7 +674,11 @@ func (s *ProxySelector) probeTempPortURL(cfg ProxyConfig, probeURL string) Healt
 	if !open {
 		return HealthResult{Error: fmt.Errorf("temp xray port never opened")}
 	}
-	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), probeURL)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	if singleTarget {
+		return testSingleURL(addr, probeURL, quickProbeTimeout)
+	}
+	return TestProxyQuick(addr, probeURL)
 }
 
 // trackTemp/untrackTemp/tempPIDSnapshot guard the in-flight throwaway-probe
