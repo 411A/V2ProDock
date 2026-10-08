@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -121,15 +122,30 @@ func fetchXrayZip(url, xrayDir, xrayBin string) error {
 	return nil
 }
 
+// unzipAbsent reports whether an unzip invocation failed because the binary
+// itself is missing, rather than because the archive is bad.
+//
+// exec.Command resolves the path at Run time, so a missing binary returns
+// exec.ErrNotFound with EMPTY CombinedOutput - the child never ran, so it
+// printed nothing. Probing that output with strings.Contains("not found") can
+// therefore never match, which made the python3 fallback below unreachable on
+// every host without unzip: boot died on a raw exec error instead of falling
+// back. Found by booting the daemon on a host without unzip.
+func unzipAbsent(err error, output []byte) bool {
+	return errors.Is(err, exec.ErrNotFound) ||
+		strings.Contains(string(output), "not found") ||
+		strings.Contains(string(output), "No such file")
+}
+
 func extractZip(src, dst string) error {
 	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
 		// Try unzip first
 		cmd := exec.Command("unzip", "-o", src, "-d", dst)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			// unzip might not be available, try tar or python
-			if strings.Contains(string(output), "not found") || strings.Contains(string(output), "No such file") {
+			// unzip might not be available, try python
+			if unzipAbsent(err, output) {
 				cmd2 := exec.Command("python3", "-c",
-					fmt.Sprintf("import zipfile; zipfile.ZipFile('%s').extractall('%s')", src, dst))
+					fmt.Sprintf("import zipfile;zipfile.ZipFile('%s').extractall('%s')", src, dst))
 				if output2, err2 := cmd2.CombinedOutput(); err2 != nil {
 					return fmt.Errorf("extract failed: %s %s", string(output), string(output2))
 				}

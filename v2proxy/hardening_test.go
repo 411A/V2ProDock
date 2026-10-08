@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -37,6 +38,40 @@ func TestPortOrDefault(t *testing.T) {
 		if got := portOrDefault(key, 27018); got != tc.want {
 			t.Errorf("portOrDefault(%q) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// extractZip's python3 fallback is decided by a predicate, and the old inline
+// version of that predicate could never fire: a missing binary returns
+// exec.ErrNotFound with EMPTY CombinedOutput, so matching on the output text
+// was always false and boot died with a raw exec error on any host without
+// unzip. Found by actually booting the daemon on such a host.
+func TestUnzipAbsentDetectsMissingBinary(t *testing.T) {
+	// What exec really returns when the binary is not on PATH.
+	out, err := exec.Command("v2prodock-no-such-unzip-binary").CombinedOutput()
+	if err == nil {
+		t.Skip("cannot reproduce: a binary with that name exists")
+	}
+	if len(out) != 0 {
+		t.Skipf("cannot reproduce: missing binary produced output %q", out)
+	}
+	if !unzipAbsent(err, out) {
+		t.Fatalf("a missing binary must be detected; the old output-text probe returned false for err=%v output=%q", err, out)
+	}
+	// A present unzip that exited non-zero is a BAD ARCHIVE, not a missing
+	// binary: retrying it via python3 would hide a corrupt download.
+	if unzipAbsent(&exec.ExitError{}, nil) {
+		t.Error("a non-zero exit of a present unzip must not be treated as a missing binary")
+	}
+	if unzipAbsent(nil, nil) {
+		t.Error("no error and no output must not be treated as a missing binary")
+	}
+	// Legacy text probes still honoured for wrappers that do print it.
+	if !unzipAbsent(nil, []byte("bash: unzip: command not found")) {
+		t.Error("must still honour the legacy stderr text probe")
+	}
+	if !unzipAbsent(nil, []byte("unzip: No such file or directory")) {
+		t.Error("must still honour the legacy No-such-file probe")
 	}
 }
 

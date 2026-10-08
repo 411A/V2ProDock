@@ -289,7 +289,6 @@ func TestProbeLegComposition(t *testing.T) {
 // Loopback probe targets used by the race tests. Plaintext on purpose: see above.
 const (
 	blockedTarget   = "http://blocked.example/generate_204"
-	fallbackTarget  = "http://fallback.example/generate_204"
 	telegramTarget  = "http://telegram.example/"
 	onlyTarget      = "http://only-this.example/generate_204"
 	unreachTarget   = "http://nowhere.example/generate_204"

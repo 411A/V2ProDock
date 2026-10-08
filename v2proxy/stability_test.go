@@ -171,7 +171,7 @@ func TestPickAggregatePorts(t *testing.T) {
 // renderOutbound parses a freshly rendered serving config back for assertions.
 func renderOutbound(t *testing.T, dir string, xrayCfg string) map[string]any {
 	t.Helper()
-	sel := NewProxySelector(dir, "http://probe.invalid/", 27991, 27992, time.Minute)
+	sel := newTestSelector(t, dir, "http://probe.invalid/", 27991, 27992)
 	path, err := sel.renderXrayConfig(ProxyConfig{Name: "n", Raw: "r", XrayCfg: []byte(xrayCfg)}, 27991, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +333,7 @@ func TestStreakLifecycle(t *testing.T) {
 	// on the SOCKS port (the stub answers every request with 204).
 	stubAddr, done := serveSocks204(t, "ok")
 	stubPort := splitPort(t, stubAddr)
-	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", stubPort, freeAggPort(t), time.Minute)
+	s := newTestSelector(t, t.TempDir(), "http://probe.invalid/", stubPort, freeAggPort(t))
 	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
 	s.mu.Lock()
 	s.activeIndex = 0
@@ -369,7 +369,7 @@ func TestStreakLifecycle(t *testing.T) {
 func TestMarkOKCopiesStreak(t *testing.T) {
 	stubAddr, done := serveSocks204(t, "ok")
 	defer done()
-	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t), time.Minute)
+	s := newTestSelector(t, t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t))
 	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
 	s.mu.Lock()
 	s.activeIndex = 0
@@ -402,7 +402,7 @@ func TestRateLimitNeutral(t *testing.T) {
 	// failCount frozen, streak untouched, still serving.
 	stubAddr, done := serveSocks204(t, "limited")
 	defer done()
-	s := NewProxySelector(t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t), time.Minute)
+	s := newTestSelector(t, t.TempDir(), "http://probe.invalid/", splitPort(t, stubAddr), freeAggPort(t))
 	s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
 	s.mu.Lock()
 	s.activeIndex = 0
@@ -425,7 +425,7 @@ func TestEgressActivitySkip(t *testing.T) {
 	// path fails after 3 strikes; with a fresh note the instance is healthy
 	// by definition (no network touched).
 	mkDead := func() *ProxySelector {
-		s := NewProxySelector(t.TempDir(), "http://probe.invalid/", freeAggPort(t), freeAggPort(t), time.Minute)
+		s := newTestSelector(t, t.TempDir(), "http://probe.invalid/", freeAggPort(t), freeAggPort(t))
 		s.UpdateConfigs([]ProxyConfig{{Name: "n", Raw: "r", Endpoint: "e:1"}})
 		s.mu.Lock()
 		s.activeIndex = 0
@@ -692,6 +692,9 @@ func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
 func backendManager(statuses []InstanceStatus, ports ...int) *ProxyManager {
 	insts := make([]*ProxySelector, 0, len(statuses))
 	for i := range statuses {
+		// Deliberately the raw constructor: this helper has no *testing.T and
+		// its selectors point at /nonexistent, so they never launch an xray
+		// child and have nothing to reap.
 		insts = append(insts, NewProxySelector("/nonexistent", "http://probe.invalid/", ports[2*i], ports[2*i+1], time.Minute))
 	}
 	return &ProxyManager{instances: insts, statuses: statuses}
@@ -924,7 +927,7 @@ func TestSearchLeavesServingAlone(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{
 		e2eCand("old", "e2e-old:9", "good"),
 		e2eCand("bad1", "e2e-bad1:9", "dead-hang"),
@@ -958,7 +961,7 @@ func TestSearchAllDeadBounded(t *testing.T) {
 	needStub(t)
 	dir := t.TempDir()
 	writeStubXray(t, dir)
-	s := NewProxySelector(dir, "http://probe.invalid/", freeLoopbackPort(t), freeLoopbackPort(t), time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", freeLoopbackPort(t), freeLoopbackPort(t))
 	snap := []ProxyConfig{
 		e2eCand("d1", "e2e-d1:8", "dead-hang"),
 		e2eCand("d2", "e2e-d2:8", "dead-hang"),

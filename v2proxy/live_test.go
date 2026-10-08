@@ -120,7 +120,7 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 	// that can reach THIS url". Leaving it empty silently substituted probeURL
 	// and made the assertion depend on a production default instead of stating
 	// it.
-	sel := NewProxySelector(dir, probeURL, freeLoopbackPort(t), freeLoopbackPort(t), time.Minute)
+	sel := newTestSelector(t, dir, probeURL, freeLoopbackPort(t), freeLoopbackPort(t))
 
 	// 2. Fragment load-safety on real TLS shapes: every sampled config must
 	//    load in the genuine binary both WITHOUT and WITH the chain.

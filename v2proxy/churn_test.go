@@ -22,7 +22,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 const (
@@ -172,7 +171,7 @@ func TestRefreshSkipsRestingSource(t *testing.T) {
 	// for the dead production host here (proves the skip, not the failure).
 	dead := "http://192.0.2.9/sub.txt"
 	dir := t.TempDir()
-	sel := NewProxySelector(dir, "http://probe.invalid/", 0, 0, time.Minute)
+	sel := newTestSelector(t, dir, "http://probe.invalid/", 0, 0)
 	a := mustParseChurn(t, churnVlessA)
 	sel.UpdateConfigs([]ProxyConfig{a})
 	sel.activeIndex = 0 // serving A, never failed it
@@ -210,7 +209,7 @@ func TestRefreshSkipsRestingSource(t *testing.T) {
 func TestRefreshRetainsHealthyVanishedActive(t *testing.T) {
 	good := churnPoolServer(t, churnVlessB)
 	dir := t.TempDir()
-	sel := NewProxySelector(dir, "http://probe.invalid/", 0, 0, time.Minute)
+	sel := newTestSelector(t, dir, "http://probe.invalid/", 0, 0)
 	a := mustParseChurn(t, churnVlessA)
 	sel.UpdateConfigs([]ProxyConfig{a})
 	sel.activeIndex = 0 // serving A, failCount 0 = never failed
@@ -235,7 +234,7 @@ func TestRefreshRetainsHealthyVanishedActive(t *testing.T) {
 func TestRefreshRotatesFailedVanishedActive(t *testing.T) {
 	good := churnPoolServer(t, churnVlessB)
 	dir := t.TempDir()
-	sel := NewProxySelector(dir, "http://probe.invalid/", 0, 0, time.Minute)
+	sel := newTestSelector(t, dir, "http://probe.invalid/", 0, 0)
 	a := mustParseChurn(t, churnVlessA)
 	sel.UpdateConfigs([]ProxyConfig{a})
 	sel.activeIndex = 0

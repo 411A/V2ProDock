@@ -147,6 +147,21 @@ func freeLoopbackPort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// newTestSelector builds a selector whose xray child is REAPED when the test
+// ends. Every selector-based test must go through this: a leaked child keeps
+// its process alive after the test binary exits, and because these tests assert
+// exact child counts via the /proc matcher, accumulated orphans from earlier
+// runs eventually made unrelated e2e tests fail (measured: 250 orphaned stubs
+// across repeated runs; 3 unrelated tests failing until the environment was
+// cleaned). Production reaps via manager.Stop() on SIGTERM - tests must not be
+// laxer than production.
+func newTestSelector(t *testing.T, xrayDir, testURL string, socksPort, httpPort int) *ProxySelector {
+	t.Helper()
+	s := NewProxySelector(xrayDir, testURL, socksPort, httpPort, time.Minute)
+	t.Cleanup(s.Stop)
+	return s
+}
+
 func e2eCand(name, endpoint, mode string) ProxyConfig {
 	return ProxyConfig{
 		Name:     name,
@@ -165,7 +180,7 @@ func TestLifecycleStartSwitchNoOrphans(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{
 		e2eCand("crash", "e2e-crash:1", "dead-crash"),
 		e2eCand("hang", "e2e-hang:1", "dead-hang"),
@@ -221,7 +236,7 @@ func TestReconcileVanishedActiveRotates(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -258,7 +273,7 @@ func TestReconcileVanishedHealthyActiveRetained(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -294,7 +309,7 @@ func TestReconcileFastActiveUntouched(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -340,7 +355,7 @@ func TestReconcileSlowServingActiveRetained(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -378,7 +393,7 @@ func TestPassiveHealthLeavesLatencyStale(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -406,7 +421,7 @@ func TestReconcileStaleLatencyNotRotated(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -437,7 +452,7 @@ func TestReconcileSlowIdleActiveStillRotates(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{e2eCand("A", "e2e-a:1", "good"), e2eCand("B", "e2e-b:1", "good")})
 	if err := s.StartWithBest(); err != nil {
 		t.Fatal(err)
@@ -486,7 +501,7 @@ func TestPopulateThrottledTargetDoesNotPoisonPool(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	// Stop the serving child before the test ends: a stub left listening
 	// outlives the test binary's stdout pipe, which makes `go test` hang for
 	// the full stub lifetime ("Test I/O incomplete ...") under LOG_LEVEL=debug.
@@ -525,7 +540,7 @@ func TestPopulateDeadTargetDoesPoisonPool(t *testing.T) {
 	dir := t.TempDir()
 	writeStubXray(t, dir)
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, "http://probe.invalid/", socks, httpP)
 	t.Cleanup(s.Stop)
 	s.UpdateConfigs([]ProxyConfig{
 		e2eCand("hang", "e2e-hang:1", "dead-hang"),

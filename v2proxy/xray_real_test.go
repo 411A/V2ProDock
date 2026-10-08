@@ -135,7 +135,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sel := NewProxySelector(dir, target, freeLoopbackPort(t), freeLoopbackPort(t), time.Minute)
+	sel := newTestSelector(t, dir, target, freeLoopbackPort(t), freeLoopbackPort(t))
 
 	// 1. Renderer output must be accepted by the genuine binary, and the
 	//    quick probe through it must report WORKING.
@@ -226,7 +226,7 @@ func TestRealXrayFragmentChain(t *testing.T) {
 	copyRealXray(t, bin, dir)
 	t.Setenv("XRAY_FRAGMENT", "1")
 
-	sel := NewProxySelector(dir, target, freeLoopbackPort(t), freeLoopbackPort(t), time.Minute)
+	sel := newTestSelector(t, dir, target, freeLoopbackPort(t), freeLoopbackPort(t))
 
 	// 1. TLS-marked upstream: the genuine binary must ACCEPT the rendered
 	//    fragment chain (sockopt.dialerProxy + freedom carrier). A wrong
@@ -276,7 +276,7 @@ func TestRealXrayParallelSwitch(t *testing.T) {
 	copyRealXray(t, bin, dir)
 
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, target, socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, target, socks, httpP)
 	closed1, closed2 := freeLoopbackPort(t), freeLoopbackPort(t)
 	s.UpdateConfigs([]ProxyConfig{
 		{Name: "dead1", Raw: "rp-dead1", Endpoint: "rp-dead1:1", XrayCfg: realOutbound(closed1)},
@@ -320,7 +320,7 @@ func TestRealXrayAggregate(t *testing.T) {
 	copyRealXray(t, bin, dir)
 
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, target, socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, target, socks, httpP)
 	s.UpdateConfigs([]ProxyConfig{
 		{Name: "good", Raw: "ra-good", Endpoint: "ra-good:1", XrayCfg: realOutbound(srvPort)},
 	})
@@ -356,7 +356,7 @@ func TestRealXraySelectorLifecycle(t *testing.T) {
 	}
 
 	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
-	s := NewProxySelector(dir, target, socks, httpP, time.Minute)
+	s := newTestSelector(t, dir, target, socks, httpP)
 	closedUpstream := freeLoopbackPort(t)
 	s.UpdateConfigs([]ProxyConfig{
 		{Name: "broken", Raw: "r-broken", Endpoint: "r-broken:1", XrayCfg: []byte(`{invalid`)},
