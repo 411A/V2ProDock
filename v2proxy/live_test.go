@@ -152,11 +152,35 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 		}
 	}
 	t.Logf("opportunistic working set: %d", len(working))
+
+	// A single 3s probe against a FREE PUBLIC proxy proves nothing in either
+	// direction: measured flakiness was 1 failure in 4 runs on the same node,
+	// with the failing leg varying (gstatic one run, api.telegram.org the next).
+	// A systematic fragment regression would not pick and choose legs.
+	//
+	// So a regression claim needs corroboration BOTH ways: the node must still
+	// work plain right now (otherwise it merely died), and must still fail
+	// chained on a retry (otherwise the first chained probe was the flake).
 	t.Setenv("XRAY_FRAGMENT", "1")
 	for _, c := range working {
-		if res := sel.probeSnapshotOnTempPort(c); !res.Working {
-			t.Fatalf("FRAGMENT REGRESSION: %s works plain but not chained (%v)", c.Key(), res.Error)
+		chained := sel.probeSnapshotOnTempPort(c)
+		if chained.Working {
+			continue
 		}
+		if retry := sel.probeSnapshotOnTempPort(c); retry.Working {
+			t.Logf("node %s failed the first chained probe (%s) but passed a retry — transient, not a regression",
+				c.Key(), chained.Describe())
+			continue
+		}
+		t.Setenv("XRAY_FRAGMENT", "")
+		plain := sel.probeSnapshotOnTempPort(c)
+		t.Setenv("XRAY_FRAGMENT", "1")
+		if !plain.Working {
+			t.Logf("node %s is a dead upstream (plain re-probe: %s) — not a fragment regression",
+				c.Key(), plain.Describe())
+			continue
+		}
+		t.Fatalf("FRAGMENT REGRESSION: %s works plain but fails chained twice (%s)", c.Key(), chained.Describe())
 	}
 
 	// 4. Switching stays bounded, serving stays intact, no orphans.
