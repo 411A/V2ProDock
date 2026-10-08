@@ -8,6 +8,13 @@ package main
 //
 //	[local HTTP target] <-freedom- [server xray: vmess in] <-vmess- [client xray: socks in]
 //
+// Reachability is asserted with testSingleURL, NOT TestProxyQuick: these tests
+// claim a loopback target is reachable, and the quick probe's fallback legs
+// (gstatic / Cloudflare / api.telegram.org) would fire REAL traffic to the
+// internet while the assertion under test is loopback-only. The race itself is
+// covered hermetically in probe_test.go; here the question is strictly "does
+// this one URL come back through a genuine xray tunnel".
+//
 // Run: V2PRODOCK_REAL_XRAY=/path/to/xray go test -run TestRealXray -v .
 // Skipped otherwise (CI without the binary stays hermetic).
 
@@ -23,6 +30,30 @@ import (
 )
 
 const realTestUUID = "123e4567-e89b-12d3-a456-426614174000"
+
+// probeTarget asserts that url is reachable through the SOCKS tunnel at
+// proxyAddr, and fails with the full verdict (which names its target).
+func probeTarget(t *testing.T, proxyAddr, url string) HealthResult {
+	t.Helper()
+	res := testSingleURL(proxyAddr, url, quickProbeTimeout)
+	if !res.Working {
+		t.Fatalf("target %s NOT reachable through %s: %s", url, proxyAddr, res.Describe())
+	}
+	if res.URL != url {
+		t.Fatalf("verdict names %q, want the probed target %q", res.URL, url)
+	}
+	return res
+}
+
+// assertUnreachable asserts url does NOT come back through the tunnel.
+func assertUnreachable(t *testing.T, proxyAddr, url string) HealthResult {
+	t.Helper()
+	res := testSingleURL(proxyAddr, url, quickProbeTimeout)
+	if res.Working {
+		t.Fatalf("target %s reported reachable through %s: %s", url, proxyAddr, res.Describe())
+	}
+	return res
+}
 
 func needRealXray(t *testing.T) string {
 	t.Helper()
@@ -121,9 +152,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 	if !waitForPort(sel.SOCKSPort(), 5*time.Second) {
 		t.Fatal("genuine xray never bound SOCKS port")
 	}
-	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", sel.SOCKSPort()), target); !res.Working {
-		t.Fatalf("quick probe through REAL xray must work, got %v", res.Error)
-	}
+	probeTarget(t, fmt.Sprintf("127.0.0.1:%d", sel.SOCKSPort()), target)
 
 	// 2. Dead upstream behind an OPEN SOCKS port must report NOT working
 	//    (TCP-open is never a health verdict), and stay bounded.
@@ -134,7 +163,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render dead: %v", err)
 	}
-	defer os.Remove(deadCfg)
+	defer func() { _ = os.Remove(deadCfg) }()
 	deadCmd, err := launchXray(dir, deadCfg)
 	if err != nil {
 		t.Fatalf("launch dead-upstream client: %v", err)
@@ -147,12 +176,12 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 		t.Fatal("precondition broken: SOCKS port must be TCP-open here")
 	}
 	start := time.Now()
-	res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", deadSock), target)
-	if res.Working {
-		t.Fatal("probe through dead upstream must NOT report working")
-	}
+	res := assertUnreachable(t, fmt.Sprintf("127.0.0.1:%d", deadSock), target)
 	if el := time.Since(start); el > quickProbeTimeout+5*time.Second {
 		t.Fatalf("dead-tunnel probe took %s, budget is %s", el, quickProbeTimeout)
+	}
+	if res.Error == nil {
+		t.Fatalf("dead tunnel must be a transport failure, got %s", res.Describe())
 	}
 
 	// 3. Killing the server must flip the good chain to NOT working:
@@ -161,9 +190,7 @@ func TestRealXrayProbeVerdicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = srv.Wait()
-	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", sel.SOCKSPort()), target); res.Working {
-		t.Fatal("probe must fail after server death")
-	}
+	assertUnreachable(t, fmt.Sprintf("127.0.0.1:%d", sel.SOCKSPort()), target)
 }
 
 // realTLSOutbound wraps realOutbound with a TLS streamSettings marker so the
@@ -209,7 +236,7 @@ func TestRealXrayFragmentChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	defer os.Remove(cfgPath)
+	defer func() { _ = os.Remove(cfgPath) }()
 	cmd, err := launchXray(dir, cfgPath)
 	if err != nil {
 		t.Fatalf("genuine xray rejected the fragment chain: %v", err)
@@ -227,7 +254,7 @@ func TestRealXrayFragmentChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render plain: %v", err)
 	}
-	defer os.Remove(plainCfg)
+	defer func() { _ = os.Remove(plainCfg) }()
 	plainCmd, err := launchXray(dir, plainCfg)
 	if err != nil {
 		t.Fatalf("launch plain: %v", err)
@@ -236,9 +263,7 @@ func TestRealXrayFragmentChain(t *testing.T) {
 	if !waitForPort(plainSock, 5*time.Second) {
 		t.Fatal("plain xray never bound")
 	}
-	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", plainSock), target); !res.Working {
-		t.Fatalf("fragment-enabled renderer must still proxy plaintext, got %v", res.Error)
-	}
+	probeTarget(t, fmt.Sprintf("127.0.0.1:%d", plainSock), target)
 }
 
 func TestRealXrayParallelSwitch(t *testing.T) {
@@ -310,9 +335,9 @@ func TestRealXrayAggregate(t *testing.T) {
 	startAggregator(m, ap, 0)
 	addr := fmt.Sprintf("127.0.0.1:%d", ap)
 	waitAggTCP(t, addr)
-	if res := TestProxyQuick(addr, target); !res.Working {
-		t.Fatalf("aggregate over real xray must serve, got %v", res.Error)
-	}
+	// Through the AGGREGATE SOCKS port: proves the stable endpoint routes a
+	// specific URL to a genuine xray tunnel without touching the internet.
+	probeTarget(t, addr, target)
 }
 
 func TestRealXraySelectorLifecycle(t *testing.T) {

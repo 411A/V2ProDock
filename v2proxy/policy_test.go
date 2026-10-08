@@ -119,7 +119,43 @@ func TestPolicyToolchainContract(t *testing.T) {
 	}
 }
 
-// TestPolicyAPIRoutes ensures every documented endpoint stays registered.
+// TestPolicyLintGate keeps the strict lint gate from eroding. golangci-lint v2
+// dropped v1's implicit default exclusions, which is how this repo drifted to
+// 33 findings (31 unchecked Close/Remove) while AGENT.md still claimed EXIT 0.
+// The config is therefore part of the contract, not a local preference.
+func TestPolicyLintGate(t *testing.T) {
+	raw, err := os.ReadFile(".golangci.yml")
+	if err != nil {
+		t.Fatalf("the strict lint gate requires a committed .golangci.yml: %v", err)
+	}
+	cfg := string(raw)
+
+	// errcheck was where the drift accumulated; it must stay on, and tests must
+	// stay in scope (every unchecked Close lived in a _test.go file).
+	for _, want := range []string{"errcheck", "tests: true"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("policy: .golangci.yml must contain %q", want)
+		}
+	}
+	if strings.Contains(cfg, "default: none") {
+		t.Error("policy: .golangci.yml must not disable the standard linter set")
+	}
+	// The production-only correctness tier beyond the standard set.
+	for _, want := range []string{"bodyclose", "errorlint", "gocritic", "revive", "misspell", "unconvert"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("policy: .golangci.yml should enable %q", want)
+		}
+	}
+	// stylecheck (ST*) is where the naming rule lives; it must run beyond the
+	// default subset, or an acronym like defaultAggHttpPort slips through.
+	if !strings.Contains(cfg, "- -ST1000") || !strings.Contains(cfg, "all") {
+		t.Error("policy: .golangci.yml must run staticcheck's full check set minus the doc-comment rules")
+	}
+	// Vendored code must stay out of the gate.
+	if !strings.Contains(cfg, "vendor/") {
+		t.Error("policy: .golangci.yml must exclude vendor/")
+	}
+}
 func TestPolicyAPIRoutes(t *testing.T) {
 	raw, err := os.ReadFile("api.go")
 	if err != nil {

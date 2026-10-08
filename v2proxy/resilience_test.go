@@ -146,7 +146,7 @@ func readN(c net.Conn, n int) ([]byte, bool) {
 }
 
 func handleMiniSocks(c net.Conn, mode string) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	greet, ok := readN(c, 2)
 	if !ok || greet[0] != 0x05 {
 		return
@@ -219,7 +219,11 @@ func handleMiniSocks(c net.Conn, mode string) {
 			}
 			buf = append(buf, tmp[:m]...)
 		}
-		_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"ok\":false,\"x\":1}"))
+		// Content-Length MUST match the body byte count: a wrong value makes
+		// the client wait on a body that never arrives, turning a clean 404
+		// into a timeout-shaped flake.
+		body := `{"ok":false}`
+		_, _ = fmt.Fprintf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 		return
 	}
 	// Slurp the HTTP request head, then 204.
@@ -309,14 +313,23 @@ func TestTelegramAcceptsAnyStatus(t *testing.T) {
 	}
 }
 
+// Every probe target the daemon can ever reach for must be HTTPS: plain HTTP
+// is RST-injected by DPI on bare transports even through a working tunnel,
+// which reads as "proxy dead" and burns the whole pool.
 func TestProbeURLsAreHTTPS(t *testing.T) {
-	for _, u := range append([]string{probeURL, quickFallbackURL, telegramProbeURL, defaultHealthCheckURL}, fallbackHealthURLs...) {
+	for _, u := range []string{probeURL, quickFallbackURL, telegramProbeURL, defaultHealthCheckURL} {
 		if !strings.HasPrefix(u, "https://") {
 			t.Fatalf("probe URL must be HTTPS, got %s", u)
 		}
 	}
-	if !strings.Contains(fallbackHealthURLs[1], "/generate_204") {
-		t.Fatalf("cloudflare fallback needs /generate_204 path, got %s", fallbackHealthURLs[1])
+	// Cloudflare's 204 endpoint is at the /generate_204 PATH: the bare host
+	// answers 404, which status grading would read as a dead tunnel.
+	if !strings.Contains(quickFallbackURL, "/generate_204") {
+		t.Fatalf("cloudflare fallback needs /generate_204 path, got %s", quickFallbackURL)
+	}
+	// And the deployment default must be one the daemon actually races.
+	if !strings.HasPrefix(defaultHealthCheckURL, "https://") {
+		t.Fatalf("default HEALTH_CHECK_URL must be HTTPS, got %s", defaultHealthCheckURL)
 	}
 }
 

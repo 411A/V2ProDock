@@ -34,7 +34,7 @@ func startTestStack(t *testing.T, base int, n int) (m *ProxyManager, apiURL stri
 		resp, err := client.Get(apiURL + "/health")
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return m, apiURL
 			}
@@ -52,7 +52,7 @@ func getJSON(t *testing.T, url string) (int, map[string]any) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var body map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode %s: %v", url, err)
@@ -85,7 +85,7 @@ func TestAPIProxiesAndAll(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if len(all) != 2 {
 		t.Fatalf("/all returned %d instances, want 2", len(all))
 	}
@@ -102,7 +102,7 @@ func TestAPIProxiesAndAll(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&alive); err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if len(alive) != 0 {
 		t.Errorf("/proxies must be empty before populate, got %d", len(alive))
 	}
@@ -121,7 +121,7 @@ func TestAPIProxiesExposeStability(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&alive); err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if len(alive) != 1 {
 		t.Fatalf("/proxies returned %d entries, want 1", len(alive))
 	}
@@ -147,7 +147,7 @@ func TestAPIRefreshPOST(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /refresh status %d, want 200", resp.StatusCode)
 	}
@@ -166,7 +166,7 @@ func TestAPIRefreshGET405(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /refresh status %d, want 405 (POST-only mux)", resp.StatusCode)
 	}

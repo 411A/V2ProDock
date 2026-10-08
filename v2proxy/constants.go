@@ -30,9 +30,16 @@ const (
 // Cloudflare). First success wins; worst case is still one 3s budget.
 const probeURL = "https://www.gstatic.com/generate_204"
 
+// Cloudflare's 204 endpoint lives at the /generate_204 PATH — the bare host
+// answers 404, which a status-grading probe would read as "tunnel dead".
 const quickFallbackURL = "https://cp.cloudflare.com/generate_204"
 
 const quickProbeTimeout = 3 * time.Second
+
+// Cap on how much of a probe response body is drained before the connection is
+// released. A 204 has none; a throttled or 404 target may send a body, and an
+// undrained response holds the tunnel (and the single idle-conn slot) open.
+const probeDrainCap = 64 << 10
 
 // ---- Steady-state health checking ----
 const (
@@ -62,7 +69,7 @@ const (
 // never rewrite config. Inside the published 27000-27100 range; 0 disables.
 const (
 	defaultAggSocksPort = 27017 // AGGREGATE_SOCKS_PORT overrides
-	defaultAggHttpPort  = 27016 // AGGREGATE_HTTP_PORT overrides
+	defaultAggHTTPPort  = 27016 // AGGREGATE_HTTP_PORT overrides
 	aggPublishedMax     = 27100 // compose publishes 27000-27017 + 27019-27100 (API holds 27018)
 )
 
@@ -112,15 +119,6 @@ var loopbackFallbackHosts = []string{
 	"172.17.0.1",
 	"172.18.0.1",
 	"10.0.2.2",
-}
-
-// Fallback health URLs for full checks (tried in order after the primary).
-// All HTTPS: plain-HTTP probes die under DPI even when the tunnel is fine.
-// NOTE: cp.cloudflare.com needs the /generate_204 path — the bare host 404s.
-var fallbackHealthURLs = []string{
-	"https://www.gstatic.com/generate_204",
-	"https://cp.cloudflare.com/generate_204",
-	"https://api.ipify.org",
 }
 
 // ---- Refresh loop ----

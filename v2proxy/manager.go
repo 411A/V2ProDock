@@ -139,7 +139,10 @@ func findAvailableBlock(start, count int) (int, error) {
 				free = false
 				break
 			}
-			ln.Close()
+			// Probe-only listener: the close result cannot change the answer,
+			// but a failed close would leak the descriptor for every candidate
+			// port scanned, so it must not be silently ignored.
+			_ = ln.Close()
 		}
 		if free {
 			return base, nil
@@ -158,7 +161,8 @@ func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
 	if len(clean) == 0 {
 		return nil, fmt.Errorf("no subscription URLs configured")
 	}
-	var lastErr error = fmt.Errorf("all %d subscription URLs failed", len(clean))
+	// fmt.Errorf already returns error: the explicit conversion was redundant.
+	lastErr := fmt.Errorf("all %d subscription URLs failed", len(clean))
 	for attempt := range fetchPoolAttempts {
 		if attempt > 0 {
 			time.Sleep(fetchPoolRetrySleep)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,7 +273,8 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 		// Fast probe: skip waitForPort, use single-URL 3s timeout.
 		// If xray is up, we get a response; if not, connection refused is fast.
 		result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
-		if result.Working {
+		switch classifyProbe(result) {
+		case verdictAdopt:
 			s.activeIndex = i
 			s.lastLatency = result.Latency
 			s.lastProbe = time.Now()
@@ -283,11 +283,23 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			s.activeSince = time.Now()
 			readyLog(s.configs[i].Name, result.Latency.Milliseconds())
 			return skipped, nil
+		case verdictUnproven:
+			// The probe TARGET throttled/forbade our egress IP, so this
+			// upstream is UNTESTED, not dead. Poisoning the shared ledger here
+			// made every peer instance skip the same candidate, and the whole
+			// pool churned on one throttled 429. Keep it claimable: the retry
+			// pass and the next health tick re-run it.
+			debugLog("candidate %d/%d %s: probe inconclusive (%s) — upstream unproven, not bad",
+				i+1, len(s.configs), shortName(s.configs[i].Name), result.Describe())
+			shared.unclaim(key)
+			s.stopXray()
+			continue
+		default:
+			debugLog("candidate %d/%d %s: unhealthy: %s", i+1, len(s.configs), shortName(s.configs[i].Name), result.Describe())
+			shared.markBad(key)
+			shared.unclaim(key)
+			s.stopXray()
 		}
-		debugLog("candidate %d/%d %s: unhealthy: %v", i+1, len(s.configs), shortName(s.configs[i].Name), result.Error)
-		shared.markBad(key)
-		shared.unclaim(key)
-		s.stopXray()
 	}
 	return skipped, fmt.Errorf("no working config found")
 }
@@ -330,14 +342,14 @@ func (s *ProxySelector) HealthCheck() bool {
 	// Inconclusive, not dead: the PROBE TARGET throttled/blocked our egress
 	// IP (429/403) while the tunnel itself may be fine. Neither strike nor
 	// absolve — hold serving, retry next tick. Anything else strikes.
-	if result.Status == http.StatusTooManyRequests || result.Status == http.StatusForbidden {
-		debugLog("probe inconclusive (%d from target, tunnel may be fine): %s", result.Status, shortName(s.configs[s.activeIndex].Name))
+	if probeInconclusive(result) {
+		debugLog("probe inconclusive (%s, tunnel may be fine): %s", result.Describe(), shortName(s.configs[s.activeIndex].Name))
 		return true
 	}
 
 	s.failCount++
 	s.okStreak = 0
-	warnLog("Health FAIL (%d/3): %s - %v", s.failCount, shortName(s.configs[s.activeIndex].Name), result.Error)
+	warnLog("Health FAIL (%d/%d): %s — %s", s.failCount, healthFailThreshold, shortName(s.configs[s.activeIndex].Name), result.Describe())
 
 	if s.failCount < healthFailThreshold {
 		// Consider still healthy until threshold is met
@@ -445,10 +457,12 @@ func (s *ProxySelector) SwitchToNextExcluding(exclude map[string]int) error {
 		return fmt.Errorf("winner never bound serving port")
 	}
 	if res := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL); !res.Working {
-		debugLog("winner failed verification on serving port: %v", res.Error)
+		// Describe, not res.Error: a completed exchange that graded badly has
+		// Error == nil, and "%w" on nil renders "%!w(<nil>)".
+		debugLog("winner failed verification on serving port: %s", res.Describe())
 		s.stopXray()
 		s.tryRestoreLocked(oldKey)
-		return fmt.Errorf("winner failed verification: %w", res.Error)
+		return fmt.Errorf("winner failed verification: %s", res.Describe())
 	}
 	s.activeIndex = cur
 	s.lastLatency = winLat
@@ -514,7 +528,7 @@ func (s *ProxySelector) searchCandidates(ctx context.Context, configs []ProxyCon
 				winMu.Unlock()
 				return
 			}
-			debugLog("candidate %s: unhealthy: %v", shortName(configs[idx].Name), res.Error)
+			debugLog("candidate %s: unhealthy: %s", shortName(configs[idx].Name), res.Describe())
 		}
 	}
 	n := min(switchWorkerCount(), len(cands))
@@ -850,7 +864,7 @@ func waitForPort(port int, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -866,7 +880,7 @@ func waitForPortFree(port int, timeout time.Duration) {
 		if err != nil {
 			return
 		}
-		conn.Close()
+		_ = conn.Close()
 		time.Sleep(50 * time.Millisecond)
 	}
 }

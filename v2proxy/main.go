@@ -117,7 +117,7 @@ func main() {
 	// Long-polling clients pin these and never care which upstream serves.
 	aggSocks, aggHTTP := pickAggregatePorts(
 		aggregatePort("AGGREGATE_SOCKS_PORT", defaultAggSocksPort),
-		aggregatePort("AGGREGATE_HTTP_PORT", defaultAggHttpPort),
+		aggregatePort("AGGREGATE_HTTP_PORT", defaultAggHTTPPort),
 		apiActualPort, manager.usedPorts())
 	var aggSocksAddr, aggHTTPAddr string
 	if aggSocks > 0 {

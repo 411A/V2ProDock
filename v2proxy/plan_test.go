@@ -65,7 +65,7 @@ func TestFindFreePortSkipsHeld(t *testing.T) {
 		if err != nil {
 			t.Skipf("plan: test range busy: %v", err)
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 	}
 	if got := findFreePort(base); got < base+4 {
 		t.Fatalf("plan: findFreePort(%d) = %d, must skip 4 held ports", base, got)

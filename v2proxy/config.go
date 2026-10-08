@@ -79,7 +79,7 @@ func fetchXrayZip(url, xrayDir, xrayBin string) error {
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("download returned status %d", resp.StatusCode)
@@ -90,10 +90,16 @@ func fetchXrayZip(url, xrayDir, xrayBin string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(out, resp.Body)
-	out.Close()
-	if err != nil {
-		return err
+	_, copyErr := io.Copy(out, resp.Body)
+	// Close error matters: a failed flush on a written file means a TRUNCATED
+	// archive, which surfaces later as a confusing "unzip failed" instead of
+	// the real cause.
+	if closeErr := out.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("write %s failed: %w", tmpFile, copyErr)
 	}
 
 	if err := extractZip(tmpFile, xrayDir); err != nil {

@@ -13,7 +13,7 @@ func findFreePort(start int) int {
 	for port := start; port <= maxPort; port++ {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			ln.Close()
+			_ = ln.Close()
 			return port
 		}
 	}
@@ -108,7 +108,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		}
 		st["enabled"] = true
 		st["ikev2"] = "500/udp,4500/udp"
-		if v, ok := st["pptp"]; !(ok && v == true) {
+		if v, ok := st["pptp"]; !ok || v != true {
 			st["pptp"] = "off (TCP 1723 not served; set VPN_ENABLE_PPTP=1 for ancient LAN devices)"
 		} else {
 			st["pptp"] = "1723/tcp+GRE (LAN-only, MPPE-128 mandatory)"

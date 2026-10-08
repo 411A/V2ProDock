@@ -103,7 +103,7 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 		// subscription became a confusing JSON parse error instead of a cap
 		// message. One extra byte is the cheapest possible overflow probe.
 		body, err := io.ReadAll(io.LimitReader(resp.Body, fetchMaxBody+1))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			continue

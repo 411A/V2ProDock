@@ -1,0 +1,74 @@
+# golangci-lint v2 configuration — the strict gate referenced in AGENT.md.
+#
+# Why this file exists: golangci-lint v2 dropped the implicit default
+# exclusions that v1 applied, so the "golangci-lint run ./... # EXIT 0" line in
+# AGENT.md silently regressed to 33 findings (31 unchecked Close/Remove calls,
+# mostly in tests, plus 2 staticcheck hints). Pinning the linter set here makes
+# the gate reproducible across tool versions instead of accidental.
+#
+# Kept OUT on purpose (documented in AGENT.md as stylistic non-goals, not
+# correctness): goconst, mnd, lll, wsl, exhaustruct, varnamelen, funlen,
+# gocognit, depguard, nlreturn, wrapcheck.
+#
+# The complementary "pedantic" pass is staticcheck's own flag set, not golangci:
+#   staticcheck -fail all -checks all ./...
+
+version: "2"
+
+run:
+  timeout: 3m
+  # Tests are linted on purpose: unchecked Close/Remove in a test is still an
+  # unchecked Close/Remove, and that is how the 31 findings were hiding.
+  tests: true
+  allow-parallel-runners: true
+
+linters:
+  # v2 "standard" == errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose      # every http response body must be closed
+    - errorlint      # %w wrapping and errors.Is/As discipline
+    - misspell       # typos in comments and identifiers
+    - nilerr         # returning nil after checking err != nil
+    - unconvert      # redundant type conversions
+    - whitespace     # leading/trailing blank lines in blocks
+    - gocritic       # the high-signal subset; see settings below
+    - revive         # naming + doc-comment structure
+  # noctx is deliberately NOT enabled. It flags net.Listen, net.DialTimeout and
+  # exec.Command as context-less, but each of those is already bounded by an
+  # explicit deadline (http.Client.Timeout / DialTimeout / xrayDownloadTimeout)
+  # and threading a context through them adds call-site ceremony with no
+  # correctness win. Context plumbing becomes worth it when a caller-supplied
+  # cancellation actually exists to propagate.
+  settings:
+    staticcheck:
+      # Everything, minus the three doc-comment checks that only ask for
+      # boilerplate prose on unexported helpers.
+      checks:
+        - all
+        - -ST1000
+        - -ST1020
+        - -ST1021
+        - -ST1022
+    gocritic:
+      # Style/opinion checks that fight the codebase's deliberate choices.
+      # (Checks already off in gocritic's own defaults are not listed.)
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+        - commentFormatting
+    revive:
+      rules:
+        - name: exported
+          disabled: true # package has no godoc policy; covered by policy_test.go
+  exclusions:
+    generated: lax
+    rules:
+      # Vendored third-party code is not ours to reformat.
+      - path: vendor/
+        linters:
+          - all
+
+formatters:
+  enable:
+    - gofmt

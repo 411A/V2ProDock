@@ -196,7 +196,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Response head arrived through the tunnel: full path proven (SOCKS +
 	// upstream + egress). Timestamp it — this outranks any synthetic probe.
 	noteEgress(httpPort)

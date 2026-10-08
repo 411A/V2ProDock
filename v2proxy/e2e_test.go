@@ -3,7 +3,8 @@ package main
 // End-to-end lifecycle tests with a FAKE xray binary (python stub).
 // The stub reads its real rendered config file, binds the real SOCKS port,
 // and behaves per upstream tag: "dead-crash" exits at once, "dead-hang"
-// accepts but never answers (dead upstream), anything else serves SOCKS5->204.
+// accepts but never answers (dead upstream), "throttled" answers 429 like a
+// rate-limiting probe target, anything else serves SOCKS5->204.
 // This exercises production start/stop/switch/health/bridge paths for real,
 // including orphan accounting via the watchdog's own cmdline matcher.
 
@@ -22,8 +23,16 @@ import (
 )
 
 const stubXray = `#!/usr/bin/env python3
-import json, socket, sys, threading, time
+import contextlib
+import json
+import socket
+import sys
+import threading
+import time
 
+# Deliberately flat and branchy: this is a SOCKS5 protocol fixture, and
+# splitting handle() into helpers would only obscure the wire sequence it
+# exists to reproduce. See AGENT.md for the ruff exemption (C901 only).
 def handle(c, mode):
     try:
         c.settimeout(5)
@@ -50,10 +59,10 @@ def handle(c, mode):
         if atyp == 1:
             need = 4
         elif atyp == 3:
-            l = c.recv(1)
-            if not l:
+            nbytes = c.recv(1)
+            if not nbytes:
                 return
-            need = l[0]
+            need = nbytes[0]
         elif atyp == 4:
             need = 16
         else:
@@ -81,17 +90,19 @@ def handle(c, mode):
             if not chunk:
                 return
             buf += chunk
+        if mode == "throttled":
+            c.sendall(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
         c.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     except Exception:
         pass
     finally:
-        try:
+        with contextlib.suppress(Exception):
             c.close()
-        except Exception:
-            pass
 
 def main():
-    cfg = json.load(open(sys.argv[sys.argv.index("-c") + 1]))
+    with open(sys.argv[sys.argv.index("-c") + 1]) as fh:
+        cfg = json.load(fh)
     port = cfg["inbounds"][0]["port"]
     mode = cfg["outbounds"][0].get("tag", "good")
     if mode == "dead-crash":
@@ -132,7 +143,7 @@ func freeLoopbackPort(t *testing.T) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
@@ -459,6 +470,85 @@ func TestReconcileSlowIdleActiveStillRotates(t *testing.T) {
 	}
 }
 
+// A probe target that rate-limits us (429) must leave the upstream UNPROVEN,
+// not poisoned. Previously tryConfigs markBad'd it, which propagated through
+// the shared probe ledger: every peer instance then skipped the same
+// candidate and the entire pool churned on one throttled 429.
+//
+// This is the wiring proof for classifyProbe's verdictUnproven arm — the
+// hermetic table test covers the decision, this covers the call site.
+//
+// startShared is called DIRECTLY with a real ledger, not via StartWithBest:
+// StartWithBest passes a nil shared, so the ledger this test inspects would
+// never be written to and every assertion here would be vacuously true.
+func TestPopulateThrottledTargetDoesNotPoisonPool(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	// Stop the serving child before the test ends: a stub left listening
+	// outlives the test binary's stdout pipe, which makes `go test` hang for
+	// the full stub lifetime ("Test I/O incomplete ...") under LOG_LEVEL=debug.
+	t.Cleanup(s.Stop)
+	s.UpdateConfigs([]ProxyConfig{
+		e2eCand("throttled", "e2e-throttle:1", "throttled"),
+		e2eCand("good", "e2e-good:1", "good"),
+	})
+	shared := newProbeShared()
+	if err := s.startShared(nil, shared, time.Now().Add(30*time.Second)); err != nil {
+		t.Fatalf("populate must skip the throttled candidate and serve the good one: %v", err)
+	}
+	if got := s.ActiveConfig(); got == nil || got.Key() != "e2e-good:1" {
+		t.Fatalf("expected active e2e-good:1, got %+v", got)
+	}
+	// Precondition: the ledger really was used, so the assertions below mean
+	// something. Without this the negative check passes on an empty ledger.
+	if len(shared.claimed) == 0 && len(shared.bad) == 0 {
+		t.Fatal("precondition: populate must have populated the shared ledger")
+	}
+	if shared.isBad("e2e-throttle:1") {
+		t.Fatal("a throttled probe TARGET must not poison the shared ledger: the upstream is untested, not dead")
+	}
+	if !s.HealthCheck() {
+		t.Fatal("serving instance must be healthy")
+	}
+	if n := stubCount(dir); n != 1 {
+		t.Fatalf("expected exactly 1 stub xray, found %d (orphans!)", n)
+	}
+}
+
+// The mirror image: a genuinely dead upstream (transport failure) MUST be
+// poisoned, or every instance re-probes known-dead nodes on every refresh.
+func TestPopulateDeadTargetDoesPoisonPool(t *testing.T) {
+	needStub(t)
+	dir := t.TempDir()
+	writeStubXray(t, dir)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := NewProxySelector(dir, "http://probe.invalid/", socks, httpP, time.Minute)
+	t.Cleanup(s.Stop)
+	s.UpdateConfigs([]ProxyConfig{
+		e2eCand("hang", "e2e-hang:1", "dead-hang"),
+		e2eCand("good", "e2e-good:1", "good"),
+	})
+	shared := newProbeShared()
+	if err := s.startShared(nil, shared, time.Now().Add(30*time.Second)); err != nil {
+		t.Fatalf("populate failed: %v", err)
+	}
+	if got := s.ActiveConfig(); got == nil || got.Key() != "e2e-good:1" {
+		t.Fatalf("expected active e2e-good:1, got %+v", got)
+	}
+	if len(shared.bad) == 0 {
+		t.Fatal("precondition: the dead candidate must have been recorded bad")
+	}
+	if !shared.isBad("e2e-hang:1") {
+		t.Fatal("a dead upstream must be recorded bad so peer instances skip it")
+	}
+	if shared.isBad("e2e-good:1") {
+		t.Fatal("the serving upstream must never be marked bad")
+	}
+}
+
 // ---- HTTP bridge behavior ----
 
 func proxyClient(t *testing.T, bridgeAddr string) *http.Client {
@@ -488,7 +578,7 @@ func TestBridgeServesThroughWorkingUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bridge GET failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != 204 {
 		t.Fatalf("expected 204 via bridge, got %d", resp.StatusCode)
@@ -521,7 +611,7 @@ func TestBridgeDeadUpstreamFast502(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected HTTP error status, got transport error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("expected 502 for dead upstream, got %d", resp.StatusCode)
@@ -535,7 +625,7 @@ func TestBridgeHungUpstreamBounded504(t *testing.T) {
 		t.Fatal(err)
 	}
 	hole := ln.Addr().String()
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -562,7 +652,7 @@ func TestBridgeHungUpstreamBounded504(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected HTTP error status, got transport error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Fatalf("expected 504 for hung upstream, got %d", resp.StatusCode)

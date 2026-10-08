@@ -131,10 +131,10 @@ func TestPickAggregatePorts(t *testing.T) {
 	// Default constants honor the deployment contract: distinct from each
 	// other and from the API port, inside the published 27000-27100 range.
 	seen := map[int]bool{defaultAggSocksPort: true}
-	if seen[defaultAggHttpPort] {
+	if seen[defaultAggHTTPPort] {
 		t.Fatal("aggregate SOCKS/HTTP defaults must differ")
 	}
-	for _, p := range []int{defaultAggSocksPort, defaultAggHttpPort} {
+	for _, p := range []int{defaultAggSocksPort, defaultAggHTTPPort} {
 		if p == defaultAPIPort || p < 27000 || p > aggPublishedMax {
 			t.Fatalf("aggregate default %d violates deployment contract", p)
 		}
@@ -144,7 +144,7 @@ func TestPickAggregatePorts(t *testing.T) {
 	// correctly out of scan range — a past revision of this test tripped
 	// on exactly that.)
 	ln, busy := holdPortInRange(t, 20000, 26000)
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	got, _ := pickAggregatePorts(busy, 0, 27018, map[int]bool{})
 	if got <= busy || got > maxPort {
 		t.Fatalf("busy port %d must scan upward within range, got %d", busy, got)
@@ -288,7 +288,7 @@ func TestRelayKeepAliveFlows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	go func() {
 		for {
 			c, err := a.Accept()
@@ -296,7 +296,7 @@ func TestRelayKeepAliveFlows(t *testing.T) {
 				return
 			}
 			go func() {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				setKeepAlive(c)
 				buf := make([]byte, 8)
 				for {
@@ -315,7 +315,7 @@ func TestRelayKeepAliveFlows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	setKeepAlive(b)
 	_ = b.SetDeadline(time.Now().Add(3 * time.Second))
 	if _, err := b.Write([]byte("ka")); err != nil {
@@ -478,16 +478,16 @@ func TestRelayFirstByteHook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer la.Close()
+	defer func() { _ = la.Close() }()
 	lb, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lb.Close()
+	defer func() { _ = lb.Close() }()
 	in, relaySrc := dial(t, la)  // test writes in, relay reads relaySrc
 	relayDst, out := dial(t, lb) // relay writes relayDst, test reads out
-	defer in.Close()
-	defer out.Close()
+	defer func() { _ = in.Close() }()
+	defer func() { _ = out.Close() }()
 	var fired int32
 	done := make(chan struct{})
 	go func() {
@@ -538,16 +538,16 @@ func TestRelayKeepsLongStreamAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer la.Close()
+	defer func() { _ = la.Close() }()
 	lb, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lb.Close()
+	defer func() { _ = lb.Close() }()
 	in, relaySrc := dial(t, la)
 	relayDst, out := dial(t, lb)
-	defer in.Close()
-	defer out.Close()
+	defer func() { _ = in.Close() }()
+	defer func() { _ = out.Close() }()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -562,7 +562,7 @@ func TestRelayKeepsLongStreamAlive(t *testing.T) {
 				return
 			}
 		}
-		in.Close()
+		_ = in.Close()
 	}()
 	_ = out.SetDeadline(time.Now().Add(idle * chunks))
 	got, ok := readN(out, want)
@@ -584,17 +584,17 @@ func TestRelayDropsSilentStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	client, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	server, err := ln.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	// Neither end ever writes: only the idle deadline can end this relay.
 	done := make(chan struct{})
 	start := time.Now()
@@ -630,7 +630,7 @@ func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
 
 	const body = "0123456789abcdef"
 	upstream, proxySide := net.Pipe()
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 	go func() {
 		br := bufio.NewReader(upstream)
 		// Drain the forwarded request head (net.Pipe is unbuffered: an unread
@@ -652,7 +652,7 @@ func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handlePlainHTTP(w, r, staticDialer{proxySide}, 0)
@@ -660,7 +660,7 @@ func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() { _ = srv.Serve(ln) }()
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	// Talk to the bridge the way a real client does: a proxied request carries
 	// an absolute URI and the transport never resolves the target itself.
@@ -676,7 +676,7 @@ func TestPlainHTTPBridgeDoesNotCutSlowBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("body read failed: %v", err)
@@ -785,7 +785,7 @@ func serveEcho(t *testing.T, marker string) string {
 				return
 			}
 			go func() {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				_, _ = c.Write([]byte(marker))
 				buf := make([]byte, 256)
 				for {
@@ -844,7 +844,7 @@ func splitPort(t *testing.T, addr string) int {
 		t.Fatal(err)
 	}
 	var n int
-	fmt.Sscanf(p, "%d", &n)
+	_, _ = fmt.Sscanf(p, "%d", &n)
 	return n
 }
 
@@ -860,7 +860,7 @@ func TestAggregateRelayRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
 	head, ok := readN(c, 2)
 	if !ok || string(head) != "E1" {
@@ -886,7 +886,7 @@ func TestAggregateFailsFastWhenDown(t *testing.T) {
 	if err != nil {
 		return // refused even faster: acceptable fail-fast
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
 	if _, err := c.Read(make([]byte, 1)); err == nil {
 		t.Fatal("down aggregate must not serve bytes")
