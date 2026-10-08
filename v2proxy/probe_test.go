@@ -187,6 +187,8 @@ func writeStatus(c net.Conn, status int) {
 }
 
 // urlKey reduces a probe URL to the "host/path" key serveSocksByURL grades on.
+// It must agree exactly with what readRequestTarget reconstructs, including the
+// root-path case: an empty path normalizes to "/", NOT to a doubled slash.
 func urlKey(t *testing.T, rawURL string) string {
 	t.Helper()
 	rest, found := strings.CutPrefix(rawURL, "https://")
@@ -196,9 +198,9 @@ func urlKey(t *testing.T, rawURL string) string {
 			t.Fatalf("probe URL must carry a scheme: %s", rawURL)
 		}
 	}
-	host, path, _ := strings.Cut(rest, "/")
-	if path == "" {
-		path = "/"
+	host, path, found := strings.Cut(rest, "/")
+	if !found || path == "" {
+		return host + "/"
 	}
 	return host + "/" + path
 }

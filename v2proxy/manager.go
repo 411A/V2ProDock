@@ -39,6 +39,10 @@ type ProxyManager struct {
 	checkInterval time.Duration
 	aggSocks      string
 	aggHTTP       string
+	// urlChecks memoizes /check results per exact probe URL and collapses
+	// concurrent identical requests onto one round of probing. Lazily built
+	// because NewProxyManager is also built directly by tests.
+	urlChecks *urlCheckCache
 	// srcBrk rests dead subscription sources across refreshes (single
 	// goroutine use — subscription loop only — so no mutex).
 	srcBrk srcBreaker

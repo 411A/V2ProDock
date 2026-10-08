@@ -161,7 +161,7 @@ func TestPolicyAPIRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, route := range []string{"/proxies", "/all", "/health", "/vpn", "/refresh"} {
+	for _, route := range []string{"/proxies", "/all", "/health", "/vpn", "/refresh", "/check"} {
 		if !strings.Contains(string(raw), route) {
 			t.Errorf("policy: API route %s not registered in api.go", route)
 		}
@@ -169,5 +169,15 @@ func TestPolicyAPIRoutes(t *testing.T) {
 	// /refresh must stay POST-only via a method-aware pattern.
 	if !strings.Contains(string(raw), `"POST /refresh"`) {
 		t.Error("policy: /refresh must use the method-aware \"POST /refresh\" pattern")
+	}
+	// /check answers both spellings from one handler, so the two registrations
+	// must never drift into different implementations.
+	for _, verb := range []string{`"GET /check"`, `"POST /check"`} {
+		if !strings.Contains(string(raw), verb) {
+			t.Errorf("policy: api.go must register %s", verb)
+		}
+	}
+	if strings.Count(string(raw), "manager.handleCheck") != 2 {
+		t.Error("policy: GET and POST /check must share manager.handleCheck")
 	}
 }

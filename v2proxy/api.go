@@ -129,6 +129,13 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		}
 	})
 
+	// Dynamic per-URL reachability: "which proxies can reach THIS url?".
+	// Registered for GET (query form, convenient from curl) and POST (JSON
+	// body) so both spellings share one implementation and one set of
+	// semantics - see urlcheck.go.
+	mux.HandleFunc("GET /check", manager.handleCheck)
+	mux.HandleFunc("POST /check", manager.handleCheck)
+
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
 		Handler:           mux,

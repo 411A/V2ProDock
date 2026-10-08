@@ -612,6 +612,15 @@ func (s *ProxySelector) probeCandidateOnTempPort(cfg ProxyConfig) HealthResult {
 // launch is serialized on tempMu so two workers can never share an ephemeral
 // port or config file.
 func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
+	return s.probeTempPortURL(cfg, s.testURL)
+}
+
+// probeTempPortURL is probeSnapshotOnTempPort with an EXPLICIT target URL, so
+// a caller can ask "can this upstream reach THAT url" (the /check endpoint)
+// without disturbing the instance's configured health probe. Read-only: it
+// never touches activeIndex, the shared probe ledger, or the serving port, so
+// a check against a target nobody can reach can never cull the pool.
+func (s *ProxySelector) probeTempPortURL(cfg ProxyConfig, probeURL string) HealthResult {
 	s.tempMu.Lock()
 	// Ephemeral port: bind :0, read back the port, release.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -653,7 +662,7 @@ func (s *ProxySelector) probeSnapshotOnTempPort(cfg ProxyConfig) HealthResult {
 	if !open {
 		return HealthResult{Error: fmt.Errorf("temp xray port never opened")}
 	}
-	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), s.testURL)
+	return TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", port), probeURL)
 }
 
 // trackTemp/untrackTemp/tempPIDSnapshot guard the in-flight throwaway-probe

@@ -112,6 +112,82 @@ curl http://localhost:27018/proxies
 | `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` + stable `aggregate_socks`/`aggregate_http` endpoints |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
+| `/check` | POST/GET | Per-URL reachability: which proxies can actually reach *this* destination (see below) |
+
+#### `/check` — dynamic URL check
+
+`HEALTH_CHECK_URL` answers one question for the whole pool: *is the tunnel
+alive?* `/check` answers a different one: *can my proxies reach **this** site?*
+A pool can be perfectly healthy against gstatic while every node is filtered
+for a given destination — the only way to know is to ask each upstream.
+
+```bash
+# Which proxies can reach Telegram right now?
+curl -s -X POST localhost:27018/check \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"api.telegram.org"}'
+
+# Optional: also probe N pool candidates (spawns a throwaway xray each)
+curl -s -X POST localhost:27018/check \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/api","depth":4}'
+
+# GET spelling
+curl -s 'localhost:27018/check?url=example.com&depth=0'
+```
+
+```json
+{
+  "key": "telegram.org",
+  "probed_url": "https://api.telegram.org/",
+  "alive": [
+    {"name":"NL | node-A","endpoint":"51.158.206.12:23576","instance":0,"latency_ms":1228,"source":"alive"}
+  ],
+  "pool": [],
+  "checked": 2, "failed": 0,
+  "duration_ms": 1571, "cached": false, "truncated": false
+}
+```
+
+**The key is the domain, not the string.** `example.com`,
+`http://example.com`, `https://www.example.com` and
+`https://www.example.co.uk/x` all resolve through the **public suffix list**,
+so `www.example.co.uk` keys to `example.co.uk` and never to `co.uk` (a naive
+last-two-labels split would merge unrelated sites).
+
+**The measurement is still per exact URL.** `/bot123/getUpdates` and `/` are
+different resources behind one key, so results are cached per probe URL and the
+domain key is only the reported identity — claiming a path is reachable
+because a sibling path answered would be an unearned verdict.
+
+| Field | Meaning |
+|---|---|
+| `key` | registrable domain (eTLD+1) — the "same URL" you asked about |
+| `probed_url` | what was actually fetched through the tunnel |
+| `alive[]` | instances already serving, probed on their live SOCKS port (**zero** extra processes) |
+| `pool[]` | pool candidates probed on throwaway ports (only when `depth > 0`) |
+| `source` | `alive` = already running; `pool` = throwaway probe |
+| `truncated` | the depth cap was hit before the pool was exhausted — the answer is a **sample**, not exhaustive |
+
+Notes:
+- **Read-only.** A check never changes the active proxy, never touches the
+  shared probe ledger, never rebinds a serving port. A destination nothing can
+  reach cannot damage the pool.
+- **Depth defaults to 0** (alive instances only, ~1s, no processes). Pool
+  candidates cost a throwaway xray each (~15MB), capped at 32, so a 600-config
+  pool is never swept per request.
+- **Cached 60s** per probe URL; concurrent identical requests share one round
+  of probing. `cached:true` in the response means the answer is up to 60s old.
+- **SSRF guard.** The probe dials *from the upstream*, so a request for a
+  private address would scan the *upstream's* LAN or cloud metadata. Loopback,
+  RFC1918, link-local, `.local`/`.internal`/`.home.arpa` and single-label hosts
+  are refused with HTTP 400. Limitation, stated plainly: only the literal is
+  validated — a public hostname that resolves to `169.254.169.254` at the
+  upstream cannot be detected from here. **Do not expose this endpoint to
+  untrusted callers.**
+- A check that completes but finds nothing is HTTP **200** with an empty
+  `alive[]` — that is the answer you asked for. HTTP 400 means the request
+  itself was unusable (bad scheme, refused target, malformed body).
 
 ### Stable endpoints (bots & long-polling clients)
 
