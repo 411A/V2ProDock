@@ -185,12 +185,15 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 
 	// 4. Switching stays bounded, serving stays intact, no orphans.
 	//
-	// Either outcome is legitimate and both are asserted: a public pool head
-	// may well contain a WORKING node (this vantage found one), in which case
-	// the switch must land it; or the whole head may be dead, in which case
-	// the serving child must be left completely alone. The old assertion
-	// unconditionally demanded the PID not change, which contradicted the
-	// comment right below it and failed on exactly the success path.
+	// A failed switch has TWO distinct shapes and only one of them promises an
+	// untouched PID:
+	//   - no winner was proven -> the old child keeps serving, same PID;
+	//   - a winner WAS proven on a throwaway port but then failed verification
+	//     ON THE SERVING PORT -> the port had to be rebound, so the old config
+	//     is restored in a FRESH process and the PID necessarily changes.
+	// The invariant that holds for both is not "same PID" but "still serving
+	// the config it was serving" - which is what this asserts. The previous
+	// version demanded an unchanged PID, so it failed on the restore path.
 	head := pool
 	if len(head) > 40 {
 		head = head[:40]
@@ -199,6 +202,9 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 	if err := sel.startXray(0); err != nil {
 		t.Fatalf("seed start: %v", err)
 	}
+	// startXray does not adopt the config - only tryConfigs does - so the seed
+	// index is anchored explicitly here, exactly as production does before a
+	// switch. Capture what is being served AFTER that anchor.
 	sel.mu.Lock()
 	sel.activeIndex = 0
 	seedPID := 0
@@ -206,11 +212,16 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 		seedPID = sel.xrayCmd.Process.Pid
 	}
 	sel.mu.Unlock()
+	prev := sel.ActiveConfig()
+	if prev == nil {
+		t.Fatal("precondition: a config must be serving before the switch")
+	}
+	prevKey := prev.Key()
 	swStart := time.Now()
 	swErr := sel.SwitchToNextExcluding(nil)
 	swEl := time.Since(swStart)
 	gotPID := sel.currentPID()
-	t.Logf("switch: err=%v in %s (pid %d -> %d)", swErr, swEl.Round(time.Millisecond), seedPID, gotPID)
+	t.Logf("switch: err=%v in %s (pid %d -> %d, serving %s)", swErr, swEl.Round(time.Millisecond), seedPID, gotPID, prevKey)
 	if swEl > switchBudget+30*time.Second {
 		t.Fatalf("switch escaped all bounds: %s", swEl)
 	}
@@ -221,8 +232,18 @@ func TestLiveSubscriptionE2E(t *testing.T) {
 		if sel.ActiveConfig() == nil {
 			t.Fatal("successful switch must leave a serving config")
 		}
-	} else if gotPID != seedPID {
-		t.Fatalf("failed switch must leave serving child alone (%d -> %d)", seedPID, gotPID)
+	} else {
+		// The instance must still serve the same upstream it was serving, and
+		// must actually have something bound: a failed switch that strands the
+		// port is worse than one that errors.
+		if got := sel.ActiveConfig(); got == nil {
+			t.Fatalf("failed switch stranded the instance with no serving config (was %s)", prevKey)
+		} else if got.Key() != prevKey {
+			t.Fatalf("failed switch must keep serving %s, got %s", prevKey, got.Key())
+		}
+		if gotPID == 0 {
+			t.Fatalf("failed switch left no child bound while claiming to serve %s", prevKey)
+		}
 	}
 	// Whatever the outcome: never more than the serving child may remain.
 	if n := len(listXrayPIDs(dir)); n > 1 {
