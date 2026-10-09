@@ -399,9 +399,10 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 		// and markBad then poisons into the SHARED ledger — so one
 		// not-yet-bound but perfectly healthy upstream is skipped by every
 		// peer instance for the rest of the round. Wait for the port first,
-		// bounded by the remaining populate deadline.
-		if !waitForPort(s.socksPort, bindBudget(deadline)) {
-			// A child that has ALREADY EXITED is a dead config - proven bad, so it
+		// bounded by the remaining populate deadline AND by the child's life.
+		bound, exited := waitForBind(s.socksPort, childProcess(s.xrayCmd), bindBudget(deadline))
+		if !bound {
+			// A child that ALREADY EXITED is a dead config - proven bad, so it
 			// poisons the ledger exactly as before. Only a LIVE process that has not
 			// bound yet is unproven: that is host starvation (10 concurrent cold xray
 			// starts on a 256MB box), and marking it bad is the exact defect this
@@ -411,7 +412,7 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			// processFinished, not processAlive: signal 0 succeeds on an unreaped
 			// zombie, so a child that crashed a moment ago reads as alive and this
 			// branch would never fire.
-			if processFinished(childProcess(s.xrayCmd)) {
+			if exited || processFinished(childProcess(s.xrayCmd)) {
 				debugLog("candidate %d/%d %s: xray exited before binding — proven bad, poisoning ledger",
 					i+1, len(s.configs), shortName(s.configs[i].Name))
 				shared.markBad(key)
@@ -1045,6 +1046,35 @@ func stopXrayCmdPort(cmd *exec.Cmd, port int) {
 		<-done
 	}
 	waitForPortFree(port, xrayPortFreeWait)
+}
+
+// waitForBind polls for the serving port to accept, but gives up the moment the
+// child exits. Waiting only on the port is right for a SLOW xray and ruinous for
+// a DEAD one: a pool of public configs is mostly dead, and every dead config
+// that survives xrayCrashDetect only to exit 200ms later used to cost the full
+// populatePortWait before anyone noticed. Across 100 such candidates, at
+// populatePortWait=5s, that is minutes of a scan that should take seconds - and
+// it is paid per instance, so the pool is re-scanned N times.
+//
+// exited is reported separately from bound because the caller must treat the two
+// oppositely: a child that exited is PROVEN bad and poisons the ledger, while a
+// live child that never bound is merely unproven (host starvation).
+func waitForBind(port int, proc *os.Process, timeout time.Duration) (bound, exited bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if processFinished(proc) {
+			return false, true
+		}
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf(":%d", port), 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return true, false
+		}
+		if !time.Now().Before(deadline) {
+			return false, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func waitForPort(port int, timeout time.Duration) bool {

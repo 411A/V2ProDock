@@ -469,6 +469,45 @@ func TestPopulateCrashingCandidateIsNeverAdopted(t *testing.T) {
 	}
 }
 
+// TestPopulateDeadCandidateDoesNotCostTheBindWait is the COST half of
+// TestPopulateCrashingCandidateIsNeverAdopted, which only checks the verdict.
+//
+// Production found the other half: a pool of public configs is mostly dead, and
+// the bind wait ran to its full timeout for every one of them before anyone
+// noticed the child had already exited. The verdict was right, the scan was
+// minutes long, and the symptom was indistinguishable from a hang - no progress
+// line for minutes because 0/N never changed.
+//
+// So the wait has to end when the CHILD ends, not only when the port opens. The
+// budget here is deliberately generous relative to the fake xray's death so a
+// regression that waits the full budget fails loudly instead of by a hair.
+func TestPopulateDeadCandidateDoesNotCostTheBindWait(t *testing.T) {
+	dir := t.TempDir()
+	installFakeXray(t, dir)
+	shrinkPopulatePortWait(t, 3*time.Second)
+	socks, httpP := freeLoopbackPort(t), freeLoopbackPort(t)
+	s := newFakeXraySelector(t, dir, socks, httpP)
+	dead := make([]ProxyConfig, 0, 4)
+	for i := range 4 {
+		dead = append(dead, e2eCand("crash", fmt.Sprintf("crash-%d:1", i), "crash"))
+	}
+	s.UpdateConfigs(dead)
+
+	start := time.Now()
+	shared := newProbeShared()
+	// The pool is entirely dead, so an error is the correct outcome; what is
+	// being measured is how long getting there takes.
+	_ = s.startShared(nil, shared, time.Now().Add(30*time.Second))
+	elapsed := time.Since(start)
+
+	// 4 dead candidates at the full 3s budget is 12s. Real death is ~100ms each.
+	// The threshold allows for a slow CI box while still catching a full-budget
+	// wait, which is the regression.
+	if max := 4 * time.Second; elapsed > max {
+		t.Fatalf("4 dead candidates took %v; the bind wait must end when the child does, not run its full %v budget (bound would allow ~%v)", elapsed, 3*time.Second, max)
+	}
+}
+
 // bindBudget is pure and decides whether the per-candidate bind wait can push
 // the scan past probeTimeout. Pinned directly so the clamp cannot rot.
 func TestBindBudgetClampsToDeadline(t *testing.T) {
