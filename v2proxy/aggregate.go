@@ -84,7 +84,21 @@ func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
 		if left <= 0 {
 			break
 		}
-		up, err := net.DialTimeout("tcp", backend, left)
+		// Per-candidate, NOT the whole remaining budget. A blackholed candidate -
+		// one that accepts nothing and never sends the SOCKS greeting, which is
+		// what a SYN-dropping or middleboxed host looks like - would otherwise
+		// consume every millisecond left and starve every later candidate, turning
+		// one bad node into a failed client handshake. The soak caught exactly
+		// that: "aggregate socks handshake: no method selection".
+		//
+		// The cap has to be generous enough that a merely SLOW working backend
+		// still gets served, because the whole point of the ordering is that a
+		// slow node beating a fast one that RSTs is better than neither.
+		budget := left
+		if budget > aggCandidateDialBudget {
+			budget = aggCandidateDialBudget
+		}
+		up, err := net.DialTimeout("tcp", backend, budget)
 		if err != nil {
 			debugLog("aggregate %s unreachable, trying next: %v", backend, err)
 			continue

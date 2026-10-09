@@ -223,6 +223,19 @@ const servingSocketUnprovenGrace = 5 * subscriptionRefreshInterval
 // (never refuse service); 0 disables the gate (legacy pure-latency).
 const aggMinStreakDefault = 3 // AGG_MIN_STREAK overrides
 
+// aggCandidateDialBudget caps how long ONE candidate may absorb while the
+// aggregate ladder walks the rest. It must be a share of aggFailoverBudget, not
+// the whole of it: a candidate that swallows packets rather than refusing them
+// consumes the entire remaining budget and starves every later candidate, so one
+// blackholed node converts into a failed SOCKS handshake for the client.
+//
+// Sized against the real cost of being wrong. Too small and a genuinely slow
+// working backend is skipped, which is the exact failure the ladder exists to
+// prevent - a slow node that completes beats a fast one that resets. So this is
+// generous next to a healthy node's dial (sub-millisecond on loopback) and only
+// bites on a candidate that is already in trouble.
+const aggCandidateDialBudget = 750 * time.Millisecond
+
 // ---- Startup serving threshold ----
 // Thin pools grind for minutes before EVERY instance lands one. Serve as soon
 // as this many are ready (capped by instance count); stragglers keep healing
