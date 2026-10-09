@@ -249,6 +249,7 @@ func fetchMergedReport(urls []string) (merged []ProxyConfig, failed map[string]b
 			failed[clean[0]] = true
 			return nil, failed
 		}
+		infoLog("subscription %s -> OK, %d configs", clean[0], len(cfgs))
 		return cfgs, failed
 	}
 	var mu sync.Mutex
@@ -273,7 +274,12 @@ func fetchMergedReport(urls []string) (merged []ProxyConfig, failed map[string]b
 			mu.Lock()
 			merged = append(merged, cfgs...)
 			mu.Unlock()
-			debugLog("subscription %s contributed %d configs", u, len(cfgs))
+			// info, not debug: this credit line already existed at debug level,
+			// which is why a 0/N pool was indistinguishable from a pool that was
+			// never fetched. A failed source shouts on its own; a source that
+			// WORKED used to say nothing at the default log level, so the positive
+			// half of the accounting was missing exactly when it was needed.
+			infoLog("subscription %s -> OK, %d configs", u, len(cfgs))
 		})
 	}
 	wg.Wait()
@@ -281,7 +287,12 @@ func fetchMergedReport(urls []string) (merged []ProxyConfig, failed map[string]b
 		warnLog("all %d subscription URLs failed, keeping existing configs", len(clean))
 		return nil, failed
 	}
-	return dedupConfigs(merged), failed
+	// The split is the whole point: "100 unique from 2 sources, 1 failed" says
+	// the survivor is being tested and simply has no working endpoint, which is a
+	// different problem from a source that yielded nothing at all.
+	deduped := dedupConfigs(merged)
+	infoLog("subscriptions: %d unique configs from %d of %d source(s)", len(deduped), len(clean)-len(failed), len(clean))
+	return deduped, failed
 }
 
 func FetchMergedSubscriptions(urls []string) []ProxyConfig {
