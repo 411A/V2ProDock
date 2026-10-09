@@ -642,9 +642,9 @@ func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
 // active -> switch now. Slow active (>rotateSlowLatency, measured FRESHLY) ->
 // probe a few fresh candidates on a THROWAWAY port (serving is never
 // interrupted) and rotate only to one proven >=30% faster. Serving live traffic
-// or holding a stale measurement -> untouched: rotation rebinds the serving
-// port and would cut real connections, which is a far worse failure than slow.
-// Fast present active -> untouched.
+// (recent bytes or an open client socket), or holding a stale measurement ->
+// untouched: rotation rebinds the serving port and would cut real connections,
+// which is a far worse failure than slow. Fast present active -> untouched.
 func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyConfig) {
 	active := inst.ActiveConfig()
 	present := active != nil &&
@@ -687,7 +687,15 @@ func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyCo
 	// serving instance (selector.go); this path had no such guard, so a busy
 	// instance was severable on every refresh tick. A slow-but-serving tunnel
 	// beats a faster one that cuts live connections.
-	if inst.ServingTraffic() {
+	//
+	// The byte ledger alone is not enough, though: egressNotes only ever sees
+	// ports THIS process serves, and the per-instance SOCKS inbound belongs to
+	// the xray child, so a client pinned straight to 127.0.0.1:<socksPort> moves
+	// bytes we never observe. ServingClients reads the sockets themselves — the
+	// connection rotation actually destroys, including one parked mid-long-poll.
+	// Together they make idleness a PROVEN condition: no recent bytes AND nothing
+	// connected (or no evidence at all, for at most servingSocketUnprovenGrace).
+	if inst.ServingTraffic() || inst.ServingClients() {
 		debugLog("Instance %d: serving client traffic, slow rotation skipped (active %s at %dms)",
 			i, shortName(active.Name), inst.LastLatency().Milliseconds())
 		return

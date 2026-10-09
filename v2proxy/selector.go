@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +58,21 @@ type ProxySelector struct {
 	// cmdline pattern (config-rot-*.json) but owns no serving handle, so an
 	// unguarded prune kills it mid-search and manufactures "no working
 	// config found" out of a pool that has working proxies.
+	// tempPIDsMu guards the in-flight throwaway-probe PID set merged into the
+	// watchdog keep set (see managedPIDs).
 	tempPIDsMu sync.Mutex
 	tempPIDs   map[int]bool
+	// servingMu guards servingUnproven, deliberately NOT s.mu: this signal is
+	// read from the rotation path while the health path holds s.mu across a
+	// whole probe exchange, and the registry it mirrors (egressNotes) keeps its
+	// own lock for exactly the same reason.
+	servingMu sync.Mutex
+	// servingUnproven is when the ESTABLISHED-socket guard last had NO evidence
+	// to work with (unreadable /proc, unparseable table). Zero = the last pass
+	// was conclusive. It is the clock behind servingSocketUnprovenGrace: it
+	// stops a permanently unreadable /proc from making the instance ineligible
+	// for rotation forever, and it is cleared the moment evidence returns.
+	servingUnproven time.Time
 }
 
 func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInterval time.Duration) *ProxySelector {
@@ -106,8 +123,70 @@ func (s *ProxySelector) LatencyFresh(maxAge time.Duration) bool {
 // ServingTraffic reports whether real client bytes have flowed through this
 // instance within egressGrace — the same evidence HealthCheck uses to refuse a
 // synthetic strike, exposed so the rotation paths can honour it too.
+//
+// The byte ledger only sees ports THIS process serves, so it is half the
+// question; see ServingClients for the half it structurally cannot answer.
 func (s *ProxySelector) ServingTraffic() bool {
 	return egressActive([]int{s.httpPort, s.socksPort}, egressGrace)
+}
+
+// ServingClients reports whether a client socket is currently open on this
+// instance's SOCKS port — the port xray itself owns, and therefore the one
+// stopXray() severs.
+//
+// Deliberately NOT folded into ServingTraffic, and the two must never drift into
+// one another. ServingTraffic means "proven responsive by recent bytes", which is
+// why HealthCheck may skip its probe on it; an open socket proves only that
+// SOMETHING is connected. A blackholed-but-open tunnel is the defining DPI
+// failure and looks identical from here, so wiring this into HealthCheck would
+// let one wedged client report a dead upstream as healthy indefinitely.
+//
+// Only socksPort is read: every severed connection terminates there. The HTTP
+// bridge listener lives in this process, survives a rotation and holds its own
+// sockets, so scanning it would measure the daemon, not the client.
+func (s *ProxySelector) ServingClients() bool {
+	return s.servingClients(procSocketEvidence)
+}
+
+// servingClients is ServingClients with the /proc scan injected, so the
+// staleness contract can be exercised where /proc cannot be broken on demand.
+//
+// Three outcomes, and the middle one is the whole point:
+//   - proven empty  -> rotatable, and the escape clock re-arms;
+//   - proven occupied -> busy FOREVER, no clock: a live socket is exactly what
+//     rotation destroys, so its protection must not expire;
+//   - unknown      -> busy (reliability first) until servingSocketUnprovenGrace
+//     has passed, then rotatable again.
+func (s *ProxySelector) servingClients(scan func(int) (int, bool)) bool {
+	n, proven := scan(s.socksPort)
+	now := time.Now()
+
+	s.servingMu.Lock()
+	defer s.servingMu.Unlock()
+	if proven {
+		s.servingUnproven = time.Time{}
+		return n > 0
+	}
+	if s.servingUnproven.IsZero() {
+		s.servingUnproven = now
+		return true
+	}
+	if now.Sub(s.servingUnproven) < servingSocketUnprovenGrace {
+		return true
+	}
+	debugLog("instance %d: no socket evidence for %s, serving-socket guard expired (rotation may proceed)",
+		s.socksPort, time.Since(s.servingUnproven).Round(time.Second))
+	return false
+}
+
+// clearServingUnproven re-arms the staleness escape after a new xray is
+// launched: whatever held the old process's sockets is gone with it, so the
+// instance earns a fresh full window of protection before the guard can expire
+// again. One rotation attempt per bound, not an open door.
+func (s *ProxySelector) clearServingUnproven() {
+	s.servingMu.Lock()
+	s.servingUnproven = time.Time{}
+	s.servingMu.Unlock()
 }
 
 // FailCount reports consecutive health failures on the current upstream (0 =
@@ -676,6 +755,10 @@ func (s *ProxySelector) startXray(index int) error {
 		return err
 	}
 	s.xrayCmd = cmd
+	// A fresh process holds no sockets: whatever the serving-socket guard was
+	// counting died with the old one, so its staleness clock starts over rather
+	// than expiring on evidence that can no longer exist.
+	s.clearServingUnproven()
 	return nil
 }
 
@@ -989,4 +1072,252 @@ func waitForPortFree(port int, timeout time.Duration) {
 		_ = conn.Close()
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// ---- Serving-socket evidence (/proc/net/tcp{,6}) ----
+//
+// egressNotes answers "did BYTES flow, recently?". This answers "is a client
+// socket still standing on the serving port?". They are not interchangeable: a
+// client that dialled the SOCKS port and then parked — mid-long-poll, waiting on
+// a reply nobody is going to send — has proven nothing recently and still owns a
+// connection that stopXray() would sever. That blind spot is exactly how a client
+// pinned straight to a per-instance SOCKS port could be rotated out from under a
+// live tunnel: its bytes crossed the xray child, which this daemon never observes.
+//
+// ESTABLISHED (state 01) only. A socket in CLOSE_WAIT/TIME_WAIT has already lost
+// its peer, so the tunnel it belonged to is broken either way and must never hold
+// a rotation hostage — one abandoned connection would freeze the pool.
+//
+// Both tables must be read: a dual-stack listener on 0.0.0.0 publishes its IPv4
+// clients in tcp6 ONLY, as v4-mapped rows, so scanning /proc/net/tcp alone sees
+// such an instance as permanently idle.
+//
+// And the daemon's own sockets must come out: it dials the serving ports
+// constantly — the HealthCheck probe, waitForPort/waitForPortFree, the watchdog's
+// tcpOpen — and refresh (reconcileActive) runs in its own goroutine beside the
+// health loop, so those pokes are in flight DURING the rotation check. Counted
+// as traffic they would defer every rotation by a tick.
+
+const tcpStateEstablished = "01"
+
+const (
+	procNetTCP     = "/proc/net/tcp"
+	procNetTCP6    = "/proc/net/tcp6"
+	procSelfFD     = "/proc/self/fd"
+	v4MappedPrefix = "0000000000000000FFFF0000"
+)
+
+var procNetTCPFiles = []string{procNetTCP, procNetTCP6}
+
+// procEndpoint is one canonicalised "ADDR:PORT" end of a socket. v4-mapped IPv6
+// addresses are folded onto their IPv4 form so both tables — and both ends of one
+// connection — compare as the same string.
+type procEndpoint struct {
+	addr string
+	port int
+}
+
+func (e procEndpoint) String() string { return e.addr + ":" + strconv.Itoa(e.port) }
+
+// procConn is one row of a /proc/net/tcp{,6} table. inode is the socket's own
+// inode: the kernel's link between this row and a descriptor in /proc/self/fd.
+type procConn struct {
+	local  procEndpoint
+	remote procEndpoint
+	state  string
+	inode  string
+}
+
+// parseProcNetTCP turns one /proc/net/tcp{,6} table into rows. Pure — table in,
+// rows out — so the format contract stays unit-testable on platforms that have
+// no /proc at all.
+//
+// ok=false means the table could NOT be understood, and every caller must read
+// that as "unknown", never as "idle": a guard that mistakes a truncated or
+// re-formatted table for an empty one severs live long-polls. Blank lines are
+// tolerated (a table read can end mid-line); anything else unrecognised is not.
+func parseProcNetTCP(table []byte) ([]procConn, bool) {
+	var rows []procConn
+	headed := false
+	for line := range strings.SplitSeq(string(table), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if !headed {
+			headed = true
+			// The kernel's own header. Its absence means this is not the format
+			// the guard was written against, which is unknown, not empty.
+			if fields[0] == "sl" {
+				continue
+			}
+			return nil, false
+		}
+		row, ok := parseProcRow(fields)
+		if !ok {
+			return nil, false
+		}
+		rows = append(rows, row)
+	}
+	return rows, headed
+}
+
+// parseProcRow decodes one whitespace-split row. The column count is pinned at
+// the inode (field 9): the peer test below cannot work without it, so a row too
+// short to carry one is a row we do not understand.
+func parseProcRow(fields []string) (procConn, bool) {
+	if len(fields) < 10 {
+		return procConn{}, false
+	}
+	local, ok := parseProcEndpoint(fields[1])
+	if !ok {
+		return procConn{}, false
+	}
+	remote, ok := parseProcEndpoint(fields[2])
+	if !ok {
+		return procConn{}, false
+	}
+	state := fields[3]
+	if _, err := strconv.ParseUint(state, 16, 8); err != nil || len(state) != 2 {
+		return procConn{}, false
+	}
+	return procConn{local: local, remote: remote, state: state, inode: fields[9]}, true
+}
+
+// parseProcEndpoint splits one "ADDR:PORT" field: the port is hex, the address
+// is 8 hex digits (IPv4) or 32 (IPv6, colonless). The v4-mapped IPv6 form is
+// what a dual-stack 0.0.0.0 listener publishes for an IPv4 client, and folding
+// it onto the IPv4 spelling is what lets the two ends of such a connection be
+// paired across the two tables.
+func parseProcEndpoint(field string) (procEndpoint, bool) {
+	i := strings.LastIndex(field, ":")
+	if i < 0 {
+		return procEndpoint{}, false
+	}
+	addr := strings.ToUpper(field[:i])
+	port, err := strconv.ParseUint(field[i+1:], 16, 32)
+	if err != nil {
+		return procEndpoint{}, false
+	}
+	switch len(addr) {
+	case 8:
+	case 32:
+		if strings.HasPrefix(addr, v4MappedPrefix) {
+			addr = addr[len(addr)-8:]
+		}
+	default:
+		return procEndpoint{}, false
+	}
+	return procEndpoint{addr: addr, port: int(port)}, true
+}
+
+// foreignEstablished counts established connections touching port whose NEITHER
+// end is a socket this process holds. Ownership is decided per CONNECTION, not
+// per row, and that distinction is the whole mechanism.
+//
+// The serving port belongs to XRAY, not to the daemon - renderXrayConfig binds
+// it in a child process - so a real client connected to this instance produces
+// two rows that are both FOREIGN: xray's (local = serving port) and the
+// client's (remote = serving port). The daemon's own probe is the only traffic
+// that mixes in an owned end: HealthCheck, the bind waits and the watchdog all
+// dial OUT, giving one owned row (local ephemeral, remote = serving port) paired
+// with xray's foreign row.
+//
+// So "both ends foreign" is precisely "a client is connected", and it is
+// unaffected by which direction the port appears in - both columns must be
+// tested, because xray's row carries it locally and the client's remotely.
+//
+// Matching rows one at a time cannot express this. Subtracting owned rows by
+// endpoint strands every real client, because xray's half of a live tunnel is
+// indistinguishable from the peer of our own probe until you look at the pair.
+func foreignEstablished(rows []procConn, own map[string]bool, port int) int {
+	// Fold each connection to one unordered endpoint key: a connection is two
+	// rows, and a v4-mapped dual-stack one is published twice (tcp AND tcp6).
+	// Counting rows would bill a single client as two or three.
+	connection := func(r procConn) [2]string {
+		key := [2]string{r.local.String(), r.remote.String()}
+		if key[0] > key[1] {
+			key[0], key[1] = key[1], key[0]
+		}
+		return key
+	}
+	owned := make(map[[2]string]bool, len(rows))
+	for _, r := range rows {
+		if own[r.inode] {
+			owned[connection(r)] = true
+		}
+	}
+	n := 0
+	seen := make(map[[2]string]bool, len(rows))
+	for _, r := range rows {
+		if r.state != tcpStateEstablished {
+			continue
+		}
+		if r.local.port != port && r.remote.port != port {
+			continue
+		}
+		key := connection(r)
+		if owned[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		n++
+	}
+	return n
+}
+
+// procOwnInodes returns the inodes of every socket descriptor this process
+// holds: /proc/self/fd entries are symlinks to "socket:[N]". ok=false when the
+// question cannot be answered at all, which the caller must treat as unknown
+// evidence rather than as an answer.
+func procOwnInodes() (map[string]bool, bool) {
+	entries, err := os.ReadDir(procSelfFD)
+	if err != nil {
+		return nil, false
+	}
+	own := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		target, err := os.Readlink(filepath.Join(procSelfFD, e.Name()))
+		if err != nil {
+			// A descriptor that closed mid-walk has no row left to misjudge.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, false
+		}
+		if inode, ok := strings.CutPrefix(target, "socket:["); ok {
+			own[strings.TrimSuffix(inode, "]")] = true
+		}
+	}
+	return own, true
+}
+
+// procSocketEvidence answers "how many client sockets are open on port", with
+// the daemon's own sockets removed. ok=false means the answer is UNKNOWN.
+//
+// A platform with no /proc at all is not a broken /proc: there is nothing to
+// measure, so the guard must not manufacture a busy verdict and freeze rotation
+// where the daemon is only ever developed. Same reasoning, same precedent as
+// listXrayPIDs, whose non-linux no-op keeps the orphan prune harmless.
+func procSocketEvidence(port int) (int, bool) {
+	if runtime.GOOS != "linux" || port <= 0 {
+		return 0, true
+	}
+	own, ok := procOwnInodes()
+	if !ok {
+		return 0, false
+	}
+	rows := make([]procConn, 0, 256)
+	for _, path := range procNetTCPFiles {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return 0, false
+		}
+		parsed, ok := parseProcNetTCP(raw)
+		if !ok {
+			return 0, false
+		}
+		rows = append(rows, parsed...)
+	}
+	return foreignEstablished(rows, own, port), true
 }

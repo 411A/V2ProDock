@@ -202,6 +202,19 @@ const telegramProbeURL = "https://api.telegram.org/"
 // with margin while bounding true-down detection to grace + 3 strikes.
 const egressGrace = 90 * time.Second
 
+// ---- Serving-socket accounting (rotation safety) ----
+// egressGrace answers "were there recent BYTES". This bounds the OTHER failure
+// direction of the ESTABLISHED-socket guard: an unreadable /proc, or a table we
+// cannot parse, makes every instance look busy, and an instance that can never
+// rotate is a slow-motion outage — a slow-but-working upstream never trips
+// healthFailThreshold, yet it keeps winning aggMinStreak and monopolises the
+// aggregate head. So blindness is treated as busy (reliability first) but only
+// for this long, after which rotation is allowed on the byte evidence alone.
+// Five refresh ticks: long enough that no legitimate long-poll is ever at risk
+// because of a transient table read, short enough that a hard-broke /proc heals
+// the pool within minutes instead of never.
+const servingSocketUnprovenGrace = 5 * subscriptionRefreshInterval
+
 // ---- Aggregate stability gating ----
 // Lowest-latency-first routes long-polls onto nodes that die mid-poll
 // (production-proven: flappy-fast RSTs 50s getUpdates). Candidates need this

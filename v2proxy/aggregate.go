@@ -90,9 +90,10 @@ func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
 			continue
 		}
 		// Credit goes to the backend that actually got the flow, and only
-		// when bytes really move: relay fires onFirstByte once per connection
-		// on the first successful read, so a skipped or zero-byte candidate
-		// never banks a note.
+		// when bytes really move: relay fires the hook on every read that
+		// carried bytes (never on a zero-byte read or a skipped candidate), so
+		// a backend that served nothing, and one that took the connection but
+		// never proved it, never bank a note.
 		egress := func() {}
 		if _, p, perr := net.SplitHostPort(backend); perr == nil {
 			if port, cerr := strconv.Atoi(p); cerr == nil {

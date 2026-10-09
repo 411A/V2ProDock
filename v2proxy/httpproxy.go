@@ -309,8 +309,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 		return
 	}
 
-	// First byte in either direction proves the tunnel live (the 200 above
-	// only proved the dial). Idempotent timestamp: double-fire is harmless.
+	// Any byte in either direction proves the tunnel live (the 200 above only
+	// proved the dial), and every later batch re-proves it — see relay. A
+	// timestamp is idempotent, so the repeat fires cost nothing but the ledger
+	// entry that keeps a long-lived connection from ageing out of the guard.
 	egress := func() { noteEgress(httpPort) }
 	// Hand the slot to the relays: released once BOTH directions finish, so one
 	// tunnel occupies exactly one connection slot for its whole life.
@@ -380,8 +382,18 @@ func setKeepAlive(c net.Conn) {
 
 // relay splices two connections until either side finishes, with an IDLE
 // deadline (relayIdleDeadline) re-armed after every successful hop.
-func relay(dst, src net.Conn, onFirstByte func()) {
-	relayWithIdle(dst, src, onFirstByte, relayIdleDeadline)
+//
+// onFlow is invoked after every read that ACTUALLY MOVED BYTES — not once, on
+// the first one. noteEgress is a one-shot-per-connection timestamp, so a client
+// that connected once and then sat on the tunnel (mid-long-poll, waiting on a
+// reply nobody is going to send) carried no note after egressGrace and read as
+// idle while its connection was very much alive — on the aggregate path, which
+// is already protected against rotation by this very ledger. Re-firing per hop
+// keeps a live tunnel noted for as long as it carries traffic and costs no
+// timer and no extra goroutine: the relay loop already owns the wakeup, and it
+// fires only when n > 0, so a genuinely silent tunnel still reads as idle.
+func relay(dst, src net.Conn, onFlow func()) {
+	relayWithIdle(dst, src, onFlow, relayIdleDeadline)
 }
 
 // relayWithIdle is relay with the idle budget injectable so the behaviour is
@@ -394,7 +406,7 @@ func relay(dst, src net.Conn, onFirstByte func()) {
 // resume. That is not a blackhole detector, it is a transfer-size limit wearing
 // an idle constant's name. Re-arming per hop makes it mean what it says: only a
 // peer that stops moving entirely trips it.
-func relayWithIdle(dst, src net.Conn, onFirstByte func(), idle time.Duration) {
+func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
 	// Both ends: a blackholed upstream must surface here (relay unblocks,
 	// both sides close, client reconnects) instead of hanging to the deadline.
 	setKeepAlive(dst)
@@ -416,9 +428,8 @@ func relayWithIdle(dst, src net.Conn, onFirstByte func(), idle time.Duration) {
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
-			if onFirstByte != nil {
-				onFirstByte()
-				onFirstByte = nil
+			if onFlow != nil {
+				onFlow()
 			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				debugLog("relay write ended stream: %v", writeErr)

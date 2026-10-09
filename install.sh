@@ -4,6 +4,12 @@ set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok() { echo -e "${GREEN}[OK] $1${NC}"; }
 err() { echo -e "${RED}[ERROR] $1${NC}"; }
+# Progress banner for functions whose STDOUT IS DATA (rewrite_sub_urls): the
+# caller does `x=$(func)`, so anything this prints on stdout is captured and
+# becomes part of the value. That is how `[OK] Rewriting ...` once landed in
+# .env as SUBSCRIPTION_URL. Anything a value-producing function says about its
+# work belongs on stderr.
+note() { echo -e "${GREEN}[OK] $1${NC}" >&2; }
 
 REPO="https://github.com/411A/V2ProDock.git"
 INSTALL_DIR="$HOME/V2ProDock"
@@ -20,6 +26,16 @@ env_val() {
 }
 
 # Print proxy info and health status after starting
+# Highest host port docker-compose.yml publishes, read out of the file's own
+# short port syntax. The data map is a FIXED range (27000-27017 and
+# 27019-27100), so a big enough PROXY_INSTANCES walks the HTTP leg past its
+# end and the host refuses the connection.
+published_port_max() {
+    grep -ohE '"[0-9.]+(-[0-9]+)?:[0-9]+(-[0-9]+)?(/[a-z]+)?"' "$DIR/docker-compose.yml" 2>/dev/null \
+        | tr -d '"' | sed 's|/[a-z]*$||' | awk -F: '{print $NF}' \
+        | awk -F- '{ if (NF > 1) print $2; else print $1 }' | sort -n | tail -1
+}
+
 show_status() {
     local port_base instances api_port
     port_base=$(env_val PORT_BASE 27019)
@@ -28,13 +44,24 @@ show_status() {
 
     echo ""
     echo -e "${CYAN}Proxies:${NC}"
-    local i=0
+    local i=0 pub_max over=0
+    pub_max=$(published_port_max)
     while [ "$i" -lt "$instances" ]; do
         local socks=$((port_base + i))
         local http=$((port_base + instances + i))
-        echo "  SOCKS5: localhost:$socks   HTTP: localhost:$http"
+        if [ -n "$pub_max" ] && [ "$http" -gt "$pub_max" ]; then
+            # Printed as if it worked = a lie the user spends 10 minutes on.
+            echo "  SOCKS5: localhost:$socks   HTTP: localhost:$http   <- HTTP port NOT published by docker-compose.yml"
+            over=1
+        else
+            echo "  SOCKS5: localhost:$socks   HTTP: localhost:$http"
+        fi
         i=$((i + 1))
     done
+    if [ "$over" -eq 1 ]; then
+        echo -e "${RED}  docker-compose.yml publishes only up to $pub_max: PROXY_INSTANCES=$instances overruns it.${NC}"
+        echo -e "${RED}  Lower PROXY_INSTANCES in .env, or widen the published range there, then: bash install.sh restart${NC}"
+    fi
     echo ""
     local agg_socks agg_http
     agg_socks=$(env_val AGGREGATE_SOCKS_PORT 27017)
@@ -172,16 +199,22 @@ dotenv_val() {
 }
 
 # Subscription URLs from .env only (both keys), one per line.
+# CANONICAL ORDER: SUBSCRIPTION_URL first, then the SUBSCRIPTION_URLS remainder
+# - exactly the order write_env_subscriptions persists. Every reader of the
+# same list must use it: with U1,U2 the two orders disagree, the installer then
+# "updates" an already-correct .env on every single run and says so.
 read_env_sub_urls() {
     local raw=""
     if [ -f "$DIR/.env" ]; then
-        raw="$(dotenv_val SUBSCRIPTION_URLS)
-$(dotenv_val SUBSCRIPTION_URL)"
+        raw="$(dotenv_val SUBSCRIPTION_URL)
+$(dotenv_val SUBSCRIPTION_URLS)"
     fi
     split_sub_urls "$raw"
 }
 
 # Subscription URLs from every source (file + .env + env vars), one per line.
+# Same canonical order as read_env_sub_urls, so a .env written from this list
+# compares equal on the next run (see above).
 read_sub_urls() {
     local raw=""
     if [ -f "$DIR/config/subscription.txt" ]; then
@@ -190,13 +223,13 @@ $(tr '\r' '\n' < "$DIR/config/subscription.txt")"
     fi
     if [ -f "$DIR/.env" ]; then
         raw="$raw
-$(dotenv_val SUBSCRIPTION_URLS)
-$(dotenv_val SUBSCRIPTION_URL)"
+$(dotenv_val SUBSCRIPTION_URL)
+$(dotenv_val SUBSCRIPTION_URLS)"
     fi
-    [ -n "${SUBSCRIPTION_URLS:-}" ] && raw="$raw
-$SUBSCRIPTION_URLS"
     [ -n "${SUBSCRIPTION_URL:-}" ] && raw="$raw
 $SUBSCRIPTION_URL"
+    [ -n "${SUBSCRIPTION_URLS:-}" ] && raw="$raw
+$SUBSCRIPTION_URLS"
     split_sub_urls "$raw"
 }
 
@@ -216,7 +249,7 @@ rewrite_sub_urls() {
             f=$(fix_vm_url "$u")
         fi
         if [ "$f" != "$u" ]; then
-            ok "Rewriting $u -> $f"
+            note "Rewriting $u -> $f"
         fi
         if [ -z "$out" ]; then out="$f"; else out="$out
 $f"; fi
@@ -261,7 +294,7 @@ netns_report() {
     # -o, NOT -br: v2prodock runs BusyBox ip (no -br) - it would print usage.
     docker exec v2prodock ip -o addr 2>&1 | sed 's/^/  addr    /'
     docker exec v2prodock ip route 2>&1 | sed 's/^/  route   /'
-    local net n
+    local net n cf
     net=$(docker inspect v2prodock --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
     for n in $net; do
         docker network inspect "$n" --format "  net     $n driver={{.Driver}} internal={{.Internal}} {{range .IPAM.Config}}subnet={{.Subnet}} gw={{.Gateway}} {{end}}members={{range $k, $v := .Containers}}{{$v.Name}}={{$v.IPv4Address}} {{end}}" 2>/dev/null
@@ -269,7 +302,14 @@ netns_report() {
     docker inspect v2prodock --format '  endpoint {{json .NetworkSettings.Networks}}' 2>/dev/null
     echo "  host    ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) bridges=$(ip -br link show type bridge 2>/dev/null | awk '{print $1"("$2")"}' | tr '\n' ' ')"
     [ -n "${COMPOSE_FILE:-}" ] && echo "  host    COMPOSE_FILE=$COMPOSE_FILE injects extra compose files"
-    ls docker-compose*.yml compose*.yml 2>/dev/null | grep -vx 'docker-compose.yml' | sed 's/^/  host    EXTRA COMPOSE FILE: /'
+    # ONLY the names compose actually auto-loads. The old `ls docker-compose*`
+    # flagged docker-compose.host.yml on every single run - it is opt-in via
+    # `-f`, compose never reads it - which drowned the one line that matters
+    # (internal= in the network actually in use).
+    for cf in docker-compose.override.yml docker-compose.override.yaml compose.override.yml \
+              compose.override.yaml compose.yaml compose.yml; do
+        [ -f "$cf" ] && echo "  host    AUTO-LOADED COMPOSE FILE: $cf"
+    done
     docker info --format '  daemon  ip-forward={{.IPv4Forwarding}} pools={{json .DefaultAddressPools}}' 2>/dev/null
     local addrs routes
     addrs=$(docker exec v2prodock ip -o addr 2>/dev/null)
@@ -277,7 +317,7 @@ netns_report() {
     if ! printf '%s' "$addrs" | grep -qE 'eth0[[:space:]]+inet '; then
         echo "  VERDICT: eth0 has no IPv4 address - the endpoint never got an IP (IPAM/daemon problem, not the URLs)"
     elif ! printf '%s' "$routes" | grep -q '^default'; then
-        echo "  VERDICT: eth0 has an address but NO default route - the network was created without a gateway (internal=true or an injected compose override - see EXTRA COMPOSE FILE / COMPOSE_FILE / internal= lines above)"
+        echo "  VERDICT: eth0 has an address but NO default route - the network was created without a gateway (internal=true or an injected compose override - see AUTO-LOADED COMPOSE FILE / COMPOSE_FILE / internal= lines above)"
     else
         echo "  VERDICT: netns has address + default route - the loss is OUTSIDE the container (host forward path: check ip_forward above, then 'sudo iptables -L FORWARD -n' and 'sudo ufw status')"
     fi
@@ -335,21 +375,27 @@ PROJECT_CONTAINERS="v2prodock v2prodock-vpn"
 # repairs, stops or removes anything, and it never looks at containers this
 # project does not own — a host-wide scan would be guessing at other stacks'
 # business (Hermes, mem0, qdrant, postgres, ...) and got that wrong before.
+# Returns 0 only if every container is running AND set to come back. The
+# warnings above are no longer the ONLY signal: a warning nobody can act on
+# programmatically is exactly how `start` exited 0 over a container that was
+# in a crash-restart loop (see start_stack).
 verify_project_containers() {
-    local want line name state policy
+    local want line name state policy bad=0
     for want in $PROJECT_CONTAINERS; do
         if ! line=$(docker inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}' "$want" 2>/dev/null); then
             err "container '$want' does not exist - run: bash install.sh start"
+            bad=1
             continue
         fi
         IFS='|' read -r name state policy <<< "$line"
         name=${name#/}
         printf '  %s: %s (restart=%s)\n' "$name" "${state:-?}" "${policy:-none}"
-        [ "$state" = "running" ] || echo -e "${RED}[WARN] $name is '${state:-unknown}', not running${NC}"
+        [ "$state" = "running" ] || { echo -e "${RED}[WARN] $name is '${state:-unknown}', not running${NC}"; bad=1; }
         # No restart policy = the container never comes back after a reboot,
         # which is what leaves clients talking to a proxy nobody is running.
-        [ "$policy" = "unless-stopped" ] || echo -e "${RED}[WARN] $name has restart='${policy:-none}' - it will NOT come back after a reboot${NC}"
+        [ "$policy" = "unless-stopped" ] || { echo -e "${RED}[WARN] $name has restart='${policy:-none}' - it will NOT come back after a reboot${NC}"; bad=1; }
     done
+    return "$bad"
 }
 
 # Full teardown + rebuild of THIS project, fully automatic: old containers
@@ -390,13 +436,19 @@ fresh_rebuild() {
             printf '%s\n' "$up_out"
             # Prove the stack is really there: 'up' returning 0 only means the
             # create call succeeded, not that the containers are alive and set
-            # to survive the next reboot.
-            verify_project_containers
+            # to survive the next reboot. The verdict is the RETURN VALUE -
+            # printing a warning and returning 0 anyway is what let a dying
+            # entrypoint report "[OK] Started".
+            verify_project_containers || return 1
             return 0
         fi
         printf '%s\n' "$up_out"
-        bind_spec=$(printf '%s' "$up_out" | grep -oE 'failed to bind host port [0-9.]+:[0-9]+/(tcp|udp)' | head -1 | grep -oE '[0-9.]+:[0-9]+/(tcp|udp)' || true)
-        if [ -z "$bind_spec" ] || ! free_port_squatter "$bind_spec"; then
+        bind_spec=$(bind_conflict_spec "$up_out")
+        if [ -z "$bind_spec" ]; then
+            break
+        fi
+        echo "  Host port $bind_spec is already allocated - checking whether the holder is a dead proxy"
+        if ! free_port_squatter "$bind_spec"; then
             break
         fi
         # free_port_squatter prints its own "Evicting ..." only when it
@@ -413,9 +465,45 @@ fresh_rebuild() {
         sleep 2
     done
     err "docker compose up failed - fix the error above, then retry"
-    echo "  If 'address already in use' persists: ss -tlnp | grep <port> finds the squatter"
-    echo "  (another stack holding the port? a host-mode binary?) - evict it, then rerun"
+    if printf '%s' "$up_out" | grep -q 'is already in use by container'; then
+        # A name conflict, not a port conflict: this checkout's project name
+        # differs from the one already running, but container_name: is global.
+        echo "  Conflict: the container NAME is taken by another stack's v2prodock"
+        echo "  docker ps -a --filter name=v2prodock   # who owns it"
+        echo "  Stop the other one (it is the same service, one host can run only one)"
+    else
+        echo "  If 'address already in use' persists: ss -tlnp | grep <port> finds the squatter"
+        echo "  (another stack holding the port? a host-mode binary?) - evict it, then rerun"
+    fi
+    # Same clean-slate rule as the retry path: an aborted 'up' leaves Created
+    # containers and a network behind, which the NEXT run has to untangle.
+    docker compose down --remove-orphans >/dev/null 2>&1 || true
     exit 1
+}
+
+# Pull "IP:PORT/PROTO" out of a failed `compose up`. BOTH formats are in the
+# wild and the newer one is the one every current install hits - matching only
+# compose v1's Python string left free_port_squatter unreachable dead code:
+#   v2 (Go):     Bind for 127.0.0.1:27018 failed: port is already allocated
+#   v1 (Python): failed to bind host port 0.0.0.0:27018/tcp
+# The v2 message does not name a protocol, so it is reported as /any and the
+# squatter lookup checks both the tcp and udp tables - guessing tcp would
+# silently skip the VPN's UDP ports.
+bind_conflict_spec() {
+    local m spec
+    m=$(printf '%s' "$1" | grep -oE 'Bind for [^ ]+ failed: port is already allocated' | head -1)
+    if [ -n "$m" ]; then
+        printf '%s' "$m" | grep -oE '[0-9.]+:[0-9]+' | head -1 | sed 's/$/\/any/'
+        return 0
+    fi
+    spec=$(printf '%s' "$1" | grep -oE 'failed to bind host port [0-9.]+:[0-9]+(/tcp|/udp)?' | head -1 \
+        | grep -oE '[0-9.]+:[0-9]+(/tcp|/udp)?')
+    [ -n "$spec" ] || return 0
+    case "$spec" in
+        */tcp|*/udp) printf '%s\n' "$spec" ;;
+        # v1 leaves the protocol off on tcp binds; udp always carries it.
+        *)           printf '%s/tcp\n' "$spec" ;;
+    esac
 }
 
 # Evict a port squatter automatically ONLY when it is provably stale: the
@@ -424,15 +512,21 @@ fresh_rebuild() {
 # container is alive (another stack's port!) or any non-proxy process is
 # refused, never killed. Returns 0 when the port is free afterwards.
 free_port_squatter() {
-    # $1 = "IP:port/proto" as reported by the daemon, e.g. 127.0.0.1:27018/tcp
+    # $1 = "IP:port/proto" as reported by the daemon, e.g. 127.0.0.1:27018/tcp.
+    # /any = the daemon named no protocol (compose v2): look in both tables.
     local spec="$1" proto="${1##*/}" port="${1%/*}" args="" cid="" pid=""
     port="${port##*:}"
-    local ssflag="-tlnp"
-    [ "$proto" = "udp" ] && ssflag="-ulnp"
+    local ssflags="-tlnp"
+    if [ "$proto" = "udp" ]; then
+        ssflags="-ulnp"
+    elif [ "$proto" = "any" ]; then
+        ssflags="-tulnp -ulnp"
+    fi
     command -v ss >/dev/null 2>&1 || return 1
     command -v ps >/dev/null 2>&1 || return 1
     local holders
-    holders=$(ss "$ssflag" "( sport = :$port )" 2>/dev/null | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+' | sort -u)
+    # shellcheck disable=SC2086
+    holders=$(ss $ssflags "( sport = :$port )" 2>/dev/null | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+' | sort -u)
     [ -z "$holders" ] && return 0
     for pid in $holders; do
         # ww = unlimited width: a truncated cmdline would hide container-id
@@ -629,39 +723,144 @@ ensure_host_prereqs() {
 
 
 
+# Start the stack and only THEN say "Started". The banner used to be
+# unconditional, so a container whose entrypoint exits immediately printed
+# "[OK] Started" and exited 0 while the daemon was already reporting
+# "Restarting (42)". Message follows the condition, never precedes it.
+start_stack() {
+    if ! fresh_rebuild; then
+        err "stack did not come up - NOT reporting Started (state above)"
+        echo "  Inspect: docker compose ps -a ; docker logs --tail 50 v2prodock"
+        exit 1
+    fi
+    ok "Started"
+}
+
+# 'start'/'restart' must never bring up a container that cannot work: compose
+# passes SUBSCRIPTION_URL from .env only, so a missing .env means an empty URL,
+# the daemon prompts on stdin, gets EOF and exits 1 - and restart=unless-stopped
+# turns that into a crash loop nobody asked for. Either a usable .env exists or
+# we refuse with instructions.
+ensure_env_file() {
+    if [ ! -f "$DIR/.env" ]; then
+        cp "$DIR/.env.example" "$DIR/.env" || { err "cannot create $DIR/.env"; exit 1; }
+        ok ".env created from .env.example"
+    fi
+    local urls first rest
+    urls=$(read_sub_urls)
+    if [ -z "$urls" ]; then
+        err "no subscription URL configured - refusing to start a stack that cannot work"
+        echo "  Put one or more URLs in $DIR/config/subscription.txt (one per line), then rerun,"
+        echo "  or run the full installer to be prompted: bash install.sh"
+        exit 1
+    fi
+    # A URL that exists only in config/subscription.txt still leaves the
+    # container's SUBSCRIPTION_URL empty, so mirror the list into .env.
+    if [ -z "$(read_env_sub_urls)" ]; then
+        first=$(printf '%s\n' "$urls" | head -1)
+        rest=$(printf '%s\n' "$urls" | tail -n +2)
+        write_env_subscriptions "$first" "$rest"
+        ok "Subscriptions restored into .env from existing sources"
+    fi
+}
+
+# Verify 'stop' actually took: `compose stop` returning 0 proves the request
+# was accepted, not that anything stopped. A container still in a restart loop
+# comes straight back under unless-stopped, and telling the user "Stopped"
+# about that is the same unearned banner as "[OK] Started".
+verify_project_stopped() {
+    local want state bad=0
+    for want in $PROJECT_CONTAINERS; do
+        if ! state=$(docker inspect --format '{{.State.Status}}' "$want" 2>/dev/null); then
+            printf '  %s: absent\n' "$want"
+            continue
+        fi
+        case "$state" in
+            running|restarting)
+                printf '  %s: %s - STILL UP\n' "$want" "$state"
+                bad=1
+                ;;
+            *) printf '  %s: %s\n' "$want" "$state" ;;
+        esac
+    done
+    if [ "$bad" -ne 0 ]; then
+        err "stop did not take - see the states above"
+        return 1
+    fi
+    return 0
+}
+
+
+
 # Check if Docker is available
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
     DOCKER_MODE=true
     ok "Docker detected"
 else
     DOCKER_MODE=false
-    echo "Docker not found, installing dependencies..."
+    if command -v docker &>/dev/null; then
+        # Docker IS installed - the Compose v2 plugin is what is missing. Say
+        # which, instead of the blanket "Docker not found" that sent users
+        # looking for a missing Docker.
+        echo -e "${RED}[WARN] Docker is installed but 'docker compose' (the Compose v2 plugin) is not - using the non-Docker install.${NC}"
+        echo "  For the containerised install, add the plugin: https://docs.docker.com/compose/install/"
+    else
+        echo "Docker not found, installing dependencies..."
+    fi
 fi
 
 if [ "$DOCKER_MODE" = true ]; then
     # Docker mode
     case "${1:-}" in
         start)
+            ensure_env_file
             ensure_host_prereqs
-            fresh_rebuild
-            ok "Started"
+            start_stack
+            check_container_egress "$(read_sub_urls)"
+            show_status
+            ;;
+        restart)
+            # Restart, NOT reinstall. This arm existed only in the README, so
+            # `restart` fell through to the full install path: git pull, .env
+            # rewrite, teardown AND `docker rmi` of both images. The documented
+            # WSL2 fix ("sed the .env, then restart") threw away two image
+            # builds to change one variable. Recreate from what is already
+            # built; compose builds any image that does not exist yet.
+            ensure_env_file
+            if docker compose up -d --force-recreate; then
+                verify_project_containers || {
+                    err "restart left the stack down - NOT reporting Restarted"
+                    echo "  Inspect: docker logs --tail 50 v2prodock"
+                    exit 1
+                }
+                ok "Restarted"
+            else
+                err "docker compose up failed"
+                echo "  Inspect: docker compose logs --tail 50"
+                exit 1
+            fi
             check_container_egress "$(read_sub_urls)"
             show_status
             ;;
         stop)
-            docker compose stop
-            ok "Stopped"
+            docker compose stop || { err "docker compose stop failed"; exit 1; }
+            if verify_project_stopped; then
+                ok "Stopped"
+            else
+                exit 1
+            fi
             ;;
         status)
             docker compose ps
             echo ""
-            verify_project_containers
+            verify_project_containers || bad_status=1
             echo ""
             docker logs --tail 10 v2prodock 2>&1
             echo ""
             echo "--- v2prodock-vpn (if enabled) ---"
             docker logs --tail 5 v2prodock-vpn 2>&1 || true
             curl -sf --max-time 5 http://localhost:$(env_val API_PORT 27018)/vpn 2>/dev/null || echo "(vpn status unavailable)"
+            exit "${bad_status:-0}"
             ;;
         logs)
             docker compose logs -f v2prodock
@@ -669,7 +868,9 @@ if [ "$DOCKER_MODE" = true ]; then
         uninstall)
             read -p "Remove everything? [y/N]: " -n 1 -r; echo
             [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
-            docker compose down -v
+            # 'Removed' must mean removed: if 'down' failed, the containers,
+            # images, config/ and .env are all still here.
+            docker compose down -v || { err "docker compose down failed - nothing else removed"; exit 1; }
             docker rmi v2prodock/proxy:latest v2prodock/vpn-gateway:latest 2>/dev/null || true
             rm -rf config .env
             ok "Removed"
@@ -785,8 +986,7 @@ if [ "$DOCKER_MODE" = true ]; then
             fi
 
             ensure_host_prereqs
-            fresh_rebuild
-            ok "Started"
+            start_stack
             check_container_egress "$sub_urls"
             show_status
             ;;
@@ -795,19 +995,37 @@ else
     # Direct install mode (no Docker)
     if ! command -v go &>/dev/null; then
         echo "Installing Go..."
-        curl -sL https://go.dev/dl/go1.25.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
+        # Each "[OK] ... installed" below is printed only if the thing it
+        # claims is actually on disk. Without the check, a failed sudo/tar/curl
+        # still reported success and the user got a green transcript over an
+        # empty /usr/local.
+        if ! curl -sL https://go.dev/dl/go1.25.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -; then
+            err "Go download/install failed - install Go 1.25+ manually, then rerun"
+            exit 1
+        fi
         echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
         export PATH=$PATH:/usr/local/go/bin
-        ok "Go installed"
+        if command -v go &>/dev/null; then
+            ok "Go installed"
+        else
+            err "Go still not on PATH after install - add /usr/local/go/bin and rerun"
+            exit 1
+        fi
     fi
 
     command -v unzip &>/dev/null || sudo apt-get install -y unzip
 
     if ! command -v zellij &>/dev/null; then
         echo "Installing zellij..."
-        curl -sL https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -C /usr/local/bin -xzf -
-        chmod +x /usr/local/bin/zellij
-        ok "Zellij installed"
+        if curl -sL https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -C /usr/local/bin -xzf -; then
+            chmod +x /usr/local/bin/zellij
+        fi
+        if command -v zellij &>/dev/null || [ -x /usr/local/bin/zellij ]; then
+            ok "Zellij installed"
+        else
+            err "zellij install failed - install it manually (needed to run the daemon), then rerun"
+            exit 1
+        fi
     fi
 
     if [ ! -f "$DIR/xray/xray" ]; then
@@ -823,7 +1041,12 @@ else
         curl -sL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" -o /tmp/x.zip
         unzip -o /tmp/x.zip -d "$DIR/xray" && rm /tmp/x.zip
         chmod +x "$DIR/xray/xray"
-        ok "Xray downloaded"
+        if [ -x "$DIR/xray/xray" ]; then
+            ok "Xray downloaded"
+        else
+            err "xray download/unzip failed - place the binary at $DIR/xray/xray and rerun"
+            exit 1
+        fi
     fi
 
     if [ ! -f "$DIR/v2proxy" ] || [ -n "$(find v2proxy/ -newer v2proxy -maxdepth 0 2>/dev/null)" ]; then
@@ -831,7 +1054,12 @@ else
         cd "$DIR/v2proxy" || exit 1
         go build -o "$DIR/v2proxy" .
         cd "$DIR" || exit 1
-        ok "Built"
+        if [ -x "$DIR/v2proxy" ]; then
+            ok "Built"
+        else
+            err "go build produced no binary - read the compiler errors above"
+            exit 1
+        fi
     fi
 
     mkdir -p "$DIR/config"
