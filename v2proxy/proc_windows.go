@@ -7,6 +7,11 @@ import (
 	"os/exec"
 )
 
+// processFinished mirrors the unix helper. Windows has no zombie state, and
+// processAlive is best-effort there (probing would mean killing), so this can
+// only answer "definitely finished" - never falsely claim death.
+func processFinished(p *os.Process) bool { return !processAlive(p) }
+
 // isolateChild is a no-op on Windows (no process groups via syscall).
 func isolateChild(_ *exec.Cmd) {}
 

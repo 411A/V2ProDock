@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
 
@@ -20,6 +22,32 @@ func processAlive(p *os.Process) bool {
 		return false
 	}
 	return p.Signal(syscall.Signal(0)) == nil
+}
+
+// processFinished reports whether p has ALREADY exited, distinguishing a dead
+// process from an unreaped ZOMBIE. processAlive() cannot: signal 0 succeeds for a
+// zombie, so a child that crashed a moment ago still reads as alive and any
+// "is it dead?" decision made on it is wrong.
+//
+// On linux the state is field 3 of /proc/<pid>/stat. Elsewhere (and if /proc is
+// unreadable) this degrades to !processAlive, which is the old behaviour - it can
+// only ever answer "definitely dead", never falsely claim death.
+func processFinished(p *os.Process) bool {
+	if p == nil {
+		return true
+	}
+	if raw, err := os.ReadFile("/proc/" + strconv.Itoa(p.Pid) + "/stat"); err == nil {
+		// comm (field 2) is parenthesised and may contain spaces, so scan past
+		// the final ')' before reading the state byte.
+		if i := bytes.LastIndexByte(raw, ')'); i >= 0 && i+2 < len(raw) {
+			switch raw[i+2] {
+			case 'Z', 'X', 'x': // zombie, dead, dead
+				return true
+			}
+			return false
+		}
+	}
+	return !processAlive(p)
 }
 
 func sigFor(sig os.Signal) syscall.Signal {

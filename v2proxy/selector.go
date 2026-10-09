@@ -238,10 +238,54 @@ func (s *ProxySelector) startShared(exclude map[string]int, shared *probeShared,
 	if skipped == 0 {
 		return err
 	}
-	// Bad marks can come from transient failures — retry them once before giving up.
-	debugLog("retrying %d bad-marked configs (transient failures possible)...", skipped)
+	// Bad marks — and a bind that never completed — can both come from a
+	// transient host condition, so retry them once before giving up.
+	debugLog("retrying %d rejected/unproven configs (transient failures possible)...", skipped)
 	_, err2 := s.tryConfigs(exclude, shared, deadline, false)
 	return err2
+}
+
+// populatePortWait bounds how long a freshly started xray may take to bind its
+// SOCKS listener before tryConfigs writes the candidate off as unproven.
+//
+// Deliberately longer than switchPortWait (2s). A switch runs under
+// switchBudget (60s) with the old tunnel still serving and only a handful of
+// candidates, so waiting long there just delays failover. Populate has the far
+// larger probeTimeout (3 min) budget, nothing to serve yet, and is the one
+// moment with probeWorkers (10) cold xray starts competing for a single small
+// CPU — a bind there can take seconds. Under-waiting is not a small loss
+// either: it poisons the SHARED ledger, so every peer instance skips a healthy
+// upstream for the rest of the round. 5s stays inside probeTimeout even if a
+// whole pool never binds, and bindBudget clamps it to the deadline regardless.
+//
+// Var, not const, ONLY so tests can shrink it to milliseconds (same precedent
+// as bridgeUpstreamDeadline).
+var populatePortWait = 5 * time.Second
+
+// bindBudget is populatePortWait clamped to what is left of the populate
+// deadline, so a single slow bind can never push the scan past probeTimeout.
+// A zero deadline (StartWithBest, which runs no shared probe budget) is
+// unclamped. May return <= 0 once the deadline has passed; waitForPort then
+// reports "not bound" immediately and the loop's deadline check ends the scan.
+// childProcess extracts the *os.Process from a launch handle, tolerating a nil
+// command (no xray was ever started). processFinished(nil) is true, which reads
+// as "already exited" - correct here, because a candidate with no live child has
+// nothing to probe and must not be adopted.
+func childProcess(cmd *exec.Cmd) *os.Process {
+	if cmd == nil {
+		return nil
+	}
+	return cmd.Process
+}
+
+func bindBudget(deadline time.Time) time.Duration {
+	if deadline.IsZero() {
+		return populatePortWait
+	}
+	if left := time.Until(deadline); left < populatePortWait {
+		return left
+	}
+	return populatePortWait
 }
 
 func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, deadline time.Time, respectBad bool) (int, error) {
@@ -270,8 +314,45 @@ func (s *ProxySelector) tryConfigs(exclude map[string]int, shared *probeShared, 
 			shared.unclaim(key)
 			continue
 		}
-		// Fast probe: skip waitForPort, use single-URL 3s timeout.
-		// If xray is up, we get a response; if not, connection refused is fast.
+		// launchXray only proves the PROCESS survived xrayCrashDetect (100ms);
+		// it never proves the SOCKS listener is BOUND. Probing into that gap
+		// reads "connection refused", which classifyProbe grades verdictReject
+		// and markBad then poisons into the SHARED ledger — so one
+		// not-yet-bound but perfectly healthy upstream is skipped by every
+		// peer instance for the rest of the round. Wait for the port first,
+		// bounded by the remaining populate deadline.
+		if !waitForPort(s.socksPort, bindBudget(deadline)) {
+			// A child that has ALREADY EXITED is a dead config - proven bad, so it
+			// poisons the ledger exactly as before. Only a LIVE process that has not
+			// bound yet is unproven: that is host starvation (10 concurrent cold xray
+			// starts on a 256MB box), and marking it bad is the exact defect this
+			// branch exists to prevent, because the shared ledger makes every peer
+			// instance skip the candidate too.
+			//
+			// processFinished, not processAlive: signal 0 succeeds on an unreaped
+			// zombie, so a child that crashed a moment ago reads as alive and this
+			// branch would never fire.
+			if processFinished(childProcess(s.xrayCmd)) {
+				debugLog("candidate %d/%d %s: xray exited before binding — proven bad, poisoning ledger",
+					i+1, len(s.configs), shortName(s.configs[i].Name))
+				shared.markBad(key)
+				shared.unclaim(key)
+				s.stopXray()
+				continue
+			}
+			// Alive but silent is NOT "upstream dead": the bind may simply not have
+			// been scheduled yet. Keep the candidate claimable and count it, so
+			// startShared's retry pass gets a second chance once the host has
+			// freed up.
+			debugLog("candidate %d/%d %s: SOCKS port %d never bound — unproven, not bad",
+				i+1, len(s.configs), shortName(s.configs[i].Name), s.socksPort)
+			if respectBad {
+				skipped++
+			}
+			shared.unclaim(key)
+			s.stopXray()
+			continue
+		}
 		result := TestProxyQuick(fmt.Sprintf("127.0.0.1:%d", s.socksPort), s.testURL)
 		switch classifyProbe(result) {
 		case verdictAdopt:

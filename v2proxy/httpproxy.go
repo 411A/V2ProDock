@@ -273,13 +273,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 	// for the dial only and MAX_CONNS bounded nothing on the CONNECT path — the
 	// dominant one for an HTTPS bridge. Every abandoned tunnel pinned an fd, two
 	// goroutines and a pooled buffer with nothing to stop it.
-	slotHeld := true
-	releaseSlot := func() {
-		if slotHeld {
-			slotHeld = false
-			connSem <- struct{}{}
-		}
-	}
+	// sync.Once, NOT a plain `if slotHeld` flag: this closure runs from BOTH the
+	// handler goroutine's defer and the relay goroutine's defer, so an
+	// unsynchronised bool is a check-then-act race that can double-release the
+	// slot (MAX_CONNS silently stops bounding anything) or drop one (a permanent
+	// leak). Found by the soak harness under -race, reproduced with a bare loop
+	// of CONNECT tunnels and no rig.
+	var releaseOnce sync.Once
+	releaseSlot := func() { releaseOnce.Do(func() { connSem <- struct{}{} }) }
 	defer releaseSlot()
 
 	destConn, err := dialSocksTimeout(dialer, "tcp", target, bridgeDialTimeout)
