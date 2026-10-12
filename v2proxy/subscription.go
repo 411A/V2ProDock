@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,11 @@ type ProxyConfig struct {
 	Raw      string
 	Endpoint string // normalized "host:port" identity; same server is never exposed twice
 	XrayCfg  json.RawMessage
+
+	// rank is this line's DPI-resistance tier, computed once by orderByDPIRank.
+	// Unexported so it travels with the config through the selector without
+	// widening the public shape or the JSON the API exposes.
+	rank int
 }
 
 // endpointKey normalizes a remote server identity for dedup and claiming.
@@ -134,6 +140,191 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 	return "", lastErr
 }
 
+// ---- DPI resistance ranking ----
+//
+// Configs are probed in pool order and the first working one wins, so pool order
+// IS the preference order. Left as the subscription's own order, that is exactly
+// how a raw-Shadowsocks node over TCP:443 gets adopted: it is usually the fastest
+// (there is no handshake to finish) and nothing tells the daemon it is also the
+// shape an Iran DPI most readily fingerprints.
+//
+// This matters because latency and DPI resistance actively disagree. Latency
+// measures how quickly a tunnel OPENS. It says nothing about whether the tunnel
+// STAYS open, and the failure under active probing is precisely "opens, then
+// RSTs mid-response" - which a client sees as RemoteProtocolError AFTER the
+// request was already delivered, so every retry guarantees another copy. A pool
+// ranked by latency alone keeps re-adopting the node that fails most expensively.
+//
+// The ranking therefore tries protocols carrying real TLS semantics first, and
+// keeps a STABLE order inside each tier so the subscription's own order - the one
+// an operator actually controls - still breaks ties.
+const (
+	// VLESS with Reality or an XTLS flow: presents as an ordinary TLS handshake
+	// because it borrows a real certificate and ALPN.
+	rankReality = 100
+	// Trojan: TLS end to end, no certificate to steal, but the handshake shape is
+	// its own and well characterised.
+	rankTrojan = 80
+	// VMess over TLS (gRPC/WS + TLS): TLS plus an outer framing that is not a
+	// long-lived raw stream.
+	rankVmessTLS = 60
+	// WebSocket/gRPC with no TLS: HTTP framing exists but is cleartext and
+	// trivially identified from header signatures.
+	rankFramed = 40
+	// VMess over raw TCP with no TLS at all.
+	rankVmessRaw = 20
+	// Shadowsocks with the 2022 AEAD ciphers: still a raw stream, but the
+	// handshake shape differs from what most DPI rules match.
+	rankSS2022 = 10
+	// Legacy Shadowsocks and anything unrecognised. Deliberately LAST: an unknown
+	// shape must never outrank a known TLS-carrying one.
+	rankRaw = 0
+)
+
+// dpiRank scores how resistant a subscription line is to active probing. Every
+// failure to classify falls to rankRaw rather than to a guess.
+func dpiRank(raw string) int {
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok {
+		return rankRaw
+	}
+	switch strings.ToLower(scheme) {
+	case "vless", "trojan":
+		q := queryOf(rest)
+		// reality and an XTLS flow are the same thing from a scanner's point of
+		// view: both look like an ordinary TLS ClientHello to a real host.
+		if strings.EqualFold(q.Get("security"), "reality") || strings.EqualFold(q.Get("flow"), "xtls-rprx-vision") {
+			return rankReality
+		}
+		if strings.EqualFold(scheme, "trojan") {
+			// trojan:// is TLS by construction; only reality outranks it.
+			return rankTrojan
+		}
+		switch strings.ToLower(q.Get("type")) {
+		case "ws", "http", "h2", "grpc":
+			return rankFramed
+		}
+		return rankVmessRaw
+	case "vmess":
+		return vmessRank(rest)
+	case "ss", "shadowsocks":
+		if isSS2022(rest) {
+			return rankSS2022
+		}
+		return rankRaw
+	default:
+		return rankRaw
+	}
+}
+
+// queryOf reads the parameters out of a payload half, tolerating the shapes real
+// subscriptions use: with or without a fragment, percent-encoded or not. Ranking
+// must never hard-fail on a malformed line; the line is unusable already.
+func queryOf(rest string) url.Values {
+	_, after, _ := strings.Cut(rest, "?")
+	if after == "" {
+		return url.Values{}
+	}
+	q, err := url.ParseQuery(after)
+	if err != nil {
+		return url.Values{}
+	}
+	return q
+}
+
+// vmessRank decodes a vmess:// payload and ranks it on transport plus TLS.
+func vmessRank(body string) int {
+	decoded, err := base64.StdEncoding.DecodeString(pathUnescape(body))
+	if err != nil {
+		// Undecodable means unusable anyway; rank low so a parseable TLS option
+		// is always tried first.
+		return rankVmessRaw
+	}
+	var cfg struct {
+		Net string `json:"net"`
+		TLS string `json:"tls"`
+	}
+	if err := json.Unmarshal(decoded, &cfg); err != nil {
+		return rankVmessRaw
+	}
+	framed := false
+	switch strings.ToLower(cfg.Net) {
+	case "grpc", "ws", "http", "h2":
+		framed = true
+	}
+	switch strings.ToLower(cfg.TLS) {
+	case "reality":
+		return rankReality
+	case "tls":
+		if framed {
+			return rankVmessTLS
+		}
+		return rankFramed
+	}
+	if framed {
+		return rankFramed
+	}
+	return rankVmessRaw
+}
+
+// isSS2022 checks the cipher in a shadowsocks payload, whose userinfo is
+// "method:password" and which real subscriptions almost always base64 as a whole.
+//
+// Only the USERINFO may be decoded. The host is appended after it and is never
+// valid base64, so decoding the whole payload fails and the cipher is never
+// seen - which silently demotes every 2022 host to the bottom tier.
+func isSS2022(rest string) bool {
+	userinfo := rest
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		userinfo = rest[:at]
+	}
+	// Two encodings are in the wild: the whole userinfo base64ed
+	// ("method:password" -> base64), and "method:password" verbatim. Try the
+	// decode first, because that is the common subscription form.
+	if decoded, err := base64.StdEncoding.DecodeString(pathUnescape(userinfo)); err == nil {
+		if strings.Contains(string(decoded), ":") {
+			userinfo = string(decoded)
+		}
+	}
+	method, _, ok := strings.Cut(userinfo, ":")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(method) {
+	case "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305":
+		return true
+	}
+	return false
+}
+
+// pathUnescape tolerates payloads that are not encoded at all, which is the
+// common case for subscription lines.
+func pathUnescape(s string) string {
+	if d, err := url.PathUnescape(s); err == nil {
+		return d
+	}
+	return s
+}
+
+// orderByDPIRank sorts the pool most-DPI-resistant first, stably within a tier so
+// the subscription's own ordering still decides ties. The rank is cached on each
+// config rather than recomputed per comparison: decoding is expensive, and
+// sorting would otherwise do it O(n log n) times.
+func orderByDPIRank(configs []ProxyConfig) {
+	for i := range configs {
+		configs[i].rank = dpiRank(configs[i].Raw)
+	}
+	slices.SortStableFunc(configs, func(a, b ProxyConfig) int {
+		switch {
+		case a.rank > b.rank:
+			return -1
+		case a.rank < b.rank:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	client := &http.Client{
 		Timeout: fetchTimeout,
@@ -179,6 +370,7 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 		}
 		proxies = append(proxies, *proxy)
 	}
+	orderByDPIRank(proxies)
 	return proxies, nil
 }
 
@@ -291,6 +483,7 @@ func fetchMergedReport(urls []string) (merged []ProxyConfig, failed map[string]b
 	// the survivor is being tested and simply has no working endpoint, which is a
 	// different problem from a source that yielded nothing at all.
 	deduped := dedupConfigs(merged)
+	orderByDPIRank(deduped)
 	infoLog("subscriptions: %d unique configs from %d of %d source(s)", len(deduped), len(clean)-len(failed), len(clean))
 	return deduped, failed
 }
