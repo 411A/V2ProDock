@@ -61,43 +61,90 @@ so it can never sit behind `relay-out`.
 
 ## Option A — teach your Worker CONNECT (keeps your egress)
 
-Reference sketch (adapt to your plan's sockets availability; the PROTOCOL
-above is what's tested, not this listing):
+Two things the docs don't promise on a free account: (a) outbound TCP
+sockets allowed, (b) the edge delivering a `CONNECT` request to your
+`fetch()` handler at all. Don't guess — probe it. Create a SEPARATE
+throwaway worker so your live relay is untouched.
+
+**Deploy the probe** (dashboard, no tools): Cloudflare dashboard →
+Workers & Pages → Create → Hello World → Edit code → paste → Deploy.
+Your probe lives at `https://cf-probe.YOU.workers.dev`.
 
 ```js
 import { connect } from "cloudflare:sockets";
 
-const USER = "relay"; // prefer a Worker secret
-const PASS = "change-me";
-
 export default {
   async fetch(req) {
-    if (req.method !== "CONNECT") {
-      return new Response("relay: send CONNECT host:port", { status: 400 });
+    const out = { method: req.method, url: req.url,
+      headers: Object.fromEntries(req.headers) };
+    try {
+      const s = connect({ hostname: "1.1.1.1", port: 80 });
+      await Promise.race([s.opened,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
+      out.sockets = "OK";
+      s.close().catch(() => {});
+    } catch (e) {
+      out.sockets = "FAIL: " + e;
     }
-    const auth = req.headers.get("proxy-authorization") || "";
-    if (auth !== "Basic " + btoa(USER + ":" + PASS)) {
-      return new Response("proxy auth required", { status: 407,
-        headers: { "proxy-authenticate": 'Basic realm="relay"' } });
-    }
-    const authority = req.headers.get("host") || "";
-    const [hostname, portStr] = authority.split(":");
-    const socket = connect({ hostname, port: Number(portStr) || 443 });
-    await socket.opened;
-    req.body?.pipeTo(socket.writable).catch(() => {});
-    return new Response(socket.readable, { status: 200 });
-  },
+    return Response.json(out);
+  }
 };
 ```
 
-Verify with Step 2 above (direct CONNECT against the worker), then continue
-at Step 3. Extra checks once wired:
+**Read the two answers** (replace the hostname with your probe's):
 
 ```bash
-curl -sS --max-time 20 -x socks5h://127.0.0.1:27015 https://api.ipify.org/
-curl -sS --max-time 20 -o /dev/null -w "%{http_code}\n" \
-  -x socks5h://127.0.0.1:27015 https://api.telegram.org/
+# 1) sockets allowed on your plan?
+curl -sS --max-time 20 https://cf-probe.YOU.workers.dev/
+# want "sockets":"OK". FAIL = free plan blocked -> Workers Paid ($5/mo) or Option B.
+
+# 2) does CONNECT reach fetch(), with the target intact?
+curl -sS --max-time 20 -x https://cf-probe.YOU.workers.dev:443 https://api.ipify.org/
+# want: a JSON body where method is "CONNECT" and a header carries
+# "api.ipify.org:443" (usually host). Anything else -> send me the JSON.
 ```
+
+**If both pass**, put this in your REAL relay worker (paste the CONNECT
+branch at the top, keep your existing `x-relay-target` code below it for
+your other clients):
+
+```js
+import { connect } from "cloudflare:sockets";
+
+const USER = "relay";          // plain ascii only; prefer a Worker secret
+const PASS = "change-me-now";
+
+export default {
+  async fetch(req) {
+    if (req.method === "CONNECT") {
+      const want = "Basic " + btoa(USER + ":" + PASS);
+      if ((req.headers.get("proxy-authorization") || "") !== want) {
+        return new Response("proxy auth required", { status: 407,
+          headers: { "proxy-authenticate": 'Basic realm="relay"' } });
+      }
+      const authority = req.headers.get("host") || "";
+      const cut = authority.lastIndexOf(":");
+      const hostname = cut > 0 ? authority.slice(0, cut) : authority;
+      const port = cut > 0 ? Number(authority.slice(cut + 1)) : 443;
+      if (!hostname) return new Response("bad authority", { status: 400 });
+      try {
+        const socket = connect({ hostname, port });
+        await socket.opened;
+        req.body?.pipeTo(socket.writable).catch(() => {});
+        return new Response(socket.readable, { status: 200 });
+      } catch (e) {
+        return new Response("dial failed: " + e, { status: 502 });
+      }
+    }
+    // ... your existing x-relay-target code unchanged below ...
+  }
+};
+```
+
+Then continue at Step 2 (relay URL becomes
+`https://USER:PASS@YOUR-RELAY.workers.dev`). Watch-item, not a blocker:
+free plan allows 10 ms CPU per invocation — idle long-polls cost ~nothing,
+but if tunnels die under load, that's the cause and Paid removes it.
 
 ## Option B — standard proxy on a clean VPS (works today, no worker change)
 
