@@ -4,6 +4,7 @@ package main
 // call is fine: renders/switches are infrequent, never per-packet).
 
 import (
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -154,4 +155,60 @@ func scanAggPort(cand, apiPort int, used map[int]bool) int {
 		return p
 	}
 	return 0
+}
+
+// relayCfg is one parsed CF_RELAY_URL: a STANDARD HTTP proxy upstream
+// (CONNECT + optional Basic auth). Custom header-relay protocols are NOT
+// accepted here: xray's http outbound cannot speak them, so they would fail
+// loudly at every render instead of cleanly at startup.
+type relayCfg struct {
+	host string
+	port int
+	user string
+	pass string
+	tls  bool // https:// scheme: TLS to the relay (workers.dev is https-only)
+}
+
+// relayConfig parses CF_RELAY_URL ("http(s)://[user:pass@]host[:port]").
+// Empty = feature off (zero behavior change). Anything malformed degrades to
+// off with a loud warning, never to a half-chained pool: a relay that cannot
+// be dialled would otherwise take every relay-path client down with it.
+func relayConfig() (relayCfg, bool) {
+	raw := strings.TrimSpace(os.Getenv("CF_RELAY_URL"))
+	if raw == "" {
+		return relayCfg{}, false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		warnLog("CF_RELAY_URL=%q invalid, relay egress disabled", raw)
+		return relayCfg{}, false
+	}
+	var tls bool
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+	case "https":
+		tls = true
+	default:
+		warnLog("CF_RELAY_URL=%q scheme must be http or https, relay egress disabled", raw)
+		return relayCfg{}, false
+	}
+	port := 80
+	if tls {
+		port = 443
+	}
+	if p := strings.TrimSpace(u.Port()); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			warnLog("CF_RELAY_URL=%q port invalid, relay egress disabled", raw)
+			return relayCfg{}, false
+		}
+		port = n
+	}
+	user := ""
+	pass := ""
+	if u.User != nil {
+		user = u.User.Username()
+		pass, _ = u.User.Password()
+	}
+	return relayCfg{host: u.Hostname(), port: port, user: user, pass: pass, tls: tls}, true
 }

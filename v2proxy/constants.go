@@ -70,7 +70,20 @@ const (
 const (
 	defaultAggSocksPort = 27017 // AGGREGATE_SOCKS_PORT overrides
 	defaultAggHTTPPort  = 27016 // AGGREGATE_HTTP_PORT overrides
+	defaultAggRelayPort = 27015 // AGGREGATE_RELAY_PORT overrides (relay egress, 0 disables)
 	aggPublishedMax     = 27100 // compose publishes 27000-27017 + 27019-27100 (API holds 27018)
+)
+
+// ---- Relay egress (opt-in second path: tunnel first, clean IP second) ----
+// A per-instance SOCKS inbound (relayInboundTag) is routed into a standard
+// HTTP-proxy outbound (relayOutTag) that is chained THROUGH the subscription
+// upstream (upstreamOutTag, the tag every parser in subscription.go emits)
+// via proxySettings, so the relay is always reached inside the tunnel and
+// the censor only ever sees the upstream transport. Egress IP is the relay's.
+const (
+	relayInboundTag = "socks-relay-in"
+	relayOutTag     = "relay-out"
+	upstreamOutTag  = "proxy"
 )
 
 // ---- DPI fragmentation (opt-in; binary-verified schema, off by default) ----

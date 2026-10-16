@@ -20,15 +20,19 @@ import (
 )
 
 type ProxySelector struct {
-	mu            sync.Mutex
-	configs       []ProxyConfig
-	activeIndex   int
-	failCount     int
-	xrayCmd       *exec.Cmd
-	xrayDir       string
-	testURL       string
-	socksPort     int
-	httpPort      int
+	mu          sync.Mutex
+	configs     []ProxyConfig
+	activeIndex int
+	failCount   int
+	xrayCmd     *exec.Cmd
+	xrayDir     string
+	testURL     string
+	socksPort   int
+	httpPort    int
+	// relayPort is this instance's relay-egress SOCKS inbound (0 = disabled).
+	// Set once by the manager before Start; the same xray child serves both
+	// paths, routing separates them, so enabling relay costs no extra process.
+	relayPort     int
 	checkInterval time.Duration
 	lastCheck     time.Time
 	lastLatency   time.Duration
@@ -91,6 +95,16 @@ func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInt
 
 func (s *ProxySelector) SOCKSPort() int { return s.socksPort }
 func (s *ProxySelector) HTTPPort() int  { return s.httpPort }
+func (s *ProxySelector) RelayPort() int { return s.relayPort }
+
+// SetRelayPort arms the relay-egress inbound for the next render. It is a
+// setter (not a constructor arg) so direct constructions keep today's
+// behavior untouched: zero value = relay off.
+func (s *ProxySelector) SetRelayPort(port int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.relayPort = port
+}
 
 // currentPID returns the managed xray child PID (0 = none) for watchdog accounting.
 func (s *ProxySelector) currentPID() int {
@@ -920,6 +934,31 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	}
 
 	outbounds := []any{outbound}
+	// Relay egress: a second SOCKS inbound routed into a standard HTTP-proxy
+	// outbound that is chained THROUGH the subscription upstream, so the relay
+	// TCP is established inside the tunnel. The censor sees the upstream
+	// transport only; the target sees the relay's (clean) egress IP. The
+	// upstream keeps outbounds[0] so the default route is untouched.
+	if rc, ok := relayConfig(); ok && s.relayPort > 0 {
+		upTag, _ := outbound["tag"].(string)
+		if strings.TrimSpace(upTag) == "" {
+			upTag = upstreamOutTag
+			outbound["tag"] = upTag
+		}
+		inbounds := fullConfig["inbounds"].([]map[string]any)
+		fullConfig["inbounds"] = append(inbounds, map[string]any{
+			"tag":      relayInboundTag,
+			"port":     s.relayPort,
+			"listen":   "0.0.0.0",
+			"protocol": "socks",
+			"settings": map[string]any{
+				"auth": "noauth",
+				"udp":  true,
+			},
+		})
+		outbounds = append(outbounds, relayOutbound(rc, upTag))
+		debugLog("relay egress armed on :%d via %s:%d", s.relayPort, rc.host, rc.port)
+	}
 	if fragmentEnabled() && upstreamUsesTLS(outbound) && !hasCustomDialChain(outbound) {
 		chainFragment(outbound)
 		outbounds = append(outbounds, map[string]any{
@@ -956,6 +995,16 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 			},
 		},
 	}
+	// Relay route lands AFTER the table exists (and after bittorrent->blocked,
+	// which stays first so the default path is never reordered).
+	if _, ok := relayConfig(); ok && s.relayPort > 0 {
+		rules := fullConfig["routing"].(map[string]any)["rules"].([]map[string]any)
+		fullConfig["routing"].(map[string]any)["rules"] = append(rules, map[string]any{
+			"type":        "field",
+			"inboundTag":  []string{relayInboundTag},
+			"outboundTag": relayOutTag,
+		})
+	}
 
 	name := fmt.Sprintf("config-%d.json", socksPort)
 	if seq > 0 {
@@ -971,8 +1020,44 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	return cfgPath, nil
 }
 
-// chainFragment points an upstream outbound's dial path at the fragment
-// carrier, preserving any existing sockopt keys the subscription set.
+// relayOutbound builds the standard HTTP-proxy outbound chained through the
+// subscription upstream. proxySettings.transportLayer routes the relay's OWN
+// dial via the upstream outbound: without it xray would dial the relay
+// direct and the censor would see (and filter) the relay address instead of
+// the tunnel. tls wraps the relay leg itself (workers.dev is https-only);
+// the client's tunneled bytes are untouched either way.
+func relayOutbound(rc relayCfg, upstreamTag string) map[string]any {
+	server := map[string]any{
+		"address": rc.host,
+		"port":    rc.port,
+	}
+	if rc.user != "" {
+		server["users"] = []map[string]any{{"user": rc.user, "pass": rc.pass}}
+	}
+	out := map[string]any{
+		"protocol": "http",
+		"tag":      relayOutTag,
+		"settings": map[string]any{
+			"servers": []map[string]any{server},
+		},
+		"proxySettings": map[string]any{
+			"tag":            upstreamTag,
+			"transportLayer": true,
+		},
+	}
+	if rc.tls {
+		out["streamSettings"] = map[string]any{
+			"network":  "tcp",
+			"security": "tls",
+			"tlsSettings": map[string]any{
+				"serverName": rc.host,
+			},
+		}
+	}
+	return out
+}
+
+// chainFragment points an upstream outbound's dial path at the fragment// carrier, preserving any existing sockopt keys the subscription set.
 func chainFragment(outbound map[string]any) {
 	ss, ok := outbound["streamSettings"].(map[string]any)
 	if !ok {

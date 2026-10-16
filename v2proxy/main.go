@@ -129,10 +129,32 @@ func main() {
 	if aggHTTP > 0 {
 		aggHTTPAddr = fmt.Sprintf("0.0.0.0:%d", aggHTTP)
 	}
-	manager.setAggregate(aggSocksAddr, aggHTTPAddr)
+	// Relay egress fan-out: stable SOCKS port in front of the per-instance
+	// relay inbounds. Scanned AFTER socks/http so it never steals their ports;
+	// port 0 (or no CF_RELAY_URL) disables it without touching the rest.
+	var aggRelayAddr string
+	aggRelay := 0
+	if rc, ok := relayConfig(); ok {
+		used := manager.usedPorts()
+		if aggSocks > 0 {
+			used[aggSocks] = true
+		}
+		if aggHTTP > 0 {
+			used[aggHTTP] = true
+		}
+		aggRelay = scanAggPort(aggregatePort("AGGREGATE_RELAY_PORT", defaultAggRelayPort), apiActualPort, used)
+		if aggRelay > 0 {
+			aggRelayAddr = fmt.Sprintf("0.0.0.0:%d", aggRelay)
+			infoLog("Relay egress armed: SOCKS5 %s via %s:%d (tunnel first, clean IP second)", aggRelayAddr, rc.host, rc.port)
+		} else {
+			warnLog("relay egress on but no free aggregate port: relay path disabled")
+		}
+	}
+	manager.setAggregate(aggSocksAddr, aggHTTPAddr, aggRelayAddr)
 	startAggregator(manager, aggSocks, aggHTTP)
+	startRelayAggregator(manager, aggRelay)
 	if aggSocksAddr != "" || aggHTTPAddr != "" {
-		bannerLog(fmt.Sprintf("Stable endpoints (pin bots here): SOCKS5 %s  HTTP %s", aggSocksAddr, aggHTTPAddr))
+		bannerLog(fmt.Sprintf("Stable endpoints (pin bots here): SOCKS5 %s  HTTP %s  RELAY %s", aggSocksAddr, aggHTTPAddr, aggRelayAddr))
 	}
 	if n := len(cleanIPMap()); n > 0 {
 		infoLog("Clean-IP map active: %d entries (CLEAN_IP_MAP; SNI untouched)", n)

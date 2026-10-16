@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,11 @@ type ProxyManager struct {
 	checkInterval time.Duration
 	aggSocks      string
 	aggHTTP       string
+	aggRelay      string
+	// relayAlive gates the relay aggregate: probed once per health tick
+	// through the relay path itself (the worker is shared, per-node probes
+	// would burn N x budget to learn one fact). False = fail fast.
+	relayAlive atomic.Bool
 	// urlChecks memoizes /check results per exact probe URL and collapses
 	// concurrent identical requests onto one round of probing. Lazily built
 	// because NewProxyManager is also built directly by tests.
@@ -120,9 +126,18 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		urlChecks:     newURLCheckCache(),
 	}
 
-	// Port layout: all SOCKS5 ports first, then all HTTP ports.
+	// Port layout: all SOCKS5 ports first, then all HTTP ports, then (relay
+	// egress on) all relay SOCKS ports. Instance i -> SOCKS=base+i,
+	// HTTP=base+instanceCount+i, RELAY=base+2*instanceCount+i. Relay-off
+	// keeps the old 2N block exactly, so existing deployments see no port
+	// shift from this feature existing.
+	portsPerInst := 2
+	_, relayOn := relayConfig()
+	if relayOn {
+		portsPerInst = 3
+	}
 	// Instance i -> SOCKS=base+i, HTTP=base+instanceCount+i.
-	block, err := findAvailableBlock(portBase, instanceCount*2)
+	block, err := findAvailableBlock(portBase, instanceCount*portsPerInst)
 	if err != nil {
 		errLog("no available port block: %v", err)
 		return m
@@ -133,6 +148,9 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		httpPort := block + instanceCount + i
 
 		selector := NewProxySelector(xrayDir, testURL, socksPort, httpPort, checkInterval)
+		if relayOn {
+			selector.SetRelayPort(block + 2*instanceCount + i)
+		}
 		m.instances = append(m.instances, selector)
 
 		m.statuses[i] = InstanceStatus{
@@ -142,7 +160,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 			Status: "starting",
 		}
 
-		debugLog("Instance %d: SOCKS5=:%d HTTP=:%d", i, socksPort, httpPort)
+		debugLog("Instance %d: SOCKS5=:%d HTTP=:%d RELAY=:%d", i, socksPort, httpPort, selector.RelayPort())
 	}
 
 	return m
@@ -286,27 +304,37 @@ func (m *ProxyManager) pickBestBackend(httpSide bool) (string, bool) {
 // planning (aggregate endpoint placement).
 func (m *ProxyManager) usedPorts() map[int]bool {
 	insts, _ := m.snapshot()
-	out := make(map[int]bool, len(insts)*2)
+	out := make(map[int]bool, len(insts)*3)
 	for _, inst := range insts {
 		out[inst.SOCKSPort()] = true
 		out[inst.HTTPPort()] = true
+		if p := inst.RelayPort(); p > 0 {
+			out[p] = true
+		}
 	}
 	return out
 }
 
 // setAggregate records the stable endpoint addrs exposed via /health.
 // Empty strings mean that protocol is disabled.
-func (m *ProxyManager) setAggregate(socks, http string) {
+func (m *ProxyManager) setAggregate(socks, http, relay string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.aggSocks = socks
 	m.aggHTTP = http
+	m.aggRelay = relay
 }
 
-func (m *ProxyManager) aggregateAddrs() (string, string) {
+func (m *ProxyManager) aggregateAddrs() (string, string, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.aggSocks, m.aggHTTP
+	return m.aggSocks, m.aggHTTP, m.aggRelay
+}
+
+func (m *ProxyManager) relayAddr() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.aggRelay
 }
 
 func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
@@ -548,6 +576,38 @@ func (m *ProxyManager) HealthCheckAll() {
 			}
 		}
 	}
+	m.probeRelay()
+}
+
+// probeRelay grades the relay path ONCE per health tick through the relay
+// aggregate itself. The worker is shared by every instance, so per-node
+// probes would burn N x budget to learn one fact; one end-to-end probe
+// through the fan-out answers it. While false the relay aggregate fails fast
+// and direct paths are untouched. Feature off (no addr) = never probed,
+// never alive, never served: zero behavior change.
+func (m *ProxyManager) probeRelay() {
+	if _, ok := relayConfig(); !ok {
+		return
+	}
+	addr := m.relayAddr()
+	if addr == "" {
+		return
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	if res := TestProxyQuick(net.JoinHostPort("127.0.0.1", port), m.testURL); res.Working {
+		if !m.relayAlive.Load() {
+			infoLog("relay egress alive via %s (%s)", addr, res.Latency)
+		}
+		m.relayAlive.Store(true)
+		return
+	}
+	if m.relayAlive.Load() {
+		warnLog("relay egress down via %s, relay aggregate failing fast (direct unaffected)", addr)
+	}
+	m.relayAlive.Store(false)
 }
 
 func (m *ProxyManager) RefreshSubscriptions() {

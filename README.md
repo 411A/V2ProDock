@@ -194,7 +194,9 @@ Notes:
 Per-instance ports die and come back on every failover — pinning a Telegram
 bot to one of them means rewriting config on each switch. Instead, point
 long-lived clients at the aggregate ports (defaults `SOCKS5 :27017`,
-`HTTP :27016`, inside the published range):
+`HTTP :27016`, inside the published range). An opt-in third aggregate,
+`RELAY :27015`, routes the same way but exits via the clean-IP relay
+(`CF_RELAY_URL`; see `docs/CF_RELAY_WORKER.md`) instead of the tunnel exit:
 
 ```python
 # One fixed config, forever: every connection is routed to the

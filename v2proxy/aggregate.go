@@ -32,18 +32,23 @@ const aggFailoverBudget = bridgeDialTimeout
 
 func startAggregator(m *ProxyManager, socksPort, httpPort int) {
 	if socksPort > 0 {
-		go serveAggregate(m, socksPort, false)
+		go serveAggregate(m, socksPort, "SOCKS5", func(c net.Conn) { handleAggregateConn(m, c, false) })
 	}
 	if httpPort > 0 {
-		go serveAggregate(m, httpPort, true)
+		go serveAggregate(m, httpPort, "HTTP", func(c net.Conn) { handleAggregateConn(m, c, true) })
 	}
 }
 
-func serveAggregate(m *ProxyManager, port int, httpBackend bool) {
-	kind := "SOCKS5"
-	if httpBackend {
-		kind = "HTTP"
+// startRelayAggregator serves the relay-egress fan-out: one stable SOCKS
+// port whose connections ride the tunnel first and exit via the clean-IP
+// relay. Port 0 disables (feature off). Direct aggregates are untouched.
+func startRelayAggregator(m *ProxyManager, port int) {
+	if port > 0 {
+		go serveAggregate(m, port, "RELAY", func(c net.Conn) { handleRelayConn(m, c) })
 	}
+}
+
+func serveAggregate(m *ProxyManager, port int, kind string, handle func(net.Conn)) {
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
 		errLog("aggregate %s bind :%d failed: %v", kind, port, err)
@@ -57,7 +62,7 @@ func serveAggregate(m *ProxyManager, port int, httpBackend bool) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleAggregateConn(m, c, httpBackend)
+		go handle(c)
 	}
 }
 
@@ -73,7 +78,23 @@ func serveAggregate(m *ProxyManager, port int, httpBackend bool) {
 // Once a dial succeeds this function is DONE: the relay owns the connection and
 // no later candidate is tried, so an established tunnel is never re-pointed.
 func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
-	cands := m.aggregateCandidates(httpBackend)
+	serveCandidates(client, m.aggregateCandidates(httpBackend), true)
+}
+
+// handleRelayConn serves one client from the relay ladder, but ONLY while
+// the relay path itself proved alive this tick. The relay is a single shared
+// hop behind every instance: walking N backends cannot route around a down
+// worker, so a dark relay fails fast instead of burning the whole failover
+// budget on guaranteed failures. Direct paths never consult this gate.
+func handleRelayConn(m *ProxyManager, client net.Conn) {
+	if !m.relayAlive.Load() {
+		_ = client.Close()
+		return
+	}
+	serveCandidates(client, m.aggregateRelayCandidates(), false)
+}
+
+func serveCandidates(client net.Conn, cands []string, trackEgress bool) {
 	if len(cands) == 0 {
 		_ = client.Close()
 		return
@@ -109,9 +130,11 @@ func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
 		// a backend that served nothing, and one that took the connection but
 		// never proved it, never bank a note.
 		egress := func() {}
-		if _, p, perr := net.SplitHostPort(backend); perr == nil {
-			if port, cerr := strconv.Atoi(p); cerr == nil {
-				egress = func() { noteEgress(port) }
+		if trackEgress {
+			if _, p, perr := net.SplitHostPort(backend); perr == nil {
+				if port, cerr := strconv.Atoi(p); cerr == nil {
+					egress = func() { noteEgress(port) }
+				}
 			}
 		}
 		go relay(up, client, egress)
@@ -140,6 +163,39 @@ func handleAggregateConn(m *ProxyManager, client net.Conn, httpBackend bool) {
 // dropped rather than dialled: pickBestBackend returns "not ok" for those,
 // which would cost a connection that the next candidate can still serve.
 func (m *ProxyManager) aggregateCandidates(httpSide bool) []string {
+	order := m.orderedAlive()
+	if len(order) == 0 {
+		return nil
+	}
+	return portsForOrder(m, order, httpSide)
+}
+
+// aggregateRelayCandidates is the relay-path twin of aggregateCandidates:
+// identical streak ordering, but the per-instance RELAY inbounds. Instances
+// without a relay port (feature off) contribute nothing, so relay-off
+// yields nil and the relay aggregate never serves.
+func (m *ProxyManager) aggregateRelayCandidates() []string {
+	order := m.orderedAlive()
+	if len(order) == 0 {
+		return nil
+	}
+	insts, _ := m.snapshot()
+	out := make([]string, 0, len(order))
+	for _, s := range order {
+		if s.Index < 0 || s.Index >= len(insts) {
+			continue
+		}
+		if port := insts[s.Index].RelayPort(); port > 0 {
+			out = append(out, fmt.Sprintf("127.0.0.1:%d", port))
+		}
+	}
+	return out
+}
+
+// orderedAlive is the streak partition both candidate ladders share: the
+// relay ladder must rank nodes exactly like the direct ladder, or one path
+// would prefer a node the other path distrusts.
+func (m *ProxyManager) orderedAlive() []InstanceStatus {
 	alive := m.GetAliveStatuses()
 	if len(alive) == 0 {
 		return nil
@@ -161,6 +217,13 @@ func (m *ProxyManager) aggregateCandidates(httpSide bool) []string {
 			order = append(order, rest...)
 		}
 	}
+	return order
+}
+
+// portsForOrder maps streak-ordered statuses onto loopback backends, dropping
+// entries with no instance or unset port rather than dialling them (a dead
+// dial costs a connection the next candidate could still serve).
+func portsForOrder(m *ProxyManager, order []InstanceStatus, httpSide bool) []string {
 	insts, _ := m.snapshot()
 	out := make([]string, 0, len(order))
 	for _, s := range order {

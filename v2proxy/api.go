@@ -81,9 +81,12 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		}
 		// Stable endpoints for clients that must never rewrite config: query
 		// once, use forever — per-connection routing survives every switch.
-		if as, ah := manager.aggregateAddrs(); as != "" || ah != "" {
+		if as, ah, ar := manager.aggregateAddrs(); as != "" || ah != "" || ar != "" {
 			body["aggregate_socks"] = as
 			body["aggregate_http"] = ah
+			if ar != "" {
+				body["aggregate_relay"] = ar
+			}
 		}
 		if err := json.NewEncoder(w).Encode(body); err != nil {
 			debugLog("encode /health failed: %v", err)
