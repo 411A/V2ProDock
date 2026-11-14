@@ -29,6 +29,11 @@ type ProxySelector struct {
 	testURL     string
 	socksPort   int
 	httpPort    int
+	// Loopback dial strings are immutable after construction; caching them
+	// keeps the per-connection aggregate ladder free of fmt.Sprintf.
+	socksAddr string
+	httpAddr  string
+	relayAddr string
 	// relayPort is this instance's relay-egress SOCKS inbound (0 = disabled).
 	// Set once by the manager before Start; the same xray child serves both
 	// paths, routing separates them, so enabling relay costs no extra process.
@@ -88,6 +93,8 @@ func NewProxySelector(xrayDir, testURL string, socksPort, httpPort int, checkInt
 		testURL:       testURL,
 		socksPort:     socksPort,
 		httpPort:      httpPort,
+		socksAddr:     fmt.Sprintf("127.0.0.1:%d", socksPort),
+		httpAddr:      fmt.Sprintf("127.0.0.1:%d", httpPort),
 		checkInterval: checkInterval,
 		activeIndex:   -1,
 	}
@@ -97,6 +104,29 @@ func (s *ProxySelector) SOCKSPort() int { return s.socksPort }
 func (s *ProxySelector) HTTPPort() int  { return s.httpPort }
 func (s *ProxySelector) RelayPort() int { return s.relayPort }
 
+// SOCKSAddr returns the loopback dial string for this instance's SOCKS port.
+func (s *ProxySelector) SOCKSAddr() string { return s.socksAddr }
+
+// HTTPAddr returns the loopback dial string for this instance's HTTP bridge.
+func (s *ProxySelector) HTTPAddr() string { return s.httpAddr }
+
+// RelayAddr returns the loopback dial string for the relay inbound ("" when
+// relay egress is off). Ports are immutable; relayAddr is the only one set
+// after construction (SetRelayPort).
+func (s *ProxySelector) RelayAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.relayAddr
+}
+
+// RelayEndpoint returns the relay port and its dial string atomically, so the
+// cached ladder can never pair a port with a stale address.
+func (s *ProxySelector) RelayEndpoint() (int, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.relayPort, s.relayAddr
+}
+
 // SetRelayPort arms the relay-egress inbound for the next render. It is a
 // setter (not a constructor arg) so direct constructions keep today's
 // behavior untouched: zero value = relay off.
@@ -104,6 +134,9 @@ func (s *ProxySelector) SetRelayPort(port int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.relayPort = port
+	if port > 0 {
+		s.relayAddr = fmt.Sprintf("127.0.0.1:%d", port)
+	}
 }
 
 // currentPID returns the managed xray child PID (0 = none) for watchdog accounting.
@@ -248,6 +281,20 @@ func (s *ProxySelector) snapshotConfigs() []ProxyConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.configs)
+}
+
+// hasConfig reports whether key is still in the pool, without cloning the
+// pool. The refresh reconciler only needs yes/no; snapshotConfigs allocated a
+// full copy of every config on every refresh just to run one ContainsFunc.
+func (s *ProxySelector) hasConfig(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.configs {
+		if s.configs[i].Key() == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ProxySelector) StartWithBest() error {
@@ -934,12 +981,17 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	}
 
 	outbounds := []any{outbound}
+	// Parse the relay config ONCE per render: the old code called relayConfig()
+	// again for the routing rule below, re-parsing CF_RELAY_URL and env for a
+	// value that cannot change mid-render.
+	rc, relayOn := relayConfig()
+	relayArmed := relayOn && s.relayPort > 0
 	// Relay egress: a second SOCKS inbound routed into a standard HTTP-proxy
 	// outbound that is chained THROUGH the subscription upstream, so the relay
 	// TCP is established inside the tunnel. The censor sees the upstream
 	// transport only; the target sees the relay's (clean) egress IP. The
 	// upstream keeps outbounds[0] so the default route is untouched.
-	if rc, ok := relayConfig(); ok && s.relayPort > 0 {
+	if relayArmed {
 		upTag, _ := outbound["tag"].(string)
 		if strings.TrimSpace(upTag) == "" {
 			upTag = upstreamOutTag
@@ -997,7 +1049,7 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	}
 	// Relay route lands AFTER the table exists (and after bittorrent->blocked,
 	// which stays first so the default path is never reordered).
-	if _, ok := relayConfig(); ok && s.relayPort > 0 {
+	if relayArmed {
 		rules := fullConfig["routing"].(map[string]any)["rules"].([]map[string]any)
 		fullConfig["routing"].(map[string]any)["rules"] = append(rules, map[string]any{
 			"type":        "field",

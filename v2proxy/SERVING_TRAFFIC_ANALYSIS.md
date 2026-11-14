@@ -20,7 +20,7 @@ func (s *ProxySelector) ServingTraffic() bool {
 ```
 
 `egressGrace` is 90s (`constants.go:203`). `egressActive`
-(`httpproxy.go:170-180`) is a pure read of `egressNotes.lastOK`, keyed by int
+(`httpproxy.go` `egressActive`) is a pure read of the `egressNotes` registry, keyed by int
 port.
 
 `noteEgress(port)` has exactly **three** production call sites — VERIFIED by

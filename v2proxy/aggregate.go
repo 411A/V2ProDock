@@ -144,30 +144,13 @@ func serveCandidates(client net.Conn, cands []string, trackEgress bool) {
 	_ = client.Close()
 }
 
-// aggregateCandidates returns the loopback backends of every usable alive
-// instance, best first. It is the ordered generalization of pickBestBackend:
-// the head is exactly that function's answer in every AGG_MIN_STREAK regime,
-// so adding failover cannot change WHICH node a healthy pool lands on, only
-// what happens once the head's port turns out to be dead.
-//
-// The order mirrors pickBestBackend's intent: stability-qualified instances
-// first, fastest-first within the tier (a slow node holding 50s polls beats a
-// fast one that RSTs them), then the unqualified pool as a last-resort tail so
-// a qualified-tier outage still finds service. GetAliveStatuses is already
-// latency-sorted, so this partition preserves "fastest first" inside each
-// tier. When nothing qualifies, pickBestBackend falls back to plain
-// fastest-wins; the fallback here is the whole alive list unchanged, for the
-// same reason - never refuse service because no node has warmed up yet.
-//
-// Entries with no instance behind their Index, or with an unset port, are
-// dropped rather than dialled: pickBestBackend returns "not ok" for those,
-// which would cost a connection that the next candidate can still serve.
+// candidateLadder serves both aggregate endpoints (and pickBestBackend) from
+// the manager's cached routing snapshot. Before the cache, every accepted
+// connection locked the manager, cloned every status, sorted them and built a
+// fresh []string of backends. That is pure derived state: it only changes when
+// a status write lands (health tick / refresh), so it is built there instead.
 func (m *ProxyManager) aggregateCandidates(httpSide bool) []string {
-	order := m.orderedAlive()
-	if len(order) == 0 {
-		return nil
-	}
-	return portsForOrder(m, order, httpSide)
+	return m.candidateLadder(httpSide, false)
 }
 
 // aggregateRelayCandidates is the relay-path twin of aggregateCandidates:
@@ -175,69 +158,68 @@ func (m *ProxyManager) aggregateCandidates(httpSide bool) []string {
 // without a relay port (feature off) contribute nothing, so relay-off
 // yields nil and the relay aggregate never serves.
 func (m *ProxyManager) aggregateRelayCandidates() []string {
-	order := m.orderedAlive()
-	if len(order) == 0 {
-		return nil
-	}
-	insts, _ := m.snapshot()
-	out := make([]string, 0, len(order))
-	for _, s := range order {
-		if s.Index < 0 || s.Index >= len(insts) {
-			continue
-		}
-		if port := insts[s.Index].RelayPort(); port > 0 {
-			out = append(out, fmt.Sprintf("127.0.0.1:%d", port))
-		}
-	}
-	return out
+	return m.candidateLadder(false, true)
 }
 
-// orderedAlive is the streak partition both candidate ladders share: the
-// relay ladder must rank nodes exactly like the direct ladder, or one path
-// would prefer a node the other path distrusts.
-func (m *ProxyManager) orderedAlive() []InstanceStatus {
-	alive := m.GetAliveStatuses()
-	if len(alive) == 0 {
-		return nil
+// orderAlive is the streak partition both candidate ladders share: the relay
+// ladder must rank nodes exactly like the direct ladder, or one path would
+// prefer a node the other path distrusts. Pure and side-effect free so the
+// same ordering rule is used by the cache builder and any future caller.
+func orderAlive(alive []InstanceStatus, minStreak int) []InstanceStatus {
+	if len(alive) == 0 || minStreak <= 0 {
+		return alive
 	}
-	order := alive
-	if minStreak := aggMinStreak(); minStreak > 0 {
-		qualified := make([]InstanceStatus, 0, len(alive))
-		rest := make([]InstanceStatus, 0, len(alive))
-		for _, s := range alive {
-			if s.OkStreak >= minStreak {
-				qualified = append(qualified, s)
-			} else {
-				rest = append(rest, s)
-			}
-		}
-		if len(qualified) > 0 {
-			order = make([]InstanceStatus, 0, len(alive))
-			order = append(order, qualified...)
-			order = append(order, rest...)
+	qualified := make([]InstanceStatus, 0, len(alive))
+	rest := make([]InstanceStatus, 0, len(alive))
+	for _, s := range alive {
+		if s.OkStreak >= minStreak {
+			qualified = append(qualified, s)
+		} else {
+			rest = append(rest, s)
 		}
 	}
+	if len(qualified) == 0 {
+		return alive
+	}
+	order := make([]InstanceStatus, 0, len(alive))
+	order = append(order, qualified...)
+	order = append(order, rest...)
 	return order
 }
 
 // portsForOrder maps streak-ordered statuses onto loopback backends, dropping
 // entries with no instance or unset port rather than dialling them (a dead
 // dial costs a connection the next candidate could still serve).
-func portsForOrder(m *ProxyManager, order []InstanceStatus, httpSide bool) []string {
-	insts, _ := m.snapshot()
+func portsForOrder(insts []*ProxySelector, order []InstanceStatus, httpSide bool) []string {
 	out := make([]string, 0, len(order))
 	for _, s := range order {
 		if s.Index < 0 || s.Index >= len(insts) {
 			continue
 		}
-		port := insts[s.Index].SOCKSPort()
 		if httpSide {
-			port = insts[s.Index].HTTPPort()
-		}
-		if port <= 0 {
+			if insts[s.Index].HTTPPort() > 0 {
+				out = append(out, insts[s.Index].HTTPAddr())
+			}
 			continue
 		}
-		out = append(out, fmt.Sprintf("127.0.0.1:%d", port))
+		if insts[s.Index].SOCKSPort() > 0 {
+			out = append(out, insts[s.Index].SOCKSAddr())
+		}
+	}
+	return out
+}
+
+// relayPortsForOrder is portsForOrder for the relay inbounds: same order, but
+// only instances that actually carry a relay port contribute a backend.
+func relayPortsForOrder(insts []*ProxySelector, order []InstanceStatus) []string {
+	out := make([]string, 0, len(order))
+	for _, s := range order {
+		if s.Index < 0 || s.Index >= len(insts) {
+			continue
+		}
+		if port, addr := insts[s.Index].RelayEndpoint(); port > 0 {
+			out = append(out, addr)
+		}
 	}
 	return out
 }

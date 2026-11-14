@@ -275,7 +275,7 @@ grep -q 'api_current_alive' watchdog.sh && ok "sticky-pin liveness check present
 # ash support set -o pipefail among the shells here).
 if command -v bash >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   _bw="$(mktemp -d)"
-  for _fn in verify_egress api_snapshot api_fastest api_current_alive api_name_for_port; do
+  for _fn in verify_egress api_snapshot api_state api_fastest api_current_alive api_name_for_port; do
     sed -n "/^${_fn}() {/,/^}/p" watchdog.sh >> "$_bw/fns.sh"
   done
   if [ -s "$_bw/fns.sh" ]; then ok "extracted live functions for mock run"; else bad "function extraction failed"; fi
@@ -338,6 +338,16 @@ EOF
     && bad "api_current_alive kept a dead pin" || ok "dead pin detected (re-pin allowed)"
   _out="$(_api 'api_snapshot >/dev/null && api_name_for_port 27024' '')"
   [ "$_out" = "Beta" ] && ok "sticky pin resolves its name" || bad "api_name_for_port wrong: $_out"
+  _out="$(_api 'api_snapshot >/dev/null && api_state' 'v2prodock:27024')"
+  [ "$_out" = "$(printf '0.0.0.0:27021\tAlpha\ttrue\tBeta')" ] \
+    && ok "api_state: one jq yields fastest+pin facts" || bad "api_state live pin wrong: $_out"
+  _out="$(_api 'api_snapshot >/dev/null && api_state' 'v2prodock:27099')"
+  [ "$_out" = "$(printf '0.0.0.0:27021\tAlpha\tfalse\tunknown')" ] \
+    && ok "api_state: dead pin reported false" || bad "api_state dead pin wrong: $_out"
+  printf '%s' '[]' > "$_bw/api.json"
+  _out="$(_api 'api_snapshot >/dev/null && api_state' '')"
+  [ "$_out" = "$(printf 'none\tunknown\tfalse\tunknown')" ] \
+    && ok "api_state: empty pool stays 4 non-empty fields" || bad "api_state empty pool malformed: $_out"
   # 8f. ms-dns renderer (entrypoint): all servers land, 3rd+ included.
   sed -n "/^render_ms_dns() {/,/^}/p" entrypoint.sh >> "$_bw/fns.sh"
   cat > "$_bw/dns.sh" <<'EOF'

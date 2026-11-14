@@ -114,3 +114,50 @@ func BenchmarkDecodeBase64Content(b *testing.B) {
 		}
 	}
 }
+
+// The aggregate ladder is read once per accepted client connection. It must
+// stay allocation-free: benchmark regressions here are per-connection costs at
+// hundreds of users/second, not a one-off startup expense.
+func BenchmarkAggregateCandidatesCached(b *testing.B) {
+	m := backendManager([]InstanceStatus{
+		{Index: 0, Status: "ok", LatMs: 80, OkStreak: 5},
+		{Index: 1, Status: "ok", LatMs: 20, OkStreak: 1},
+		{Index: 2, Status: "ok", LatMs: 50, OkStreak: 9},
+	}, 27801, 27811, 27802, 27812, 27803, 27813)
+	_ = m.aggregateCandidates(false) // publish the cache
+	b.ReportAllocs()
+	for b.Loop() {
+		if len(m.aggregateCandidates(false)) == 0 {
+			b.Fatal("ladder empty")
+		}
+	}
+}
+
+// noteEgress runs from every relay goroutine on a moving stream (throttled to
+// once per second per direction). It must not serialize concurrent tunnels on
+// a global mutex.
+func BenchmarkNoteEgressParallel(b *testing.B) {
+	ports := []int{27021, 27022}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			noteEgress(27021)
+			if !egressActive(ports, egressGrace) {
+				b.Fatal("fresh note not visible")
+			}
+		}
+	})
+}
+
+// acquireConnSlot is on the CONNECT/plain-HTTP hot path. The free-slot case
+// must not allocate a timer (the old time.After did, for every request).
+func BenchmarkConnSlotRoundTrip(b *testing.B) {
+	initConnSem()
+	b.ReportAllocs()
+	for b.Loop() {
+		if !acquireConnSlot() {
+			b.Fatal("free slot not acquired")
+		}
+		connSem <- struct{}{}
+	}
+}

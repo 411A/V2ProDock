@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -344,11 +345,10 @@ func TestReconcileFastActiveUntouched(t *testing.T) {
 // later test's "no live traffic" precondition by accident — silently turning
 // its assertions into no-ops.
 func expireEgress(ports ...int) {
-	egressNotes.mu.Lock()
-	defer egressNotes.mu.Unlock()
+	stale := egressElapsed() - int64(2*egressGrace)
 	for _, p := range ports {
-		if _, ok := egressNotes.lastOK[p]; ok {
-			egressNotes.lastOK[p] = time.Now().Add(-2 * egressGrace)
+		if v, ok := egressNotes.Load(p); ok {
+			v.(*atomic.Int64).Store(stale)
 		}
 	}
 }

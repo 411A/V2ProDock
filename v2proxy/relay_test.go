@@ -272,7 +272,10 @@ func TestRelayGateFailsFast(t *testing.T) {
 		t.Fatal("dark relay accepted bytes; must fail fast")
 	}
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("dark relay handler: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("dark relay handler did not return")
 	}

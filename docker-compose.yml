@@ -138,7 +138,11 @@ services:
       - EGRESS_URL=${EGRESS_URL:-https://api.ipify.org}
       - PERSIST_DIR=/config/vpn
     healthcheck:
-      test: ["CMD-SHELL", "swanctl --list-sas >/dev/null 2>&1 || swanctl --list-conns 2>&1 | grep -q ikev2-eap"]
+      # VPN_ENABLED=0 runs an idle container (entrypoint sleeps). Without the
+      # first clause the old check still forked swanctl every 30s only to fail
+      # forever, marking a deliberately idle sidecar unhealthy and burning CPU
+      # on a 1-vCPU host. $$ keeps the expansion inside the container.
+      test: ["CMD-SHELL", "[ \"$${VPN_ENABLED:-1}\" = \"0\" ] || swanctl --list-sas >/dev/null 2>&1 || swanctl --list-conns 2>&1 | grep -q ikev2-eap"]
       interval: 30s
       timeout: 10s
       retries: 3

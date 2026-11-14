@@ -79,8 +79,15 @@ trap cleanup TERM INT
 
 write_status() {
   # $1 upstream_socks $2 upstream_name $3 egress_ip $4 verified(true/false) $5 error
-  local ts verified err name_clean err_clean _plain _pptp
-  mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
+  # local is a busybox-ash extension the image relies on; POSIX sh -n accepts
+  # it and the test suite asserts the declaration stays. Watching this file
+  # with -S warning otherwise reports SC3043 on every run.
+  # shellcheck disable=SC3043
+  local ts verified err name_clean err_clean _plain _pptp _dir
+  # The directory is created once at boot (entrypoint/PERSIST_DIR); only pay
+  # for a mkdir process when it is genuinely missing.
+  _dir="$(dirname "$STATUS_FILE")"
+  [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || true
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
   verified="$4"; err="$5"
   # minimal JSON escaping (names are subscription remarks; strip quotes/newlines)
@@ -95,13 +102,36 @@ write_status() {
     && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
 }
 
-# One API fetch per poll; api_fastest + api_current_alive both parse the
-# snapshot (two curls per poll would double localhost traffic and could
-# observe two different pool states mid-churn).
+# One API fetch per poll; api_state below reads all three facts the steady
+# loop needs (fastest, sticky-pin liveness, pin name) in ONE jq process.
+# api_fastest/api_current_alive/api_name_for_port remain for boot/tests, but
+# the hot loop no longer pays 2-4 jq forks every POLL_SECS.
 API_SNAPSHOT="${API_SNAPSHOT:-/tmp/vpn-api.json}"
 api_snapshot() {
   curl -fsS --max-time 8 "$V2PRODOCK_API" > "$API_SNAPSHOT.tmp" 2>/dev/null \
     && mv -f "$API_SNAPSHOT.tmp" "$API_SNAPSHOT" 2>/dev/null || return 1
+}
+
+# Prints "fastest_socks<TAB>fastest_name<TAB>cur_alive<TAB>cur_name" from one
+# snapshot. @tsv escapes tabs/newlines inside subscription names, so the field
+# count never drifts. cur_alive is "true" only when CURRENT_SOCKS is numeric
+# AND present in the alive set.
+api_state() {
+  [ -f "$API_SNAPSHOT" ] || return 1
+  cur_port="${CURRENT_SOCKS##*:}"
+  case "$cur_port" in ''|*[!0-9]*) cur_port="" ;; esac
+  jq -r --arg p "$cur_port" '
+    def nz($v; $d): if ($v // "") == "" then $d else $v end;
+    (.[0].socks5 // "") as $fast |
+    (.[0].name // "") as $fname |
+    ([.[] | select((.socks5 // "") | endswith(":" + $p))]) as $cur |
+    [
+      nz($fast; "none"),
+      nz($fname; "unknown"),
+      (if $p == "" then false else ($cur | length > 0) end),
+      nz($cur[0].name; "unknown")
+    ] | @tsv
+  ' "$API_SNAPSHOT" 2>/dev/null
 }
 
 # Prints "host:port|name" for fastest alive proxy, or fails.
@@ -326,7 +356,29 @@ while true; do
   sleep "$POLL_SECS"
   ensure_ipsec || exit 1
   ensure_pptpd
-  if ! api_snapshot || ! fastest="$(api_fastest)"; then
+  state=""
+  state_ok=true
+  if ! api_snapshot; then
+    state_ok=false
+  elif ! state="$(api_state)"; then
+    state_ok=false
+  fi
+  socks_raw=""; pname=""; cur_alive=false; cur_name="unknown"
+  if [ "$state_ok" = true ] && [ -n "$state" ]; then
+    IFS="$(printf '\t')" read -r socks_raw pname cur_alive cur_name <<EOF
+$state
+EOF
+  fi
+  case "$socks_raw" in
+    ''|null|none) state_ok=false ;;
+  esac
+  if [ "$state_ok" = true ]; then
+    port="${socks_raw##*:}"
+    case "$port" in
+      ''|*[!0-9]*) state_ok=false ;;
+    esac
+  fi
+  if [ "$state_ok" = false ]; then
     API_FAILS=$((API_FAILS + 1))
     if [ "$API_FAILS" -eq 1 ]; then
       warn "API has no alive proxy; keeping last pin $CURRENT_SOCKS (fail-closed, no direct fallback)."
@@ -337,12 +389,12 @@ while true; do
     continue
   fi
   API_FAILS=0
-  socks="${fastest%%|*}"; pname="${fastest#*|}"
-  if [ "$socks" != "$CURRENT_SOCKS" ] && api_current_alive; then
+  socks="$V2PRODOCK_SOCKS_HOST:$port"
+  if [ "$socks" != "$CURRENT_SOCKS" ] && [ "$cur_alive" = "true" ]; then
     # Sticky pin: fastest flapped but our upstream still serves — verify and
     # report the CURRENT pin below, never the fastest.
     socks="$CURRENT_SOCKS"
-    pname="$(api_name_for_port "${socks##*:}")"
+    pname="$cur_name"
   fi
   if [ "$socks" != "$CURRENT_SOCKS" ]; then
     log "Upstream changed $CURRENT_SOCKS -> $socks ($pname), re-pinning..."

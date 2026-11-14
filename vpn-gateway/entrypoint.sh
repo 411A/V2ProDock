@@ -27,7 +27,11 @@ trap 'rm -f /tmp/eap-secrets.conf /tmp/psk-secret.conf /tmp/swanctl.rendered' EX
 case "${VPN_ENABLED:-1}" in
   0|false|False|FALSE|no|No|NO|off|Off|OFF)
     log "VPN_ENABLED=0: v2prodock-vpn idle (proxy-only mode). Set VPN_ENABLED=1 + VPN_PASSWORD to serve IKEv2."
-    exec tail -f /dev/null
+    # A long single sleep, not `tail -f /dev/null`: busybox tail wakes every
+    # second just to notice a file that never changes. The container's job here
+    # is to stay alive for compose, so one syscall-free sleep is the leanest
+    # correct idle. SIGTERM still terminates it immediately.
+    exec sleep 2147483647
     ;;
 esac
 
@@ -252,7 +256,11 @@ chmod 600 /etc/swanctl/private/server.key
 log "Certs installed into swanctl store."
 # Apple profile for legacy devices (best-effort, never fatal to VPN boot).
 if [ -x /gen-mobileconfig.sh ]; then
-  OUT="$PERSIST_DIR/apple.mobileconfig" PERSIST_DIR="$PERSIST_DIR" VPN_DOMAIN="$VPN_DOMAIN" /gen-mobileconfig.sh 2>&1 || \
+  # Separate variable: spelling OUT="$PERSIST_DIR/..." on the same command as
+  # PERSIST_DIR="$PERSIST_DIR" makes shellcheck (rightly) warn that the
+  # assignment is only seen by the forked process.
+  _mc_out="$PERSIST_DIR/apple.mobileconfig"
+  OUT="$_mc_out" PERSIST_DIR="$PERSIST_DIR" VPN_DOMAIN="$VPN_DOMAIN" /gen-mobileconfig.sh 2>&1 || \
     warn "mobileconfig generation failed (VPN still boots)."
 fi
 

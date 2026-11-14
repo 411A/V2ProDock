@@ -559,6 +559,10 @@ You can also add more public subscription URLs directly via `SUBSCRIPTION_URLS` 
 
 ### Tuning for Low-End Devices
 
+On a 1-vCPU or burstable VPS, see [docs/MONITORING.md](docs/MONITORING.md) for
+the quota math and `docker stats`/`sar` recipes that answer "is it this
+container or the whole box?".
+
 For devices with limited RAM (256MB-512MB):
 
 ```bash

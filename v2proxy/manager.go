@@ -41,6 +41,12 @@ type ProxyManager struct {
 	aggSocks      string
 	aggHTTP       string
 	aggRelay      string
+	// cache is the routing ladder derived from statuses. It is written only by
+	// status writes (health tick / refresh, under mu) and read lock-free by
+	// every aggregate connection. A pointer swap means reader and writer never
+	// share the same snapshot, and a stale snapshot is impossible after a
+	// markOK/markDown because each one publishes a rebuilt cache.
+	cache atomic.Pointer[statusCache]
 	// relayAlive gates the relay aggregate: probed once per health tick
 	// through the relay path itself (the worker is shared, per-node probes
 	// would burn N x budget to learn one fact). False = fail fast.
@@ -58,6 +64,15 @@ type ProxyManager struct {
 	// pointer) so the zero value is usable: tests build &ProxyManager{...}
 	// literals, and a nil pointer here was a segfault.
 	srcBrk srcBreaker
+}
+
+// statusCache is the immutable routing snapshot derived from statuses. Slices
+// are never mutated after build; replacing the pointer leaves old readers with
+// a valid array, so callers may keep the slice header after the load.
+type statusCache struct {
+	socks []string
+	http  []string
+	relay []string
 }
 
 // srcBreaker circuit-breaks dead subscription sources across refreshes: a
@@ -216,8 +231,9 @@ func dedupConfigs(in []ProxyConfig) []ProxyConfig {
 	seen := make(map[string]bool, len(in))
 	out := make([]ProxyConfig, 0, len(in))
 	for _, c := range in {
-		if !seen[c.Key()] {
-			seen[c.Key()] = true
+		key := c.Key()
+		if !seen[key] {
+			seen[key] = true
 			out = append(out, c)
 		}
 	}
@@ -266,6 +282,7 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 	if i >= 0 && i < len(m.statuses) {
 		m.statuses[i].Status = "down"
 		m.statuses[i].Error = errMsg
+		m.buildCacheLocked()
 	}
 }
 
@@ -275,29 +292,60 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 // RSTs them. Nothing qualifying falls back to fastest (never refuse service).
 // False when nothing is servable.
 func (m *ProxyManager) pickBestBackend(httpSide bool) (string, bool) {
-	alive := m.GetAliveStatuses()
-	if len(alive) == 0 {
+	cands := m.candidateLadder(httpSide, false)
+	if len(cands) == 0 {
 		return "", false
 	}
-	best := alive[0]
-	if minStreak := aggMinStreak(); minStreak > 0 {
-		for _, s := range alive {
-			// Alive is latency-sorted: first qualifier is fastest qualifier.
-			if s.OkStreak >= minStreak {
-				best = s
-				break
-			}
+	return cands[0], true
+}
+
+// buildCacheLocked publishes a fresh routing snapshot. Caller holds m.mu (or
+// owns the manager exclusively during construction/tests). The snapshot is
+// immutable once stored, so readers need no lock at all.
+func (m *ProxyManager) buildCacheLocked() *statusCache {
+	alive := make([]InstanceStatus, 0, len(m.statuses))
+	for _, s := range m.statuses {
+		if s.Status == "ok" {
+			alive = append(alive, s)
 		}
 	}
-	insts, _ := m.snapshot()
-	if best.Index < 0 || best.Index >= len(insts) {
-		return "", false
+	slices.SortFunc(alive, func(a, b InstanceStatus) int {
+		return cmp.Compare(a.LatMs, b.LatMs)
+	})
+	order := orderAlive(alive, aggMinStreak())
+	c := &statusCache{
+		socks: portsForOrder(m.instances, order, false),
+		http:  portsForOrder(m.instances, order, true),
+		relay: relayPortsForOrder(m.instances, order),
 	}
-	port := insts[best.Index].SOCKSPort()
-	if httpSide {
-		port = insts[best.Index].HTTPPort()
+	m.cache.Store(c)
+	return c
+}
+
+// candidateLadder returns the cached backend list for one protocol side. The
+// load is lock-free: the aggregate path is the hottest code in the daemon
+// (every accepted client connection) and must not serialize on the manager
+// mutex shared with health checks and refreshes. The fallback build exists for
+// tests and direct &ProxyManager{} literals that never went through a status
+// write; production publishes a cache on every markOK/markDown.
+func (m *ProxyManager) candidateLadder(httpSide, relayPath bool) []string {
+	c := m.cache.Load()
+	if c == nil {
+		m.mu.Lock()
+		c = m.cache.Load()
+		if c == nil {
+			c = m.buildCacheLocked()
+		}
+		m.mu.Unlock()
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port), true
+	switch {
+	case relayPath:
+		return c.relay
+	case httpSide:
+		return c.http
+	default:
+		return c.socks
+	}
 }
 
 // usedPorts snapshots every instance SOCKS+HTTP port for collision-aware
@@ -355,6 +403,7 @@ func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
 				m.statuses[i].ActiveSince = since.UTC().Format(time.RFC3339)
 			}
 		}
+		m.buildCacheLocked()
 	}
 }
 
@@ -707,10 +756,7 @@ func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
 // which is a far worse failure than slow. Fast present active -> untouched.
 func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyConfig) {
 	active := inst.ActiveConfig()
-	present := active != nil &&
-		slices.ContainsFunc(inst.snapshotConfigs(), func(c ProxyConfig) bool {
-			return c.Key() == active.Key()
-		})
+	present := active != nil && inst.hasConfig(active.Key())
 	if !present {
 		// Vanished but never failed: the remote list ROTATED, the proxy did
 		// not die — keep serving it (re-inserted at the pool head) instead

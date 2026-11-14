@@ -358,13 +358,16 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 	// Try decoding base64 if needed
 	decodedContent := decodeBase64Content(content)
 
+	// Parse the CLEAN_IP_MAP once for the whole subscription instead of once per
+	// line; the map is env-derived and cannot change mid-fetch.
+	clean := cleanIPMap()
 	var proxies []ProxyConfig
 	for line := range strings.SplitSeq(decodedContent, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		proxy, err := parseToXrayConfig(line)
+		proxy, err := parseToXrayConfigWithMap(line, clean)
 		if err != nil {
 			continue
 		}
@@ -494,16 +497,16 @@ func FetchMergedSubscriptions(urls []string) []ProxyConfig {
 }
 
 func decodeBase64Content(s string) string {
-	// If it already looks like a list of URLs (e.g. starts with vless://, vmess://, etc.), return as is
-	lines := strings.Split(s, "\n")
-	if len(lines) > 0 {
-		firstLine := strings.TrimSpace(lines[0])
-		if strings.HasPrefix(firstLine, "vless://") ||
-			strings.HasPrefix(firstLine, "vmess://") ||
-			strings.HasPrefix(firstLine, "trojan://") ||
-			strings.HasPrefix(firstLine, "ss://") {
-			return s
-		}
+	// If it already looks like a list of URLs (e.g. starts with vless://, vmess://, etc.), return as is.
+	// Cut, not Split: this only needs the first line, and Split allocated a
+	// slice of every line in a potentially 10MiB subscription just to read one.
+	firstLine, _, _ := strings.Cut(s, "\n")
+	firstLine = strings.TrimSpace(firstLine)
+	if strings.HasPrefix(firstLine, "vless://") ||
+		strings.HasPrefix(firstLine, "vmess://") ||
+		strings.HasPrefix(firstLine, "trojan://") ||
+		strings.HasPrefix(firstLine, "ss://") {
+		return s
 	}
 
 	// Sanitize base64 string: remove all whitespace and newlines
@@ -535,8 +538,17 @@ func decodeBase64Content(s string) string {
 }
 
 func parseToXrayConfig(raw string) (*ProxyConfig, error) {
+	return parseToXrayConfigWithMap(raw, cleanIPMap())
+}
+
+// parseToXrayConfigWithMap is parseToXrayConfig with the CLEAN_IP_MAP already
+// parsed. FetchSubscription hoists the parse out of the line loop: with a map
+// configured, the old per-line cleanIPMap() re-split and re-lowercased the
+// same env string for every subscription line (hundreds of times per refresh).
+// Direct callers keep the fresh-read behavior via parseToXrayConfig.
+func parseToXrayConfigWithMap(raw string, clean map[string]string) (*ProxyConfig, error) {
 	// L2 escape hatch: blocked edge IP -> working edge IP, SNI untouched.
-	raw = rewriteCleanIP(raw, cleanIPMap())
+	raw = rewriteCleanIP(raw, clean)
 	if strings.HasPrefix(raw, "vmess://") {
 		return parseVmess(raw, "")
 	}

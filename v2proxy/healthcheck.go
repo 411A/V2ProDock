@@ -53,13 +53,29 @@ func (r HealthResult) Describe() string {
 }
 
 func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResult {
+	return testSingleURLContext(context.Background(), proxyAddr, testURL, timeout)
+}
+
+// testSingleURLContext is testSingleURL with a cancelable context. The race
+// uses it to abort losing legs the moment a winner is accepted, so a healthy
+// primary answer no longer leaves two full TLS handshakes running in the
+// background until their own 3s budgets expire. A canceled leg returns an
+// error that the race discards; no verdict ever depends on it.
+func testSingleURLContext(ctx context.Context, proxyAddr, testURL string, timeout time.Duration) HealthResult {
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
 		return HealthResult{Error: err, URL: testURL}
 	}
+	// The SOCKS5 dialer implements ContextDialer, so cancellation reaches the
+	// dial and its in-flight handshake reads instead of leaking a goroutine
+	// that outlives the probe (the old Dial path had no ctx at all).
+	cd, _ := dialer.(proxy.ContextDialer)
 
 	transport := &http.Transport{
-		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if cd != nil {
+				return cd.DialContext(ctx, network, addr)
+			}
 			return dialer.Dial(network, addr)
 		},
 		TLSHandshakeTimeout:   healthTLSHandshakeTimeout,
@@ -74,9 +90,13 @@ func testSingleURL(proxyAddr, testURL string, timeout time.Duration) HealthResul
 		Transport: transport,
 		Timeout:   timeout,
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
+	if err != nil {
+		return HealthResult{Error: err, URL: testURL}
+	}
 
 	start := time.Now()
-	resp, err := client.Get(testURL)
+	resp, err := client.Do(req)
 	latency := time.Since(start)
 
 	if err != nil {
@@ -219,6 +239,13 @@ func raceProbe(proxyAddr string, legs []probeLeg) HealthResult {
 	if len(legs) == 1 {
 		return testSingleURL(proxyAddr, legs[0].url, quickProbeTimeout)
 	}
+	// Cancel every still-running leg once a winner is accepted. The race's
+	// answer is "the first leg its own grading rule accepts"; a losing leg can
+	// never change that answer, so letting it burn a full TLS handshake (and up
+	// to quickProbeTimeout of network/CPU) after the verdict is already known
+	// was pure waste on every healthy health tick.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	type outcome struct {
 		res HealthResult
 		leg probeLeg
@@ -228,7 +255,7 @@ func raceProbe(proxyAddr string, legs []probeLeg) HealthResult {
 	ch := make(chan outcome, len(legs))
 	for _, leg := range legs {
 		go func() {
-			ch <- outcome{res: testSingleURL(proxyAddr, leg.url, quickProbeTimeout), leg: leg}
+			ch <- outcome{res: testSingleURLContext(ctx, proxyAddr, leg.url, quickProbeTimeout), leg: leg}
 		}()
 	}
 	accept := func(o outcome) (HealthResult, bool) {
@@ -238,6 +265,7 @@ func raceProbe(proxyAddr string, legs []probeLeg) HealthResult {
 		// Normalize: Telegram's rule accepts a 404, but callers switch on
 		// Working. Leave the verdict self-consistent with the rule that won.
 		o.res.Working = true
+		cancel()
 		return o.res, true
 	}
 	first := <-ch

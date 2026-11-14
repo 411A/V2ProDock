@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -22,14 +24,38 @@ var errDialTimeout = errors.New("upstream dial timeout")
 // handler (and its connection slot) indefinitely. Timeout -> caller gets a
 // fast 504 instead of a hung client.
 //
-// The abandoned goroutine is NOT left parked and a late connection is NOT
-// dropped: x/net's socks.Dialer resolves the proxy with context.Background(), so
-// its handshake reads are unbounded. The previous version returned 504 while
-// that goroutine stayed blocked in io.ReadFull forever, and if the handshake
-// later succeeded the fully-open net.Conn was discarded with no Close - an fd
-// leak on every timeout that raced. Closing the orphan is the only way to keep
-// the fd table bounded.
+// Production always takes the context path: proxy.SOCKS5 returns a
+// *socks.Dialer that implements proxy.ContextDialer, so cancellation reaches
+// the SOCKS handshake reads and x/net closes the in-flight socket. The
+// goroutine+timer fallback exists only for custom Dialers that do not
+// implement ContextDialer; there a late connection is closed by a cleanup
+// goroutine, so a timeout still cannot leak an fd.
 func dialSocksTimeout(dialer proxy.Dialer, network, addr string, timeout time.Duration) (net.Conn, error) {
+	// The production dialer is a *socks.Dialer, which implements
+	// proxy.ContextDialer. Using it is strictly cheaper and safer than the
+	// goroutine+timer fallback: cancellation reaches the SOCKS handshake reads,
+	// x/net closes the in-flight socket, and no goroutine survives a timeout.
+	// The old path returned 504 while the dial and its cleanup goroutine stayed
+	// blocked until the peer answered (they never did for a blackholed port).
+	if cd, ok := dialer.(proxy.ContextDialer); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		c, err := cd.DialContext(ctx, network, addr)
+		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("%w after %s", errDialTimeout, timeout)
+			}
+			return nil, err
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// A conn that raced the deadline must not be handed to a caller
+			// that is about to receive a timeout verdict.
+			_ = c.Close()
+			return nil, fmt.Errorf("%w after %s", errDialTimeout, timeout)
+		}
+		return c, nil
+	}
+
 	type res struct {
 		c   net.Conn
 		err error
@@ -147,10 +173,21 @@ func startHTTPProxy(addr, socksAddr string) {
 // egressNotes timestamps proven byte flows per instance port: the passive
 // health registry. A proxy that just served real traffic is responsive by
 // definition — HealthCheck trusts freshness here over synthetic probes.
-var egressNotes = struct {
-	mu     sync.Mutex
-	lastOK map[int]time.Time
-}{lastOK: map[int]time.Time{}}
+//
+// A sync.Map of *atomic.Int64, not a mutex-guarded map: this is written from
+// every relay goroutine on every noted hop, so a single global mutex made all
+// concurrent tunnels contend on one cache line for a timestamp nobody reads
+// more than once a tick. Loads for the fixed per-instance port set are
+// lock-free in the read-mostly path.
+var egressNotes sync.Map // map[int]*atomic.Int64
+
+// egressEpoch anchors the monotonic timestamps stored in egressNotes. Using
+// time.Since(egressEpoch) keeps the ledger immune to wall-clock jumps, which a
+// raw UnixNano stamp would not be: an NTP step back would age every live note
+// at once and let a probe strike a serving instance.
+var egressEpoch = time.Now()
+
+func egressElapsed() int64 { return int64(time.Since(egressEpoch)) }
 
 // noteEgress records a proven flow for one instance port (bridge HTTP port or
 // serving SOCKS port). Port 0 (unparseable listener addr) is dropped: a note
@@ -159,31 +196,50 @@ func noteEgress(port int) {
 	if port <= 0 {
 		return
 	}
-	egressNotes.mu.Lock()
-	defer egressNotes.mu.Unlock()
-	egressNotes.lastOK[port] = time.Now()
+	v, ok := egressNotes.Load(port)
+	if !ok {
+		v, _ = egressNotes.LoadOrStore(port, new(atomic.Int64))
+	}
+	v.(*atomic.Int64).Store(egressElapsed())
 }
 
 // egressActive reports whether ANY of the given instance ports proved a flow
 // within grace. Pure read for HealthCheck; keys are the fixed per-instance
 // port set, so the map stays tiny forever.
 func egressActive(ports []int, grace time.Duration) bool {
-	cutoff := time.Now().Add(-grace)
-	egressNotes.mu.Lock()
-	defer egressNotes.mu.Unlock()
+	cutoff := egressElapsed() - int64(grace)
 	for _, p := range ports {
-		if t, ok := egressNotes.lastOK[p]; ok && t.After(cutoff) {
+		if v, ok := egressNotes.Load(p); ok && v.(*atomic.Int64).Load() > cutoff {
 			return true
 		}
 	}
 	return false
 }
 
-func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, httpPort int) {
-	// Acquire connection slot to prevent unbounded HTTP request goroutines
+// acquireConnSlot takes one MAX_CONNS slot, waiting at most proxySlotWait.
+// The fast path is non-blocking: the old code created a time.After timer for
+// EVERY request even when a slot was free, leaving one timer to fire (and one
+// wakeup) per connection five seconds later. At hundreds of requests/second
+// that is a timer-heap storm for no reason.
+func acquireConnSlot() bool {
 	select {
 	case <-connSem:
-	case <-time.After(proxySlotWait):
+		return true
+	default:
+	}
+	timer := time.NewTimer(proxySlotWait)
+	defer timer.Stop()
+	select {
+	case <-connSem:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, httpPort int) {
+	// Acquire connection slot to prevent unbounded HTTP request goroutines
+	if !acquireConnSlot() {
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -261,9 +317,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 	}
 
 	// Acquire connection slot
-	select {
-	case <-connSem:
-	case <-time.After(proxySlotWait):
+	if !acquireConnSlot() {
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -340,6 +394,24 @@ func copyBodyIdle(w io.Writer, body io.Reader, conn net.Conn) (int64, error) {
 	bufp := relayBufPool.Get().(*[]byte)
 	defer relayBufPool.Put(bufp)
 	buf := *bufp
+	// Re-arm at most once per second (or a quarter of a test-shrunk budget):
+	// the deadline only has to notice a fully silent peer, not every chunk.
+	rearmEvery := relayIdleDeadline / 4
+	if rearmEvery > time.Second {
+		rearmEvery = time.Second
+	}
+	if rearmEvery < 0 {
+		rearmEvery = 0
+	}
+	var lastArm time.Time
+	arm := func() {
+		now := time.Now()
+		if rearmEvery > 0 && now.Sub(lastArm) < rearmEvery {
+			return
+		}
+		_ = conn.SetDeadline(now.Add(relayIdleDeadline))
+		lastArm = now
+	}
 	var total int64
 	for {
 		n, readErr := body.Read(buf)
@@ -349,7 +421,7 @@ func copyBodyIdle(w io.Writer, body io.Reader, conn net.Conn) (int64, error) {
 			if writeErr != nil {
 				return total, writeErr
 			}
-			_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
+			arm()
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
@@ -381,17 +453,14 @@ func setKeepAlive(c net.Conn) {
 }
 
 // relay splices two connections until either side finishes, with an IDLE
-// deadline (relayIdleDeadline) re-armed after every successful hop.
+// deadline (relayIdleDeadline) re-armed while bytes move.
 //
-// onFlow is invoked after every read that ACTUALLY MOVED BYTES — not once, on
-// the first one. noteEgress is a one-shot-per-connection timestamp, so a client
-// that connected once and then sat on the tunnel (mid-long-poll, waiting on a
-// reply nobody is going to send) carried no note after egressGrace and read as
-// idle while its connection was very much alive — on the aggregate path, which
-// is already protected against rotation by this very ledger. Re-firing per hop
-// keeps a live tunnel noted for as long as it carries traffic and costs no
-// timer and no extra goroutine: the relay loop already owns the wakeup, and it
-// fires only when n > 0, so a genuinely silent tunnel still reads as idle.
+// onFlow is invoked on the FIRST byte, then at most once per
+// egressNoteInterval (one second). noteEgress is a freshness stamp, so the
+// replay keeps a live tunnel noted for as long as it carries traffic while a
+// genuinely silent tunnel still reads as idle. The old callback fired on every
+// 32KiB hop; the ledger only answers "was there traffic within egressGrace",
+// so the extra map writes bought no extra truth.
 func relay(dst, src net.Conn, onFlow func()) {
 	relayWithIdle(dst, src, onFlow, relayIdleDeadline)
 }
@@ -399,37 +468,62 @@ func relay(dst, src net.Conn, onFlow func()) {
 // relayWithIdle is relay with the idle budget injectable so the behaviour is
 // testable in milliseconds instead of minutes.
 //
-// The deadline must be re-armed per hop. A single SetDeadline at entry is an
-// ABSOLUTE wall: every connection older than the budget was severed mid-stream
-// regardless of how well it was transferring, so large JSON/binary bodies that
-// simply took longer than the wall arrived truncated and the client had to
-// resume. That is not a blackhole detector, it is a transfer-size limit wearing
-// an idle constant's name. Re-arming per hop makes it mean what it says: only a
+// The deadline must be re-armed while data moves. A single SetDeadline at entry
+// is an ABSOLUTE wall: every connection older than the budget was severed
+// mid-stream regardless of how well it was transferring, so large JSON/binary
+// bodies that simply took longer than the wall arrived truncated and the client
+// had to resume. That is not a blackhole detector, it is a transfer-size limit
+// wearing an idle constant's name. Re-arming makes it mean what it says: only a
 // peer that stops moving entirely trips it.
 func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
-	// Both ends: a blackholed upstream must surface here (relay unblocks,
-	// both sides close, client reconnects) instead of hanging to the deadline.
-	setKeepAlive(dst)
+	// Configure liveness on src only: relay is used as a PAIR (one goroutine
+	// per direction), so every socket is a src exactly once. Setting both ends
+	// in both goroutines issued every keepalive syscall twice for no added
+	// coverage.
 	setKeepAlive(src)
 	defer func() { _ = dst.Close() }()
 	defer func() { _ = src.Close() }()
 
-	arm := func() {
-		d := time.Now().Add(idle)
+	// Re-arming both deadlines on EVERY hop is two deadline updates per 32KiB
+	// chunk. The timeout only matters when a peer goes fully silent, so one
+	// re-arm per second is indistinguishable in effect (a 5-minute idle budget
+	// becomes at most 5m+1s) while removing that overhead from the throughput
+	// path. Small injected budgets (tests) keep a proportional re-arm cadence.
+	rearmEvery := idle / 4
+	if rearmEvery > time.Second {
+		rearmEvery = time.Second
+	}
+	if rearmEvery < 0 {
+		rearmEvery = 0
+	}
+	var lastRearm time.Time
+	arm := func(force bool) {
+		now := time.Now()
+		if !force && rearmEvery > 0 && now.Sub(lastRearm) < rearmEvery {
+			return
+		}
+		d := now.Add(idle)
 		_ = dst.SetDeadline(d)
 		_ = src.SetDeadline(d)
+		lastRearm = now
 	}
-	arm()
+	arm(true)
 
 	bufp := relayBufPool.Get().(*[]byte)
 	defer relayBufPool.Put(bufp)
 
 	buf := *bufp
+	// The passive ledger answers "was there traffic within egressGrace (90s)",
+	// so a once-per-second stamp is just as conclusive as one per 32KiB chunk.
+	// The FIRST byte always fires immediately, which is what makes a newly
+	// active tunnel visible on the very next health read.
+	var lastFlow time.Time
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
-			if onFlow != nil {
+			if onFlow != nil && (lastFlow.IsZero() || time.Since(lastFlow) >= egressNoteInterval) {
 				onFlow()
+				lastFlow = time.Now()
 			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				debugLog("relay write ended stream: %v", writeErr)
@@ -446,6 +540,6 @@ func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
 			}
 			return
 		}
-		arm()
+		arm(false)
 	}
 }

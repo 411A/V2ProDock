@@ -215,6 +215,12 @@ const telegramProbeURL = "https://api.telegram.org/"
 // with margin while bounding true-down detection to grace + 3 strikes.
 const egressGrace = 90 * time.Second
 
+// egressNoteInterval bounds how often a moving stream re-stamps the passive
+// ledger. The ledger only answers "was there traffic within egressGrace", so
+// one stamp per second is exactly as conclusive as one per 32KiB hop, while
+// the hot relay path no longer takes a shared timestamp write per chunk.
+const egressNoteInterval = time.Second
+
 // ---- Serving-socket accounting (rotation safety) ----
 // egressGrace answers "were there recent BYTES". This bounds the OTHER failure
 // direction of the ESTABLISHED-socket guard: an unreadable /proc, or a table we

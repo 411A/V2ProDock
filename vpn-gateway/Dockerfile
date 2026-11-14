@@ -77,6 +77,6 @@ RUN chmod +x /entrypoint.sh /watchdog.sh /gen-mobileconfig.sh \
 EXPOSE 500/udp 4500/udp 1701/udp 1723/tcp
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD sh -c 'ipsec status >/dev/null 2>&1 || swanctl --list-sas >/dev/null 2>&1'
+  CMD sh -c 'if [ "${VPN_ENABLED:-1}" = "0" ]; then exit 0; fi; ipsec status >/dev/null 2>&1 || swanctl --list-sas >/dev/null 2>&1'
 
 ENTRYPOINT ["/entrypoint.sh"]

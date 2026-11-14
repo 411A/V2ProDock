@@ -168,7 +168,7 @@ const (
 	// rather than a garbage-rate measurement.
 	soakMaxHeapGrowth = 8 << 20
 	//
-	// Passive-health registry keys: +8. egressNotes.lastOK is keyed by instance
+	// Passive-health registry keys: +8. egressNotes is keyed by instance
 	// port and every port in play is fixed for the run, so the key COUNT should
 	// not move at all; +8 absorbs keys synthesised from ports that merely
 	// happen to be recycled by the OS across tests, while still failing if a
@@ -271,7 +271,7 @@ type soakSample struct {
 	heapAlloc   uint64
 	heapObjects uint64
 	children    int // -1 where no child accounting is possible
-	egressKeys  int // len(egressNotes.lastOK)
+	egressKeys  int // egressNotes size (fixed per-instance ports)
 	slotsHeld   int // connSem slots in use
 	iterations  int64
 }
@@ -342,9 +342,12 @@ func soakSampleNow(childDir string, iterations int64) soakSample {
 	if childDir != "" && runtime.GOOS == "linux" {
 		s.children = len(listXrayPIDs(childDir))
 	}
-	egressNotes.mu.Lock()
-	s.egressKeys = len(egressNotes.lastOK)
-	egressNotes.mu.Unlock()
+	egressKeys := 0
+	egressNotes.Range(func(_, _ any) bool {
+		egressKeys++
+		return true
+	})
+	s.egressKeys = egressKeys
 	if connSem != nil {
 		s.slotsHeld = cap(connSem) - len(connSem)
 	}
