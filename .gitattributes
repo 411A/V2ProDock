@@ -32,6 +32,13 @@ docker-compose.yml text eol=lf linguist-vendored
 # checkout would silently break poptop/pppd parsing (proven failure mode).
 *.tmpl text eol=lf linguist-vendored
 
+# Agent/skill tooling (use-modern-go runner, etc.): not part of the app. The
+# one .ps1 here was the only unexcluded non-Go source and made GitHub report
+# "PowerShell 0.6%" next to Go. Excluding the tree keeps the language bar
+# honest: Go is the only source language this project ships.
+.agents/** linguist-vendored
+*.ps1 linguist-vendored
+
 # Binary
 *.exe binary
 *.zip binary
