@@ -50,6 +50,8 @@ grep -q 'FORWARD -s "\$_net" -j DROP' entrypoint.sh && ok "fail-closed DROP pres
 if grep -Eq 'iptables -t nat -(A|C) POSTROUTING' entrypoint.sh; then bad "MASQUERADE breaks hev return path (replies die in INPUT)"; else ok "no MASQUERADE on VPN nets"; fi
 grep -q 'FORWARD -i "\$TUN_DEV" -j ACCEPT' entrypoint.sh && ok "tun0 return path accepted (hev re-injects)" || bad "return path from tun0 must be ACCEPTed"
 if grep -q 'FORWARD -i "\$TUN_DEV" -m state' entrypoint.sh; then bad "state match on tun0 blackholes hev replies (no conntrack)"; else ok "no conntrack match on tun0"; fi
+grep -q 'TCPMSS --set-mss' entrypoint.sh && ok "TCP MSS clamped for VPN clients (PMTU black holes)" || bad "missing TCPMSS clamp: large transfers stall on PPPoE/small-MTU links"
+grep -q 'VPN_MSS' entrypoint.sh && ok "VPN_MSS validated + configurable" || bad "VPN_MSS knob missing"
 grep -q 'iptables -t nat -D POSTROUTING' entrypoint.sh && ok "stale MASQ rules scrubbed" || bad "must scrub MASQ left by older builds"
 if grep -q 'POSTROUTING.*-o eth0' entrypoint.sh; then bad "must never MASQUERADE VPN via eth0"; else ok "no eth0 masquerade"; fi
 grep -q 'table 100' watchdog.sh entrypoint.sh && ok "policy routing table 100" || bad "table 100 routing missing"

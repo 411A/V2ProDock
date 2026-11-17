@@ -87,6 +87,48 @@ func aggMinStreak() int {
 	return n
 }
 
+// tcpCongestion parses XRAY_TCP_CONGESTION: a kernel congestion-control
+// algorithm name applied per outbound socket (e.g. bbr). Empty/off by default
+// (zero behavior change); garbage is ignored with a warning rather than
+// rendered into xray, where an unknown name would fail every dial.
+func tcpCongestion() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("XRAY_TCP_CONGESTION")))
+	if v == "" {
+		return ""
+	}
+	for _, r := range v {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			warnLog("XRAY_TCP_CONGESTION=%q invalid, using the kernel default", v)
+			return ""
+		}
+	}
+	return v
+}
+
+// applyUpstreamSockopt adds performance-only socket options to an outbound
+// without overriding anything the subscription already chose. tcpCongestion
+// is the one knob that changes sustained bulk throughput on a lossy path:
+// CUBIC collapses on packet loss, BBR paces instead.
+func applyUpstreamSockopt(outbound map[string]any, congestion string) {
+	if congestion == "" {
+		return
+	}
+	ss, ok := outbound["streamSettings"].(map[string]any)
+	if !ok {
+		ss = map[string]any{}
+		outbound["streamSettings"] = ss
+	}
+	so, ok := ss["sockopt"].(map[string]any)
+	if !ok {
+		so = map[string]any{}
+		ss["sockopt"] = so
+	}
+	if _, exists := so["tcpCongestion"]; exists {
+		return
+	}
+	so["tcpCongestion"] = congestion
+}
+
 // isPlainHTTP reports a downgrade-prone probe URL. Plain-HTTP inner traffic
 // is RST-injected by DPI on bare transports even when the tunnel is fine,
 // so a primary like this condemns healthy proxies (warn at startup).

@@ -4,20 +4,10 @@ package main
 // configurable duration and asserts that goroutines, file descriptors, heap,
 // connection slots and xray child processes do not GROW without bound.
 //
-// KNOWN LIMITATION — this harness currently FAILS under `go test -race`.
-// handleConnect's slot-release closure in httpproxy.go reads and writes an
-// unsynchronised `slotHeld bool` from BOTH the handler goroutine (its defer)
-// and the relay goroutine (the inner defer), so two concurrent CONNECT tunnels
-// trip the race detector. That is a REAL production data race, not a harness
-// artefact: a bare loop of CONNECT tunnels with no soak rig reproduces it.
-// httpproxy.go is outside this task's file ownership, so it is reported rather
-// than fixed. Everything else here is race-clean; the growth assertions, the
-// child-process accounting and the fixture wiring all pass under -race apart
-// from this one production defect. See README_SOAK.md.
-//
 // The daemon holds a TCP relay per proxied connection, a goroutine PAIR per
-// relay direction, a 32KiB pooled buffer per direction, one connection-slot
-// semaphore entry per live tunnel, and spawns/kills an xray CHILD PROCESS per
+// relay direction, a 64KiB pooled buffer per direction, one connection-slot
+// semaphore entry per bridge handler (returned at handler exit; sync.Once makes
+// the relay's release idempotent), and spawns/kills an xray CHILD PROCESS per
 // upstream switch. None of that shows up in a unit test: a leak is invisible
 // until a long-lived tunnel-serving process runs for hours. This file is the
 // missing measurement.
@@ -160,8 +150,8 @@ const (
 	soakMaxFDGrowth = 32
 	//
 	// Heap: +8MiB after a forced GC. The pooled relay buffer is relayBufSize
-	// (32KiB) and a connection holds two of them, so a buffer-per-connection
-	// leak reaches 8MiB after ~128 connections — well inside the minimum 10s
+	// (64KiB) and a connection holds two of them, so a buffer-per-connection
+	// leak reaches 8MiB after ~64 connections — well inside the minimum 10s
 	// budget — whereas GC pacing on a loaded box moves HeapAlloc by a few MiB
 	// between samples. Forcing GC before BOTH the baseline and the final
 	// sample (soakQuietSample) is what makes this a retention measurement
@@ -177,10 +167,10 @@ const (
 	//
 	// Connection slots: 0. connSem is pre-filled to cap, so any slot still held
 	// after the settle is an unreleased slot. This is the sharpest assertion in
-	// the file: MAX_CONNS is 128 by default, so an unreleased slot is caught
-	// after 128 tunnels rather than after the goroutine/fd counts have drifted
-	// enough to notice. Zero is not a guess — cap-len is exactly 0 when the
-	// semaphore is at rest.
+	// the file: MAX_CONNS is 128 by default, so an unreleased handler slot is
+	// caught after 128 CONNECTs rather than after the goroutine/fd counts have
+	// drifted enough to notice. Zero is not a guess — cap-len is exactly 0 when
+	// the semaphore is at rest.
 	soakMaxSlotGrowth = 0
 
 	// Coverage floors. These exist because bounded growth proved over no work

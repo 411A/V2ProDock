@@ -936,6 +936,10 @@ func (s *ProxySelector) tempPIDSnapshot() map[int]bool {
 	return out
 }
 
+// congestionWarnOnce keeps an unsupported XRAY_TCP_CONGESTION from logging on
+// every render (health/refresh/rotation all re-render).
+var congestionWarnOnce sync.Once
+
 // renderXrayConfig writes the full xray config for one upstream. seq > 0
 // marks a throwaway probe config: the filename carries the sequence so
 // parallel workers never clobber each other (or the serving config).
@@ -980,6 +984,19 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 		return "", fmt.Errorf("bad config: %w", err)
 	}
 
+	// Optional per-socket congestion control (XRAY_TCP_CONGESTION, e.g. bbr).
+	// Verify support BEFORE rendering: an unknown algorithm makes every dial
+	// fail, so a typo or a kernel without the module must degrade to the
+	// default, never to an unusable pool.
+	cc := tcpCongestion()
+	if cc != "" && !tcpCongestionSupported(cc) {
+		congestionWarnOnce.Do(func() {
+			warnLog("XRAY_TCP_CONGESTION=%q is not available in this kernel, using the system default", cc)
+		})
+		cc = ""
+	}
+	applyUpstreamSockopt(outbound, cc)
+
 	outbounds := []any{outbound}
 	// Parse the relay config ONCE per render: the old code called relayConfig()
 	// again for the routing rule below, re-parsing CF_RELAY_URL and env for a
@@ -1013,7 +1030,7 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 	}
 	if fragmentEnabled() && upstreamUsesTLS(outbound) && !hasCustomDialChain(outbound) {
 		chainFragment(outbound)
-		outbounds = append(outbounds, map[string]any{
+		frag := map[string]any{
 			"protocol": "freedom",
 			"tag":      fragmentOutTag,
 			"settings": map[string]any{
@@ -1023,7 +1040,13 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 					"interval": fragmentInterval,
 				},
 			},
-		})
+		}
+		// With dialerProxy the underlying TCP socket is opened by THIS
+		// freedom outbound, not by the proxy outbound that carries the
+		// sockopt. Put the congestion option on both, or fragment mode would
+		// silently lose it.
+		applyUpstreamSockopt(frag, cc)
+		outbounds = append(outbounds, frag)
 	}
 	outbounds = append(outbounds,
 		map[string]any{

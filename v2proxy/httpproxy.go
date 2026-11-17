@@ -259,20 +259,33 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 		return
 	}
 	defer func() { _ = conn.Close() }()
-	// Absolute budget for the whole upstream exchange so a stalled server
-	// cannot pin a connection slot forever (CONNECT streams keep relayIdleDeadline).
-	_ = conn.SetDeadline(time.Now().Add(bridgeUpstreamDeadline))
 
 	r.Header.Del("Proxy-Connection")
 	r.Header.Del("Proxy-Authorization")
 
-	if err := r.Write(conn); err != nil {
+	// The write side is an IDLE budget, not an absolute one: a large upload
+	// (Telegram file, video publish) legitimately takes longer than the
+	// header-phase budget, and the old single SetDeadline severed it mid-body
+	// at exactly bridgeUpstreamDeadline. Each Write re-arms, so only a server
+	// that stops accepting bytes trips it.
+	if err := r.Write(idleWriteConn{Conn: conn, idle: bridgeUpstreamDeadline}); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// The response head keeps the absolute anti-stall budget: a server that
+	// never answers must still recycle the slot.
+	_ = conn.SetDeadline(time.Now().Add(bridgeUpstreamDeadline))
 
 	reader := bufio.NewReaderSize(conn, relayBufSize)
 	resp, err := http.ReadResponse(reader, r)
+	// Informational responses (100 Continue, 103 Early Hints) are not the
+	// final response. The old code forwarded the 100 as if it were the body's
+	// response, so an Expect: 100-continue upload saw an empty 100 and the real
+	// 200 was never read. Skip them; 101 stays final (upgrade semantics).
+	for err == nil && resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != http.StatusSwitchingProtocols {
+		_ = resp.Body.Close()
+		resp, err = http.ReadResponse(reader, r)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -321,18 +334,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
-	// The slot is released by the RELAY PAIR, not by this handler's defer. The
-	// handler returns as soon as the tunnel is spliced while the tunnel itself
-	// lives as long as the client holds it open, so a defer here held the slot
-	// for the dial only and MAX_CONNS bounded nothing on the CONNECT path — the
-	// dominant one for an HTTPS bridge. Every abandoned tunnel pinned an fd, two
-	// goroutines and a pooled buffer with nothing to stop it.
-	// sync.Once, NOT a plain `if slotHeld` flag: this closure runs from BOTH the
-	// handler goroutine's defer and the relay goroutine's defer, so an
-	// unsynchronised bool is a check-then-act race that can double-release the
-	// slot (MAX_CONNS silently stops bounding anything) or drop one (a permanent
-	// leak). Found by the soak harness under -race, reproduced with a bare loop
-	// of CONNECT tunnels and no rig.
+	// The slot guards the DIAL/HIJACK phase and is returned when this handler
+	// returns; the relay goroutine also calls releaseSlot, but sync.Once makes
+	// the second call a no-op. sync.Once, NOT a plain `if slotHeld` flag: the
+	// closure can run from BOTH goroutines, so an unsynchronised bool is a
+	// check-then-act race that can double-release the slot or drop one (a
+	// permanent leak). Found by the soak harness under -race.
+	//
+	// MAX_CONNS therefore bounds concurrent bridge setup work, not how many
+	// live tunnels a client may hold. That is deliberate: browsers and
+	// Telegram keep many long-lived media sockets, and enforcing the cap on
+	// them would return 503 for new segments while the existing tunnels are
+	// idle. The idle deadline reclaims genuinely dead tunnels.
 	var releaseOnce sync.Once
 	releaseSlot := func() { releaseOnce.Do(func() { connSem <- struct{}{} }) }
 	defer releaseSlot()
@@ -350,7 +363,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, brw, err := hijacker.Hijack()
 	if err != nil {
 		_ = destConn.Close()
 		return
@@ -363,20 +376,37 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 		return
 	}
 
+	// A fast client may pipeline the first tunnel bytes (typically the TLS
+	// ClientHello) into the same packet as the CONNECT request. The HTTP
+	// server has already read those bytes into the hijacked bufio.Reader;
+	// discarding brw (the old `_` in Hijack) silently dropped them, and the
+	// upstream then waited for a handshake that would never be re-sent.
+	if brw != nil && brw.Reader.Buffered() > 0 {
+		early, _ := brw.Reader.Peek(brw.Reader.Buffered())
+		// The target may stop reading; this write is still part of the setup
+		// phase and must not pin the handler/slot forever.
+		_ = destConn.SetWriteDeadline(time.Now().Add(bridgeUpstreamDeadline))
+		_, werr := destConn.Write(early)
+		_ = destConn.SetWriteDeadline(time.Time{})
+		if werr != nil {
+			debugLog("early tunnel bytes failed: %v", werr)
+			_ = destConn.Close()
+			_ = clientConn.Close()
+			return
+		}
+	}
+
 	// Any byte in either direction proves the tunnel live (the 200 above only
 	// proved the dial), and every later batch re-proves it — see relay. A
 	// timestamp is idempotent, so the repeat fires cost nothing but the ledger
 	// entry that keeps a long-lived connection from ageing out of the guard.
 	egress := func() { noteEgress(httpPort) }
-	// Hand the slot to the relays: released once BOTH directions finish, so one
-	// tunnel occupies exactly one connection slot for its whole life.
+	// The relay owns both connections from here. The connection slot was
+	// acquired for the dial/hijack phase and is returned when this handler
+	// exits (see above); keeping MAX_CONNS off live tunnels is deliberate.
 	go func() {
 		defer releaseSlot()
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); relay(destConn, clientConn, egress) }()
-		go func() { defer wg.Done(); relay(clientConn, destConn, egress) }()
-		wg.Wait()
+		relayPair(destConn, clientConn, egress)
 	}()
 }
 
@@ -384,6 +414,21 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, 
 // asserts) that the plain-HTTP body phase uses a re-armed idle budget rather
 // than one absolute wall. A const so the invariant is checkable by the suite.
 const plainBodyIsIdleBudget = true
+
+// idleWriteConn turns a write deadline into an IDLE budget: every successful
+// Write pushes the deadline forward. Request.Write() uses it to stream an
+// arbitrarily large request body without inheriting one absolute wall.
+type idleWriteConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c idleWriteConn) Write(p []byte) (int, error) {
+	if c.idle > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	}
+	return c.Conn.Write(p)
+}
 
 // copyBodyIdle streams a response body under an IDLE budget: conn's deadline is
 // re-armed after every chunk that actually moves bytes, so a large transfer is
@@ -412,6 +457,15 @@ func copyBodyIdle(w io.Writer, body io.Reader, conn net.Conn) (int64, error) {
 		_ = conn.SetDeadline(now.Add(relayIdleDeadline))
 		lastArm = now
 	}
+	// Go's ResponseWriter buffers ~4KiB. A live stream (SSE, chunked event
+	// feed, long-poll body) whose chunks are smaller than that would sit in
+	// the buffer until the next chunk or EOF, which reads as a stall to the
+	// client. Flushing after every delivered chunk makes each one visible
+	// immediately; for bulk 64KiB copies Flush is a no-op on an empty buffer.
+	var flush func()
+	if f, ok := w.(http.Flusher); ok {
+		flush = f.Flush
+	}
 	var total int64
 	for {
 		n, readErr := body.Read(buf)
@@ -420,6 +474,9 @@ func copyBodyIdle(w io.Writer, body io.Reader, conn net.Conn) (int64, error) {
 			total += int64(m)
 			if writeErr != nil {
 				return total, writeErr
+			}
+			if flush != nil {
+				flush()
 			}
 			arm()
 		}
@@ -465,6 +522,33 @@ func relay(dst, src net.Conn, onFlow func()) {
 	relayWithIdle(dst, src, onFlow, relayIdleDeadline)
 }
 
+// relayPair splices two connections in both directions and closes both only
+// after BOTH directions finish. Each direction half-closes the peer on a clean
+// EOF, so a protocol that signals "request complete" with a TCP FIN still gets
+// its response: the old code closed both sockets as soon as the first
+// direction ended, truncating every such exchange. A hard error still tears
+// both down immediately so a dead peer cannot pin the other direction.
+func relayPair(a, b net.Conn, onFlow func()) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); relay(b, a, onFlow) }() // a -> b
+	go func() { defer wg.Done(); relay(a, b, onFlow) }() // b -> a
+	wg.Wait()
+	_ = a.Close()
+	_ = b.Close()
+}
+
+// closeWrite sends FIN without tearing down the read side. *net.TCPConn is the
+// production case; anything else (net.Pipe in tests, a custom Dialer's conn)
+// falls back to a full close, preserving the old end-of-stream behavior.
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	_ = c.Close()
+}
+
 // relayWithIdle is relay with the idle budget injectable so the behaviour is
 // testable in milliseconds instead of minutes.
 //
@@ -481,8 +565,6 @@ func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
 	// in both goroutines issued every keepalive syscall twice for no added
 	// coverage.
 	setKeepAlive(src)
-	defer func() { _ = dst.Close() }()
-	defer func() { _ = src.Close() }()
 
 	// Re-arming both deadlines on EVERY hop is two deadline updates per 32KiB
 	// chunk. The timeout only matters when a peer goes fully silent, so one
@@ -527,6 +609,8 @@ func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
 			}
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				debugLog("relay write ended stream: %v", writeErr)
+				_ = dst.Close()
+				_ = src.Close()
 				return
 			}
 		}
@@ -535,9 +619,15 @@ func relayWithIdle(dst, src net.Conn, onFlow func(), idle time.Duration) {
 			// quiet. A timeout is the one that matters, and it used to be
 			// swallowed completely — which is why a truncated download looked
 			// like a server problem with no trace on our side.
-			if !errors.Is(readErr, io.EOF) {
-				debugLog("relay read ended stream after %s idle: %v", idle, readErr)
+			if errors.Is(readErr, io.EOF) {
+				// Clean end of THIS direction: let the reverse direction keep
+				// draining (a request body FIN must not kill the response).
+				closeWrite(dst)
+				return
 			}
+			debugLog("relay read ended stream after %s idle: %v", idle, readErr)
+			_ = dst.Close()
+			_ = src.Close()
 			return
 		}
 		arm(false)

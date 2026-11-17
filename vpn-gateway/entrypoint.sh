@@ -469,6 +469,43 @@ if [ "$ENABLE_PPTP" = "1" ]; then
   enforce_net "$VPN_PPTP_NET"
 fi
 
+# ---- TCP MSS clamping: stop path-MTU black holes for VPN clients ----
+# Clients often negotiate a 1500-byte inner MTU while their real path is
+# 1492 (PPPoE) or smaller. Small requests then work, but large TLS records
+# vanish - the exact "connects fine, big download stalls" symptom. Clamp
+# the MSS on BOTH SYN directions (client->internet and the SYN-ACK back)
+# to a value that fits IPsec/L2TP/PPTP encapsulation. 0 disables it.
+VPN_MSS="${VPN_MSS:-1360}"
+case "$VPN_MSS" in
+  0)
+    log "TCP MSS clamping disabled (VPN_MSS=0)."
+    ;;
+  ''|*[!0-9]*)
+    die "VPN_MSS must be 0 or an integer between 536 and 1460 (got '$VPN_MSS')."
+    ;;
+  *)
+    [ "$VPN_MSS" -ge 536 ] && [ "$VPN_MSS" -le 1460 ] \
+      || die "VPN_MSS must be 0 or an integer between 536 and 1460 (got '$VPN_MSS')."
+    clamp_mss() {
+      _net="$1"
+      for _dir in s d; do
+        iptables -t mangle -C FORWARD -"$_dir" "$_net" -p tcp \
+          --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$VPN_MSS" 2>/dev/null \
+          || iptables -t mangle -A FORWARD -"$_dir" "$_net" -p tcp \
+             --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$VPN_MSS" \
+          || warn "cannot clamp TCP MSS for $_net (-$_dir); large transfers may stall"
+      done
+      log "TCP MSS clamped to $VPN_MSS for $_net (both directions)."
+    }
+    clamp_mss "$VPN_SUBNET"
+    clamp_mss "$VPN_L2TP_NET"
+    if [ "$ENABLE_PPTP" = "1" ]; then
+      clamp_mss "$VPN_PPTP_NET"
+    fi
+    unset _net _dir
+    ;;
+esac
+
 # ---- start charon via distro starter (charon lives under libexec on Alpine) ----
 mkdir -p /var/run/charon /var/log
 rm -f /var/run/charon/charon-vici.sock

@@ -137,8 +137,7 @@ func serveCandidates(client net.Conn, cands []string, trackEgress bool) {
 				}
 			}
 		}
-		go relay(up, client, egress)
-		go relay(client, up, egress)
+		go relayPair(up, client, egress)
 		return
 	}
 	_ = client.Close()

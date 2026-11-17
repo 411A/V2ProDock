@@ -7,8 +7,8 @@ not **grow** without bound.
 
 It is not a benchmark and it is not a correctness test for behaviour. It exists
 because the daemon holds a TCP relay per proxied connection, a goroutine pair
-per relay direction, a 32KiB pooled buffer per direction, one connection-slot
-semaphore entry per live tunnel, and it spawns/kills an xray **child process**
+per relay direction, a 64KiB pooled buffer per direction, one connection-slot
+semaphore entry per bridge handler, and it spawns/kills an xray **child process**
 per upstream switch. None of that shows up in a unit test: a leak is invisible
 until a long-lived tunnel-serving process runs for hours.
 
@@ -107,7 +107,7 @@ workers and its own bookkeeping goroutines).
 | `fds` | `len(os.ReadDir("/proc/self/fd"))` | A socket is not being closed. Closing a loopback socket releases the descriptor immediately — the kernel keeps a `TIME_WAIT` entry, not an fd — so a correct daemon's count is flat and the listener set is fixed for the whole run. |
 | `heap_bytes` | `runtime.ReadMemStats().HeapAlloc`, post-GC | Memory is being *retained*, not merely allocated. Because GC is forced before both ends of the comparison, this is a retention measurement rather than a garbage-rate measurement. |
 | `egress_keys` | `egressNotes` size | The passive-health registry is growing a key per connection instead of one per fixed instance port — e.g. a key minted from an unparsed port. |
-| `slots_held` | `cap(connSem) - len(connSem)` | A tunnel never released its connection slot. The sharpest assertion in the file: `connSem` is pre-filled to cap, so the budget is exactly 0 and any slot still held after the settle is unreleased. With `MAX_CONNS` at its 128 default an unreleased slot is caught after 128 tunnels, long before the goroutine/fd counts drift enough to notice. |
+| `slots_held` | `cap(connSem) - len(connSem)` | A bridge handler never released its connection slot. The sharpest assertion in the file: `connSem` is pre-filled to cap, so the budget is exactly 0 and any slot still held after the settle is unreleased. With `MAX_CONNS` at its 128 default an unreleased setup slot is caught after 128 CONNECTs, long before the goroutine/fd counts drift enough to notice. |
 | `xray_children` | `listXrayPIDs(childDir)` (linux `/proc`) | Processes are being spawned without being reaped. Asserted as an absolute 0 after `Stop`, plus a concurrent-ceiling check while running. |
 | coverage floors | per-path counters | The soak did not exercise enough of a path for its growth bound to mean anything. A soak that silently tested nothing would "prove" bounded growth by never growing. |
 
@@ -140,7 +140,7 @@ numbers are therefore "many leak units", not "a bit of noise".
 | --- | --- | --- |
 | goroutines | `+40` | A relay pair is 2 goroutines plus 1 `net/http` conn goroutine per live connection, so one leaked connection is ~3 goroutines. At the observed rate (below) 40 is reached by a per-connection leak within a couple of seconds of the window opening, while leaving >10x headroom over the single-digit tail a loaded box shows. |
 | fds | `+32` | One leaked descriptor per unclosed connection per side. 32 tolerates a couple of dozen descriptors still held by unwinding relays and by the SOCKS/HTTP fixtures, and still catches a per-tunnel fd leak inside the first second of the window. |
-| heap | `+8MiB` | The pooled relay buffer is `relayBufSize` (32KiB) and a connection holds two of them, so a buffer-per-connection leak reaches 8MiB after ~128 connections — well inside the minimum 10s budget — whereas GC pacing on a loaded box moves `HeapAlloc` by a few MiB between samples. |
+| heap | `+8MiB` | The pooled relay buffer is `relayBufSize` (64KiB) and a connection holds two of them, so a buffer-per-connection leak reaches 8MiB after ~64 connections - well inside the minimum 10s budget - whereas GC pacing on a loaded box moves `HeapAlloc` by a few MiB between samples. |
 | egress keys | `+8` | Every port in play is fixed for the run, so the key count should not move at all. +8 absorbs keys synthesised from ports the OS merely recycled across tests, while still failing if a key is minted per connection. |
 | slots | `+0` | Not a guess: `cap(connSem) - len(connSem)` is exactly 0 when the semaphore is at rest. Any deviation is an unreleased slot. |
 | xray children | `<= 1 + switchWorkerCount()` (= 4 by default) | Derived, not invented. `SwitchToNextExcluding` runs `min(switchWorkerCount(), candidates)` throwaway probes concurrently — each holding a live child — *while the old child keeps serving*, so `1 + switchWorkerCount()` is the honest concurrent bound. Checked from a concurrent sampler every 2.5s, not only between ticks, because a child spawned, orphaned and reaped inside one tick would be invisible to tick-boundary sampling. |
@@ -233,44 +233,13 @@ The final assertion is absolute: **zero** live children after `Stop`, checked
 both inside the phase and again on the final quiesced sample. An orphan holding
 a port fails the soak rather than being left for the next run to trip over.
 
-## Known limitation: one real data race
+## Previously known data race (fixed)
 
-`go test -race` **fails** on this harness. The report is in
-`handleConnect` (`httpproxy.go`):
-
-```go
-slotHeld := true
-releaseSlot := func() {
-    if slotHeld {      // <- unsynchronised read
-        slotHeld = false // <- unsynchronised write
-        connSem <- struct{}{}
-    }
-}
-defer releaseSlot()          // handler goroutine
-...
-go func() {
-    defer releaseSlot()      // relay goroutine
-    ...
-}()
-```
-
-`slotHeld` is a plain `bool` captured by the closure and touched from both the
-handler goroutine (whose `defer` fires as soon as the tunnel is spliced) and the
-relay goroutine (whose `defer` fires when both relay directions finish). Two
-concurrent CONNECT tunnels are enough to trip the detector.
-
-This is a **real production data race**, not a harness artefact: a bare loop of
-200 CONNECT tunnels against a bridge, with no soak rig involved, reproduces it in
-under two seconds. It is also not merely a detector complaint — an unsynchronised
-check-then-act on a release-once flag can double-release the semaphore slot
-(`connSem` over-filled, so `MAX_CONNS` silently stops bounding anything) or drop
-a release entirely (a permanent slot leak). `httpproxy.go` was outside this
-task's file ownership, so it is reported rather than fixed. The fix is a
-`sync.Once` (or an `atomic.Bool` compare-and-swap) around the release.
-
-Everything else in the harness is race-clean: the growth assertions, the
-child-process accounting, the barrier protocol and the fixture wiring all hold
-under `-race`.
+An earlier `handleConnect` used an unsynchronised `slotHeld bool` for the
+connection-slot release. Two goroutines (the handler's defer and the relay's
+defer) touched it, which `-race` caught and which could double-release or
+leak a semaphore slot. It is now a `sync.Once` around the release, so the
+second caller is an idempotent no-op. The soak runs clean under `-race`.
 
 ## What this harness CANNOT detect
 

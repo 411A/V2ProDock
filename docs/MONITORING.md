@@ -71,6 +71,33 @@ daemon handles subscriptions, health checks, and the SOCKS/HTTP bridges.
   is intentionally non-zero. If you do not use the VPN sidecar, leave
   `VPN_ENABLED=0`.
 
+## "It connects, then large transfers stall" — quota or bad hop?
+
+These are different failures and need different fixes:
+
+| Symptom | Likely cause |
+|---|---|
+| CPU% sits at/above the guarantee, `nr_throttled` keeps rising, stalls are variable and affect several flows | Host CPU quota throttling |
+| A repeatable ceiling at the same byte count (~12–16 KB) on one proxy, while another proxy moves the same file | Broken/truncating upstream hop |
+| Large TLS transfers stall but tiny requests work, on every path | Path MTU / MSS (especially VPN clients) |
+
+Check the container's cgroup throttle counters **during** playback:
+
+```bash
+docker exec v2prodock cat /sys/fs/cgroup/cpu.stat 2>/dev/null || \
+  docker exec v2prodock cat /sys/fs/cgroup/cpu/cpu.stat
+```
+
+`nr_throttled` and `throttled_usec` are cumulative. If they grow every few
+seconds while streaming, the host quota — not this code — is the limit. A
+10%-of-a-core guarantee is 100 ms of CPU per second; TLS + proxy crypto for
+sustained 4K video can exceed that even though connecting and small requests
+are fine.
+
+For the truncation test (bytes and checksums, not `HEAD`) and the port layout
+that identifies whether the failing port is even ours, see the README section
+[When a transfer stops at ~12 KB](../README.md#when-a-transfer-stops-at-12-kb).
+
 ## If throttling happens again
 
 Capture the evidence the provider asks for **during** the spike, with a

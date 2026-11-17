@@ -41,6 +41,11 @@ services:
       - CLEAN_IP_MAP=${CLEAN_IP_MAP:-}
       - SWITCH_WORKERS=${SWITCH_WORKERS:-3}
       - XRAY_FRAGMENT=${XRAY_FRAGMENT:-0}
+      # Optional per-socket congestion control for the xray upstream dials.
+      # Empty = kernel default (usually cubic). "bbr" is the single biggest
+      # sustained-throughput win on a lossy long-haul link; the daemon verifies
+      # kernel support before rendering it.
+      - XRAY_TCP_CONGESTION=${XRAY_TCP_CONGESTION:-}
       - XRAY_DIR=${XRAY_DIR:-/root/xray}
       - GOGC=${GOGC:-100}
       - GOMEMLIMIT=${GOMEMLIMIT:-128MiB}
@@ -123,6 +128,9 @@ services:
       - VPN_L2TP_LOCAL=${VPN_L2TP_LOCAL:-10.10.11.1}
       - VPN_L2TP_RANGE=${VPN_L2TP_RANGE:-10.10.11.10-10.10.11.100}
       - VPN_ALLOW_PLAIN_L2TP=${VPN_ALLOW_PLAIN_L2TP:-0}
+      # TCP MSS clamp for VPN client flows (both SYN directions). 1360 fits
+      # IPsec/L2TP/PPTP overhead on a 1500-byte path; 0 disables.
+      - VPN_MSS=${VPN_MSS:-1360}
       - VPN_ENABLE_PPTP=${VPN_ENABLE_PPTP:-0}
       - VPN_PPTP_NET=${VPN_PPTP_NET:-10.10.12.0/24}
       - VPN_PPTP_LOCAL=${VPN_PPTP_LOCAL:-10.10.12.1}

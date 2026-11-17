@@ -211,6 +211,60 @@ In-flight long-polls on a truly dead upstream still break (TCP is TCP) —
 reconnect, don't restart the whole gateway. Query `GET /health` once to
 discover the aggregate addresses if you customized the ports.
 
+### When a transfer stops at ~12 KB
+
+A proxy that completes the TLS handshake but cuts every sizable body at a
+fixed size (commonly one TLS record, ~12–16 KB) is **broken, not slow**. A
+`HEAD` request or the 204 used by health checks still succeeds, so the pool
+keeps selecting it: probes are deliberately tiny and cannot see truncation.
+Package installs, `git clone`, Docker pulls and large uploads will fail
+intermittently while small API calls look fine.
+
+First identify the port. This stack publishes **27000-27017** and
+**27019-27100**; per-instance ports start at `PORT_BASE` (`27019` by
+default) and aggregates are `27015-27017`. A port like `27910` is outside
+that range unless you changed `PORT_BASE`/the compose mapping, so it is
+normally an upstream node or a different tool. Confirm with:
+
+```bash
+docker compose config | grep -A4 'ports:'
+curl -s http://127.0.0.1:27018/health
+curl -s http://127.0.0.1:27018/proxies
+```
+
+Measure bytes, not status codes, and compare checksums. Test each hop
+(upstream SOCKS, per-instance HTTP, aggregate) so the broken layer is
+obvious:
+
+```bash
+URL='https://speed.cloudflare.com/__down?bytes=10000000'
+curl -fsS --proxy http://HOST:PORT -o /tmp/proxied.bin \
+     -w 'http=%{http_code} bytes=%{size_download} speed=%{speed_download}\n' "$URL"
+sha256sum /tmp/proxied.bin
+# Same URL with the upstream SOCKS port:
+curl -fsS --socks5-hostname HOST:SOCKS_PORT -o /tmp/socks.bin "$URL"
+```
+
+If one upstream truncates, remove that subscription/node from the pool;
+`AGG_MIN_STREAK` and the health checks cannot quarantine a node that passes
+small probes. If **all** paths truncate, check the host's CPU quota first —
+see [docs/MONITORING.md](docs/MONITORING.md) — then test with
+`XRAY_TCP_CONGESTION=bbr` on a lossy link. On a 10%-of-a-core plan, sustained
+video/TLS crypto can exceed the guarantee and look like packet loss, but a
+precise, repeatable ~12 KB ceiling is almost always a bad proxy hop, not CPU.
+
+Transport notes:
+
+- **TCP** (HTTPS/HTTP, YouTube, Telegram files, git, package installs) is
+  carried end-to-end by the relay. The bridge is byte-transparent and has
+  multi-megabyte regression tests in `v2proxy/transfer_test.go`.
+- **UDP** is not carried by the HTTP bridge or the aggregate TCP relays.
+  Xray's direct SOCKS UDP relay returns a container-side address plus an
+  ephemeral port, which Docker's published-port NAT cannot reach from
+  outside; the VPN gateway works because it sits on the same Docker network.
+  For external UDP (QUIC/calls), use the VPN gateway, not a published SOCKS
+  port.
+
 ## Usage
 
 ### From Python (multi-instance)
@@ -513,11 +567,12 @@ Environment variables (set in `.env` or via docker-compose):
 | `AGG_MIN_STREAK` | `3` | Aggregate prefers this-consecutive-successes stability over raw latency (`0` = fastest wins) |
 | `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
 | `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |
+| `XRAY_TCP_CONGESTION` | — | Per-socket congestion control for upstream dials (e.g. `bbr`); verified against the kernel, ignored if unavailable |
 | `CLEAN_IP_MAP` | — | L2 escape hatch: `blocked.edge=working.edge.ip,...` swaps the dial address at ingest (SNI/Host/UUID untouched); find winners via `scripts/cleanip-scan.sh` |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
-| `MAX_CONNS` | `128` | Max concurrent HTTP CONNECT relay connections |
+| `MAX_CONNS` | `128` | Max concurrent HTTP bridge handlers (CONNECT dial/hijack; full plain-HTTP exchange). Live CONNECT tunnels are not counted — raise for many parallel clients |
 | `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |
 | `NO_COLOR` / `LOG_COLOR` | unset | Set either to disable log colors (auto-off without a TTY) |
 | `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |
@@ -527,6 +582,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `VPN_L2TP_NET` | `10.10.11.0/24` | L2TP client pool (forwarded to tun0 only) |
 | `VPN_L2TP_LOCAL` / `VPN_L2TP_RANGE` | `10.10.11.1` / `10.10.11.10-10.10.11.100` | L2TP server address + client range (must sit inside the /24) |
 | `VPN_ALLOW_PLAIN_L2TP` | `0` | `1` = allow bare L2TP without IPsec (CLEARTEXT — old firmware only) |
+| `VPN_MSS` | `1360` | TCP MSS clamp for VPN clients (both SYN directions; `0` disables) |
 | `VPN_ENABLE_PPTP` | `0` | `1` = serve PPTP on TCP 1723+GRE (ancient LAN devices only, MPPE-128 mandatory) |
 | `VPN_PPTP_NET` | `10.10.12.0/24` | PPTP client pool (forwarded to tun0 only) |
 | `VPN_PPTP_LOCAL` / `VPN_PPTP_RANGE` | `10.10.12.1` / `10.10.12.10-10.10.12.100` | PPTP server address + client range (must sit inside the /24) |
