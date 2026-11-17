@@ -107,11 +107,12 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies sorted by latency (lowest first); each carries `ok_streak` (consecutive successful checks) — prefer high streaks over merely low latency for long-polling bots |
-| `/all` | GET | All instances including down ones |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1}` + stable `aggregate_socks`/`aggregate_http` endpoints |
+| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, latency-ordered within each tier; each carries `endpoint`, `memo`, `degraded`, and `ok_streak` |
+| `/all` | GET | All instances including down ones (same quality fields) |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
+| `/memo` | POST | Attach or clear a quality note for an upstream endpoint (`{"endpoint":"host:port","memo":"..."}`); it stays alive but ranks after every clean node |
 | `/check` | POST/GET | Per-URL reachability: which proxies can actually reach *this* destination (see below) |
 
 #### `/check` — dynamic URL check
@@ -178,6 +179,41 @@ Notes:
   pool is never swept per request.
 - **Cached 60s** per probe URL; concurrent identical requests share one round
   of probing. `cached:true` in the response means the answer is up to 60s old.
+
+#### `/memo` — mark a usable-but-broken node
+
+Health checks are deliberately tiny, so a node that truncates large transfers
+can pass every probe. A memo records that known quality problem **without
+marking the node down**: it stays in the pool as the deliberate last resort,
+but ranks after every clean node and carries the warning in the API.
+
+```bash
+# Record the finding from the 10 MB + sha256 test
+curl -s -X POST localhost:27018/memo \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"203.0.113.9:443","memo":"truncates >12KB; downloads and uploads fail"}'
+
+# Clear it after the node is replaced/fixed
+curl -s -X POST localhost:27018/memo \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"203.0.113.9:443","memo":""}'
+```
+
+`/proxies` then shows that entry with `"degraded":true`, its `memo`, and
+`endpoint`; it appears after all clean entries. When every alive node is
+degraded, `/health` returns `"fallback_only":true` plus a warning, meaning
+small requests may work but large transfers probably won't.
+
+Memos are keyed by the upstream `host:port`, not by the local instance port:
+when failover switches the instance to a different node, the old memo does not
+follow the port. Seed them at boot with `PROXY_MEMOS` (comma-separated
+`endpoint=memo`, no commas inside a memo):
+
+```env
+PROXY_MEMOS="203.0.113.9:443=truncates >12KB; downloads/uploads fail"
+```
+
+### Stable endpoints (bots & long-polling clients)
 - **SSRF guard.** The probe dials *from the upstream*, so a request for a
   private address would scan the *upstream's* LAN or cloud metadata. Loopback,
   RFC1918, link-local, `.local`/`.internal`/`.home.arpa` and single-label hosts
@@ -245,10 +281,13 @@ sha256sum /tmp/proxied.bin
 curl -fsS --socks5-hostname HOST:SOCKS_PORT -o /tmp/socks.bin "$URL"
 ```
 
-If one upstream truncates, remove that subscription/node from the pool;
-`AGG_MIN_STREAK` and the health checks cannot quarantine a node that passes
-small probes. If **all** paths truncate, check the host's CPU quota first —
-see [docs/MONITORING.md](docs/MONITORING.md) — then test with
+If one upstream truncates, record it with `POST /memo` (or seed
+`PROXY_MEMOS`): it stays alive as the deliberate last resort but ranks after
+every clean node, and `/proxies` shows the warning. Remove the subscription/node
+entirely if you do not want it used even as a fallback. `AGG_MIN_STREAK` and the
+health checks cannot detect truncation on their own, because their probes are
+tiny. If **all** paths truncate, check the host's CPU quota first — see
+[docs/MONITORING.md](docs/MONITORING.md) — then test with
 `XRAY_TCP_CONGESTION=bbr` on a lossy link. On a 10%-of-a-core plan, sustained
 video/TLS crypto can exceed the guarantee and look like packet loss, but a
 precise, repeatable ~12 KB ceiling is almost always a bad proxy hop, not CPU.
@@ -573,6 +612,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOGC` | `100` | Go GC target percentage (lower = more frequent GC, less memory) |
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP bridge handlers (CONNECT dial/hijack; full plain-HTTP exchange). Live CONNECT tunnels are not counted — raise for many parallel clients |
+| `PROXY_MEMOS` | — | Comma-separated `endpoint=memo` quality notes (e.g. `203.0.113.9:443=truncates >12KB; downloads fail`); memo'd nodes stay servable but rank last |
 | `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |
 | `NO_COLOR` / `LOG_COLOR` | unset | Set either to disable log colors (auto-off without a TTY) |
 | `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |

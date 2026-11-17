@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func findFreePort(start int) int {
@@ -69,6 +71,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		total := manager.InstanceCount()
 		alive := manager.AliveCount()
 		starting := manager.StartingCount()
+		degraded := manager.DegradedCount()
 		status := "ok"
 		if alive == 0 {
 			status = "degraded"
@@ -78,6 +81,14 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"instances": total,
 			"alive":     alive,
 			"starting":  starting,
+			"degraded":  degraded,
+		}
+		// Every alive node carries a quality memo: service continues (small
+		// requests may be fine) but the caller must not expect large transfers
+		// to complete. Explicit, because "alive" alone is misleading here.
+		if alive > 0 && degraded >= alive {
+			body["fallback_only"] = true
+			body["warning"] = "all alive proxies carry quality memos; large downloads/uploads may fail"
 		}
 		// Stable endpoints for clients that must never rewrite config: query
 		// once, use forever — per-connection routing survives every switch.
@@ -129,6 +140,50 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "refreshing"}); err != nil {
 			debugLog("encode /refresh failed: %v", err)
+		}
+	})
+
+	// Quality memo: an operator or monitoring agent that proved a node is
+	// unusable for large transfers records it here. The node stays alive (it
+	// may be the only path), but it is ranked after every clean node and the
+	// note is exposed on /proxies + /all. POST-only like /refresh.
+	mux.HandleFunc("POST /memo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		var req struct {
+			Endpoint string `json:"endpoint"`
+			Memo     string `json:"memo"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req)
+		if req.Endpoint == "" {
+			req.Endpoint = r.URL.Query().Get("endpoint")
+		}
+		if req.Memo == "" {
+			req.Memo = r.URL.Query().Get("memo")
+		}
+		endpoint := normalizeEndpoint(req.Endpoint)
+		if endpoint == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "endpoint required"})
+			return
+		}
+		if len(endpoint) > 255 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "endpoint too long"})
+			return
+		}
+		memo := strings.TrimSpace(req.Memo)
+		if len(memo) > 500 {
+			memo = memo[:500]
+		}
+		manager.SetMemo(endpoint, memo)
+		infoLog("memo: %s -> %q", endpoint, memo)
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ok",
+			"endpoint": endpoint,
+			"memo":     memo,
+		}); err != nil {
+			debugLog("encode /memo failed: %v", err)
 		}
 	})
 

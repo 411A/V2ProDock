@@ -50,6 +50,9 @@ services:
       - GOGC=${GOGC:-100}
       - GOMEMLIMIT=${GOMEMLIMIT:-128MiB}
       - MAX_CONNS=${MAX_CONNS:-128}
+      # Known quality problems per upstream endpoint (host:port=memo,...).
+      # Memo'd nodes stay alive but rank last; exposed on /proxies.
+      - PROXY_MEMOS=${PROXY_MEMOS:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NO_PROXY=127.0.0.1,localhost,host.docker.internal,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
     # Real liveness: a wedged Go process still passes `kill -0 1` but serves

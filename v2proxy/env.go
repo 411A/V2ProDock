@@ -87,6 +87,27 @@ func aggMinStreak() int {
 	return n
 }
 
+// parseProxyMemos parses PROXY_MEMOS: comma-separated endpoint=memo entries.
+// The endpoint is the normalized host:port shown in /proxies. A memo may not
+// contain a comma (it would start the next entry), but spaces, ';', '>' and
+// '=' are fine. Empty keys/values are ignored; a later duplicate wins.
+func parseProxyMemos(raw string) map[string]string {
+	out := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		key, memo, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		key = normalizeEndpoint(key)
+		memo = strings.TrimSpace(memo)
+		if key == "" || memo == "" {
+			continue
+		}
+		out[key] = memo
+	}
+	return out
+}
+
 // tcpCongestion parses XRAY_TCP_CONGESTION: a kernel congestion-control
 // algorithm name applied per outbound socket (e.g. bbr). Empty/off by default
 // (zero behavior change); garbage is ignored with a warning rather than

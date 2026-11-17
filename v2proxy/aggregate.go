@@ -160,11 +160,35 @@ func (m *ProxyManager) aggregateRelayCandidates() []string {
 	return m.candidateLadder(false, true)
 }
 
-// orderAlive is the streak partition both candidate ladders share: the relay
-// ladder must rank nodes exactly like the direct ladder, or one path would
-// prefer a node the other path distrusts. Pure and side-effect free so the
-// same ordering rule is used by the cache builder and any future caller.
+// orderAlive is the routing order both candidate ladders share. Clean
+// instances always come before memo'd (degraded) ones: a node that truncates
+// large transfers must not be chosen while any clean node is alive, but it
+// stays in the ladder as the last resort instead of being discarded. Within
+// each tier the stability partition applies, so the relay ladder ranks nodes
+// exactly like the direct ladder.
 func orderAlive(alive []InstanceStatus, minStreak int) []InstanceStatus {
+	if len(alive) == 0 {
+		return alive
+	}
+	clean := make([]InstanceStatus, 0, len(alive))
+	degraded := make([]InstanceStatus, 0, len(alive))
+	for _, s := range alive {
+		if s.Degraded {
+			degraded = append(degraded, s)
+		} else {
+			clean = append(clean, s)
+		}
+	}
+	out := make([]InstanceStatus, 0, len(alive))
+	out = append(out, orderStable(clean, minStreak)...)
+	out = append(out, orderStable(degraded, minStreak)...)
+	return out
+}
+
+// orderStable is the streak partition: qualified (streak >= minStreak) before
+// the rest. The caller's order is preserved inside each partition, and the
+// input is already latency-sorted by buildCacheLocked.
+func orderStable(alive []InstanceStatus, minStreak int) []InstanceStatus {
 	if len(alive) == 0 || minStreak <= 0 {
 		return alive
 	}

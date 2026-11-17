@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math/rand"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,16 @@ type InstanceStatus struct {
 	LatMs   int64         `json:"latency_ms"`
 	Name    string        `json:"name"`
 	Error   string        `json:"error,omitempty"`
+	// Endpoint is the active upstream identity (host:port). It is the key a
+	// caller uses to attach a memo: truncation is a property of the remote
+	// node, not of this instance's local port, and the node changes on switch.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Memo is a free-text quality note (e.g. "truncates >12KB; downloads and
+	// uploads fail"). A memo'd instance is still alive and still eligible when
+	// nothing clean remains, but it is ranked behind every clean instance.
+	// Degraded is the machine-readable form of Memo != "".
+	Memo     string `json:"memo,omitempty"`
+	Degraded bool   `json:"degraded,omitempty"`
 	// Stability signals: consecutive successful health checks on the current
 	// upstream, and when it was adopted. Long-polling clients should prefer
 	// high streaks over merely low latency (stable-slow beats flappy-fast).
@@ -41,6 +52,11 @@ type ProxyManager struct {
 	aggSocks      string
 	aggHTTP       string
 	aggRelay      string
+	// memos are quality notes keyed by upstream endpoint (lowercased
+	// host:port). They never mark an instance down: a memo'd node is the
+	// deliberate last resort, not a failure. Seeded by PROXY_MEMOS and updated
+	// by POST /memo; guarded by mu.
+	memos map[string]string
 	// cache is the routing ladder derived from statuses. It is written only by
 	// status writes (health tick / refresh, under mu) and read lock-free by
 	// every aggregate connection. A pointer swap means reader and writer never
@@ -139,6 +155,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		checkInterval: checkInterval,
 		statuses:      make([]InstanceStatus, instanceCount),
 		urlChecks:     newURLCheckCache(),
+		memos:         parseProxyMemos(os.Getenv("PROXY_MEMOS")),
 	}
 
 	// Port layout: all SOCKS5 ports first, then all HTTP ports, then (relay
@@ -276,10 +293,92 @@ func (m *ProxyManager) buildExcluding(i int) map[string]int {
 	return used
 }
 
+func normalizeEndpoint(endpoint string) string {
+	return strings.ToLower(strings.TrimSpace(endpoint))
+}
+
+// memoForLocked returns the quality note attached to an endpoint. Caller holds
+// m.mu (or owns the manager exclusively). Nil maps are valid: tests construct
+// &ProxyManager{} directly.
+func (m *ProxyManager) memoForLocked(endpoint string) string {
+	if m.memos == nil {
+		return ""
+	}
+	return m.memos[normalizeEndpoint(endpoint)]
+}
+
+// applyQualityLocked copies the active upstream identity and its memo into one
+// status row. The memo travels with the ENDPOINT, not the local port: when an
+// instance switches configs, the old note must not follow the port to a
+// different node.
+func (m *ProxyManager) applyQualityLocked(i int) {
+	if i < 0 || i >= len(m.statuses) || i >= len(m.instances) {
+		return
+	}
+	cfg := m.instances[i].ActiveConfig()
+	if cfg == nil {
+		m.statuses[i].Endpoint = ""
+		m.statuses[i].Memo = ""
+		m.statuses[i].Degraded = false
+		return
+	}
+	m.statuses[i].Endpoint = cfg.Endpoint
+	memo := m.memoForLocked(cfg.Endpoint)
+	m.statuses[i].Memo = memo
+	m.statuses[i].Degraded = memo != ""
+}
+
+// SetMemo attaches (or clears, when memo is empty) a quality note to an
+// upstream endpoint and republishes the routing ladder. A memo'd endpoint is
+// still alive and still servable: it ranks after every clean instance, so it
+// is the deliberate last resort instead of being discarded.
+func (m *ProxyManager) SetMemo(endpoint, memo string) {
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		return
+	}
+	memo = strings.TrimSpace(memo)
+	if len(memo) > 500 {
+		memo = memo[:500]
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if memo == "" {
+		delete(m.memos, endpoint)
+	} else {
+		if m.memos == nil {
+			m.memos = make(map[string]string)
+		}
+		m.memos[endpoint] = memo
+	}
+	for i := range m.statuses {
+		if normalizeEndpoint(m.statuses[i].Endpoint) == endpoint {
+			m.statuses[i].Memo = memo
+			m.statuses[i].Degraded = memo != ""
+		}
+	}
+	m.buildCacheLocked()
+}
+
+// DegradedCount reports alive instances carrying a quality memo.
+func (m *ProxyManager) DegradedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, s := range m.statuses {
+		if s.Status == "ok" && s.Degraded {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *ProxyManager) markDown(i int, errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if i >= 0 && i < len(m.statuses) {
+		m.applyQualityLocked(i)
 		m.statuses[i].Status = "down"
 		m.statuses[i].Error = errMsg
 		m.buildCacheLocked()
@@ -391,6 +490,7 @@ func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
 	if i >= 0 && i < len(m.statuses) {
 		m.statuses[i].Status = "ok"
 		m.statuses[i].Error = ""
+		m.applyQualityLocked(i)
 		if name != "" {
 			m.statuses[i].Name = name
 		}
@@ -886,6 +986,15 @@ func (m *ProxyManager) GetAliveStatuses() []InstanceStatus {
 	m.mu.Unlock()
 
 	slices.SortFunc(alive, func(a, b InstanceStatus) int {
+		// Aware clients see the warning on the entry itself, and the list keeps
+		// clean nodes first so a naive client that takes proxies[0] does not
+		// start with a known-truncating node. Within each tier latency wins.
+		if a.Degraded != b.Degraded {
+			if a.Degraded {
+				return 1
+			}
+			return -1
+		}
 		return cmp.Compare(a.LatMs, b.LatMs)
 	})
 
