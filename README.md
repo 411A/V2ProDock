@@ -107,9 +107,9 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, latency-ordered within each tier; each carries `endpoint`, `memo`, `degraded`, and `ok_streak` |
+| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, then measured throughput class, latency; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `bulk_usable`, and `ok_streak` |
 | `/all` | GET | All instances including down ones (same quality fields) |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 | `/memo` | POST | Attach or clear a quality note for an upstream endpoint (`{"endpoint":"host:port","memo":"..."}`); it stays alive but ranks after every clean node |
@@ -179,6 +179,16 @@ Notes:
   pool is never swept per request.
 - **Cached 60s** per probe URL; concurrent identical requests share one round
   of probing. `cached:true` in the response means the answer is up to 60s old.
+- **SSRF guard.** The probe dials *from the upstream*, so a request for a
+  private address would scan the *upstream's* LAN or cloud metadata. Loopback,
+  RFC1918, link-local, `.local`/`.internal`/`.home.arpa` and single-label hosts
+  are refused with HTTP 400. Limitation, stated plainly: only the literal is
+  validated — a public hostname that resolves to `169.254.169.254` at the
+  upstream cannot be detected from here. **Do not expose this endpoint to
+  untrusted callers.**
+- A check that completes but finds nothing is HTTP **200** with an empty
+  `alive[]` — that is the answer you asked for. HTTP 400 means the request
+  itself was unusable (bad scheme, refused target, malformed body).
 
 #### `/memo` — mark a usable-but-broken node
 
@@ -213,17 +223,42 @@ follow the port. Seed them at boot with `PROXY_MEMOS` (comma-separated
 PROXY_MEMOS="203.0.113.9:443=truncates >12KB; downloads/uploads fail"
 ```
 
-### Stable endpoints (bots & long-polling clients)
-- **SSRF guard.** The probe dials *from the upstream*, so a request for a
-  private address would scan the *upstream's* LAN or cloud metadata. Loopback,
-  RFC1918, link-local, `.local`/`.internal`/`.home.arpa` and single-label hosts
-  are refused with HTTP 400. Limitation, stated plainly: only the literal is
-  validated — a public hostname that resolves to `169.254.169.254` at the
-  upstream cannot be detected from here. **Do not expose this endpoint to
-  untrusted callers.**
-- A check that completes but finds nothing is HTTP **200** with an empty
-  `alive[]` — that is the answer you asked for. HTTP 400 means the request
-  itself was unusable (bad scheme, refused target, malformed body).
+#### Bulk throughput gate
+
+Health probes are 204s: a node can answer in 500 ms and then carry 1 KB/s. The
+gate fetches a real 512 KiB body through each instance's SOCKS port on
+promotion and every 5 minutes (two workers at a time, skipped when a client
+carried bytes in the last 5 s). Results are visible as:
+
+```json
+{"throughput_kbps": 7264, "bulk_usable": true}
+```
+
+`throughput_kbps` is kilobits/s (divide by 8 for KB/s). A node is demoted to
+the same **last-resort** lane as a memo after two consecutive low/partial
+bodies; one good body promotes it immediately. A node is never marked down.
+Ordering within the clean and degraded partitions is: measured throughput
+class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown), then the
+`AGG_MIN_STREAK` stability partition, then latency.
+
+`/health` exposes `usable_bulk` and `bulk_measured`; once at least one node
+has been measured, a pool with `usable_bulk:0` reports `status:"degraded"` and
+a `bulk_warning`, because small probes are not evidence of bulk capacity.
+
+Tune or disable it:
+
+```env
+THROUGHPUT_CHECK=1
+THROUGHPUT_FLOOR_KBPS=800        # 800 kbps ≈ 100 KB/s
+THROUGHPUT_INTERVAL_SECS=300
+THROUGHPUT_CHECK_BYTES=524288
+THROUGHPUT_CHECK_URL=https://speed.cloudflare.com/__down?bytes=%d
+# THROUGHPUT_CHECK=0            # metered host or blocked target
+```
+
+Repeated short **plain-HTTP** bodies (Content-Length not satisfied) are counted
+per endpoint; after 3, the node is auto-memo'd. HTTPS/CONNECT bodies are opaque
+to the bridge, so those are covered by the throughput gate instead.
 
 ### Stable endpoints (bots & long-polling clients)
 
@@ -283,14 +318,17 @@ curl -fsS --socks5-hostname HOST:SOCKS_PORT -o /tmp/socks.bin "$URL"
 
 If one upstream truncates, record it with `POST /memo` (or seed
 `PROXY_MEMOS`): it stays alive as the deliberate last resort but ranks after
-every clean node, and `/proxies` shows the warning. Remove the subscription/node
-entirely if you do not want it used even as a fallback. `AGG_MIN_STREAK` and the
-health checks cannot detect truncation on their own, because their probes are
-tiny. If **all** paths truncate, check the host's CPU quota first — see
-[docs/MONITORING.md](docs/MONITORING.md) — then test with
-`XRAY_TCP_CONGESTION=bbr` on a lossy link. On a 10%-of-a-core plan, sustained
-video/TLS crypto can exceed the guarantee and look like packet loss, but a
-precise, repeatable ~12 KB ceiling is almost always a bad proxy hop, not CPU.
+every clean node, and `/proxies` shows the warning. The bulk gate below also
+catches a node that cannot carry a 512 KiB body; memos remain useful for
+problems the gate cannot see (upload-only breakage, intermittent truncation).
+Remove the subscription/node entirely if you do not want it used even as a
+fallback. `AGG_MIN_STREAK` and the health checks cannot detect truncation on
+their own, because their probes are tiny. If **all** paths truncate, check the
+host's CPU quota first — see [docs/MONITORING.md](docs/MONITORING.md) — then
+test with `XRAY_TCP_CONGESTION=bbr` on a lossy link. On a 10%-of-a-core plan,
+sustained video/TLS crypto can exceed the guarantee and look like packet loss,
+but a precise, repeatable ~12 KB ceiling is almost always a bad proxy hop, not
+CPU.
 
 Transport notes:
 
@@ -605,7 +643,7 @@ Environment variables (set in `.env` or via docker-compose):
 | `AGGREGATE_SOCKS_PORT` / `AGGREGATE_HTTP_PORT` | `27017` / `27016` | Stable single ports routing to the best alive instance (`0` disables) |
 | `AGG_MIN_STREAK` | `3` | Aggregate prefers this-consecutive-successes stability over raw latency (`0` = fastest wins) |
 | `SWITCH_WORKERS` | `3` | Parallel probers per failover (old keeps serving meanwhile) |
-| `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only) |
+| `XRAY_FRAGMENT` | `0` | `1` = TLS-handshake fragmentation for SNI-filtering networks (TLS upstreams only). **Measured trade-off:** anti-RST but pro-throttle — the split ClientHello can trigger shaping; enable only where handshakes are actually RST |
 | `XRAY_TCP_CONGESTION` | — | Per-socket congestion control for upstream dials (e.g. `bbr`); verified against the kernel, ignored if unavailable |
 | `CLEAN_IP_MAP` | — | L2 escape hatch: `blocked.edge=working.edge.ip,...` swaps the dial address at ingest (SNI/Host/UUID untouched); find winners via `scripts/cleanip-scan.sh` |
 | `XRAY_DIR` | `/root/xray` | Path to xray binary directory |
@@ -613,6 +651,11 @@ Environment variables (set in `.env` or via docker-compose):
 | `GOMEMLIMIT` | `128MiB` | Go soft memory limit (prevents OOM by triggering aggressive GC) |
 | `MAX_CONNS` | `128` | Max concurrent HTTP bridge handlers (CONNECT dial/hijack; full plain-HTTP exchange). Live CONNECT tunnels are not counted — raise for many parallel clients |
 | `PROXY_MEMOS` | — | Comma-separated `endpoint=memo` quality notes (e.g. `203.0.113.9:443=truncates >12KB; downloads fail`); memo'd nodes stay servable but rank last |
+| `THROUGHPUT_CHECK` | `1` | `0` disables the bulk gate (metered host or blocked probe target) |
+| `THROUGHPUT_FLOOR_KBPS` | `800` | Demotion floor in kilobits/s (800 ≈ 100 KB/s) |
+| `THROUGHPUT_INTERVAL_SECS` | `300` | Per-instance bulk re-measure cadence |
+| `THROUGHPUT_CHECK_BYTES` | `524288` | Body size for the gate (64 KiB–4 MiB) |
+| `THROUGHPUT_CHECK_URL` | Cloudflare speed test | Body URL (`%d` = configured bytes); must return a real body |
 | `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |
 | `NO_COLOR` / `LOG_COLOR` | unset | Set either to disable log colors (auto-off without a TTY) |
 | `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |

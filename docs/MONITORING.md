@@ -80,6 +80,14 @@ These are different failures and need different fixes:
 | CPU% sits at/above the guarantee, `nr_throttled` keeps rising, stalls are variable and affect several flows | Host CPU quota throttling |
 | A repeatable ceiling at the same byte count (~12–16 KB) on one proxy, while another proxy moves the same file | Broken/truncating upstream hop |
 | Large TLS transfers stall but tiny requests work, on every path | Path MTU / MSS (especially VPN clients) |
+| 204 health checks pass but bulk throughput is 1–7 KB/s on one node | Shaped/throttled upstream; the bulk gate demotes it (`throughput_kbps`, `degraded`) |
+
+`XRAY_FRAGMENT=1` is an anti-RST tool, not a speed setting. Measured on a
+shaped link, the split ClientHello was itself the fingerprint: identical
+ports went from full-speed to 1–7 KB/s with fragment on. Leave it `0` unless
+handshakes are actually being reset, and watch `throughput_kbps` after
+enabling it. The gate demotes a node that collapses, but it cannot undo the
+shaping for a pool that was already working.
 
 Check the container's cgroup throttle counters **during** playback:
 

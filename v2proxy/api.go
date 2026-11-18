@@ -72,16 +72,19 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		alive := manager.AliveCount()
 		starting := manager.StartingCount()
 		degraded := manager.DegradedCount()
+		usableBulk, measuredBulk := manager.BulkStats()
 		status := "ok"
 		if alive == 0 {
 			status = "degraded"
 		}
 		body := map[string]any{
-			"status":    status,
-			"instances": total,
-			"alive":     alive,
-			"starting":  starting,
-			"degraded":  degraded,
+			"status":        status,
+			"instances":     total,
+			"alive":         alive,
+			"starting":      starting,
+			"degraded":      degraded,
+			"usable_bulk":   usableBulk,
+			"bulk_measured": measuredBulk,
 		}
 		// Every alive node carries a quality memo: service continues (small
 		// requests may be fine) but the caller must not expect large transfers
@@ -89,6 +92,12 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		if alive > 0 && degraded >= alive {
 			body["fallback_only"] = true
 			body["warning"] = "all alive proxies carry quality memos; large downloads/uploads may fail"
+		}
+		// Once the bulk gate has measurements, a pool with zero usable nodes is
+		// NOT healthy for real traffic even though every 204 probe passed.
+		if measuredBulk > 0 && usableBulk == 0 {
+			body["status"] = "degraded"
+			body["bulk_warning"] = "no alive proxy passed the bulk throughput check; large transfers may fail"
 		}
 		// Stable endpoints for clients that must never rewrite config: query
 		// once, use forever — per-connection routing survives every switch.

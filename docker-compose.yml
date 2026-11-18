@@ -53,6 +53,14 @@ services:
       # Known quality problems per upstream endpoint (host:port=memo,...).
       # Memo'd nodes stay alive but rank last; exposed on /proxies.
       - PROXY_MEMOS=${PROXY_MEMOS:-}
+      # Bulk throughput gate: fetch a real 512KiB body per instance on
+      # promotion and every 5 minutes. Low nodes are demoted through the same
+      # memo/degraded lane (last resort), never marked down.
+      - THROUGHPUT_CHECK=${THROUGHPUT_CHECK:-1}
+      - THROUGHPUT_FLOOR_KBPS=${THROUGHPUT_FLOOR_KBPS:-800}
+      - THROUGHPUT_INTERVAL_SECS=${THROUGHPUT_INTERVAL_SECS:-300}
+      - THROUGHPUT_CHECK_BYTES=${THROUGHPUT_CHECK_BYTES:-524288}
+      - THROUGHPUT_CHECK_URL=${THROUGHPUT_CHECK_URL:-https://speed.cloudflare.com/__down?bytes=%d}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NO_PROXY=127.0.0.1,localhost,host.docker.internal,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
     # Real liveness: a wedged Go process still passes `kill -0 1` but serves

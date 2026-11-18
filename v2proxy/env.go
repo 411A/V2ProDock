@@ -8,7 +8,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+)
+
+var (
+	throughputFloorWarn    sync.Once
+	throughputIntervalWarn sync.Once
+	throughputBytesWarn    sync.Once
 )
 
 // switchWorkerCount bounds parallel temp-port probing during a switch.
@@ -106,6 +113,77 @@ func parseProxyMemos(raw string) map[string]string {
 		out[key] = memo
 	}
 	return out
+}
+
+// throughputCheckEnabled lets an operator opt out of the bulk fetch entirely
+// (metered links, or a network where the throughput target is blocked).
+func throughputCheckEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("THROUGHPUT_CHECK"))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// throughputFloorKbps is the demotion floor in kilobits/s. 800 kbps ≈ 100 KB/s:
+// enough for a 720p stream, far below a healthy node on the measured links.
+func throughputFloorKbps() int64 {
+	v := strings.TrimSpace(os.Getenv("THROUGHPUT_FLOOR_KBPS"))
+	if v == "" {
+		return throughputFloorKbpsDefault
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 || n > 1_000_000 {
+		throughputFloorWarn.Do(func() { warnLog("THROUGHPUT_FLOOR_KBPS=%q invalid, using %d", v, throughputFloorKbpsDefault) })
+		return throughputFloorKbpsDefault
+	}
+	return n
+}
+
+// throughputInterval is the per-instance re-measure cadence. Clamped to a
+// sensible range so a typo cannot probe every second or once a week.
+func throughputInterval() time.Duration {
+	v := strings.TrimSpace(os.Getenv("THROUGHPUT_INTERVAL_SECS"))
+	if v == "" {
+		return throughputIntervalDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 30 || n > 86400 {
+		throughputIntervalWarn.Do(func() { warnLog("THROUGHPUT_INTERVAL_SECS=%q invalid, using %s", v, throughputIntervalDefault) })
+		return throughputIntervalDefault
+	}
+	return time.Duration(n) * time.Second
+}
+
+// throughputProbeSize bounds the measured body. 64KiB is enough to expose a
+// shaper; 4MiB is the largest we will spend on a background probe.
+func throughputProbeSize() int64 {
+	v := strings.TrimSpace(os.Getenv("THROUGHPUT_CHECK_BYTES"))
+	if v == "" {
+		return throughputProbeBytesDefault
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 64<<10 || n > 4<<20 {
+		throughputBytesWarn.Do(func() { warnLog("THROUGHPUT_CHECK_BYTES=%q invalid, using %d", v, throughputProbeBytesDefault) })
+		return throughputProbeBytesDefault
+	}
+	return n
+}
+
+// throughputProbeURL returns the URL with the configured byte count spliced in.
+// A URL without %d is used verbatim (useful for a fixed test file); the
+// Content-Length then caps the expected body in measureThroughput.
+func throughputProbeURL() string {
+	raw := strings.TrimSpace(os.Getenv("THROUGHPUT_CHECK_URL"))
+	if raw == "" {
+		raw = throughputURLDefault
+	}
+	if strings.Contains(raw, "%d") {
+		// Replace only the byte placeholder: Sprintf would also interpret a
+		// literal %20/%2F in a user-supplied URL and corrupt it.
+		return strings.Replace(raw, "%d", strconv.FormatInt(throughputProbeSize(), 10), 1)
+	}
+	return raw
 }
 
 // tcpCongestion parses XRAY_TCP_CONGESTION: a kernel congestion-control

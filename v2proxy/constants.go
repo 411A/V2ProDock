@@ -218,6 +218,24 @@ const telegramProbeURL = "https://api.telegram.org/"
 // with margin while bounding true-down detection to grace + 3 strikes.
 const egressGrace = 90 * time.Second
 
+// ---- Bulk throughput gate ----
+// A 204 proves handshake, not capacity: a node can answer in 500ms and carry
+// 1 KB/s. Measure a real body through each instance on promotion and on a slow
+// interval, then demote low-throughput nodes through the same memo/degraded
+// path (last resort, never down). The fetch is 512KiB / 8s, so it can never
+// run in the hot path; one worker at a time keeps probe traffic bounded.
+const (
+	throughputProbeBytesDefault = 512 << 10
+	throughputProbeTimeout      = 8 * time.Second
+	throughputProbeWorkers      = 2
+	throughputIntervalDefault   = 5 * time.Minute
+	throughputFloorKbpsDefault  = 800 // 800 kbps ≈ 100 KB/s
+	throughputURLDefault        = "https://speed.cloudflare.com/__down?bytes=%d"
+	// Auto-memo after this many short plain-HTTP bodies from one endpoint.
+	// TLS/CONNECT bodies are opaque, so those are caught by the gate instead.
+	shortTransferMemoAfter = 3
+)
+
 // egressNoteInterval bounds how often a moving stream re-stamps the passive
 // ledger. The ledger only answers "was there traffic within egressGrace", so
 // one stamp per second is exactly as conclusive as one per 32KiB hop, while

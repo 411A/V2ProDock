@@ -116,6 +116,90 @@ func testSingleURLContext(ctx context.Context, proxyAddr, testURL string, timeou
 	}
 }
 
+// ThroughputResult is one bulk-transfer measurement through an instance's
+// SOCKS port. Expected is the body length the target actually promised (after
+// Content-Length clamping); Bytes == Expected with Err == nil is a complete
+// transfer. Kbps is kilobits/s, so divide by 8 for KB/s.
+type ThroughputResult struct {
+	Kbps     int64
+	Bytes    int64
+	Expected int64
+	Status   int
+	Err      error
+	URL      string
+	Elapsed  time.Duration
+}
+
+// measureThroughput dials the target through proxyAddr (an instance's xray
+// SOCKS port) and streams a body without buffering it. It returns partial
+// bytes + elapsed even when the read times out or the peer truncates, so the
+// caller can distinguish "slow" from "no measurement".
+func measureThroughput(proxyAddr, rawURL string, expected int64, timeout time.Duration) ThroughputResult {
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		return ThroughputResult{Err: err, URL: rawURL, Expected: expected}
+	}
+	cd, _ := dialer.(proxy.ContextDialer)
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if cd != nil {
+			return cd.DialContext(ctx, network, addr)
+		}
+		return dialer.Dial(network, addr)
+	}
+	return measureThroughputDial(dial, rawURL, expected, timeout)
+}
+
+func measureThroughputDial(dial func(ctx context.Context, network, addr string) (net.Conn, error),
+	rawURL string, expected int64, timeout time.Duration) ThroughputResult {
+	res := ThroughputResult{URL: rawURL, Expected: expected}
+	if expected <= 0 {
+		expected = throughputProbeBytesDefault
+		res.Expected = expected
+	}
+	transport := &http.Transport{
+		DialContext:           dial,
+		TLSHandshakeTimeout:   healthTLSHandshakeTimeout,
+		ResponseHeaderTimeout: healthResponseHeaderTimeout,
+		MaxIdleConns:          1,
+		IdleConnTimeout:       5 * time.Second,
+		DisableKeepAlives:     true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	defer func() { _ = resp.Body.Close() }()
+	res.Status = resp.StatusCode
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		res.Err = fmt.Errorf("throughput target returned %d", resp.StatusCode)
+		return res
+	}
+	want := expected
+	if resp.ContentLength > 0 && resp.ContentLength < want {
+		want = resp.ContentLength
+	}
+	res.Expected = want
+	start := time.Now()
+	n, readErr := io.CopyN(io.Discard, resp.Body, want)
+	res.Elapsed = time.Since(start)
+	res.Bytes = n
+	res.Err = readErr
+	if res.Elapsed <= 0 {
+		res.Elapsed = time.Millisecond
+	}
+	res.Kbps = int64(float64(n) * 8 / res.Elapsed.Seconds() / 1000)
+	return res
+}
+
 // telegramWorking is the acceptance predicate: any COMPLETED exchange proves
 // Telegram reachability (even a 404 envelope); only transport errors fail.
 // Pure so it stays unit-testable — the SOCKS/TLS transport underneath is the

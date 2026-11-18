@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,14 @@ type InstanceStatus struct {
 	// Degraded is the machine-readable form of Memo != "".
 	Memo     string `json:"memo,omitempty"`
 	Degraded bool   `json:"degraded,omitempty"`
+	// ThroughputKbps is the measured bulk rate (kilobits/s; 0 = not measured).
+	// BulkUsable is true only after a completed fetch at or above the floor.
+	// A low measurement demotes the node via Degraded but never marks it down.
+	ThroughputKbps int64 `json:"throughput_kbps,omitempty"`
+	BulkUsable     bool  `json:"bulk_usable,omitempty"`
+	// throughputAt/lows are scheduler state, not API surface.
+	throughputAt  time.Time
+	lowThroughput int
 	// Stability signals: consecutive successful health checks on the current
 	// upstream, and when it was adopted. Long-polling clients should prefer
 	// high streaks over merely low latency (stable-slow beats flappy-fast).
@@ -57,6 +66,10 @@ type ProxyManager struct {
 	// deliberate last resort, not a failure. Seeded by PROXY_MEMOS and updated
 	// by POST /memo; guarded by mu.
 	memos map[string]string
+	// Throughput probes are background work: a single worker (so a 10-node
+	// pool never bursts 10 x 512KiB at once) and a per-instance in-flight set.
+	throughputSem  chan struct{}
+	throughputBusy map[int]bool
 	// cache is the routing ladder derived from statuses. It is written only by
 	// status writes (health tick / refresh, under mu) and read lock-free by
 	// every aggregate connection. A pointer swap means reader and writer never
@@ -156,6 +169,7 @@ func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subUR
 		statuses:      make([]InstanceStatus, instanceCount),
 		urlChecks:     newURLCheckCache(),
 		memos:         parseProxyMemos(os.Getenv("PROXY_MEMOS")),
+		throughputSem: make(chan struct{}, throughputProbeWorkers),
 	}
 
 	// Port layout: all SOCKS5 ports first, then all HTTP ports, then (relay
@@ -310,22 +324,61 @@ func (m *ProxyManager) memoForLocked(endpoint string) string {
 // applyQualityLocked copies the active upstream identity and its memo into one
 // status row. The memo travels with the ENDPOINT, not the local port: when an
 // instance switches configs, the old note must not follow the port to a
-// different node.
+// different node. Degraded is memo OR a confirmed low throughput measurement;
+// the latter uses the same last-resort lane without inventing a memo.
 func (m *ProxyManager) applyQualityLocked(i int) {
 	if i < 0 || i >= len(m.statuses) || i >= len(m.instances) {
 		return
 	}
 	cfg := m.instances[i].ActiveConfig()
+	port := portOfAddr(m.statuses[i].HTTP)
 	if cfg == nil {
 		m.statuses[i].Endpoint = ""
 		m.statuses[i].Memo = ""
 		m.statuses[i].Degraded = false
+		m.statuses[i].ThroughputKbps = 0
+		m.statuses[i].BulkUsable = false
+		m.statuses[i].lowThroughput = 0
+		m.statuses[i].throughputAt = time.Time{}
+		if port > 0 {
+			setHTTPPortEndpoint(port, "")
+		}
 		return
+	}
+	if prev := m.statuses[i].Endpoint; prev != cfg.Endpoint {
+		// A different node: never inherit the previous node's throughput class
+		// or its measurement clock. The next health tick schedules a fresh one.
+		m.statuses[i].ThroughputKbps = 0
+		m.statuses[i].BulkUsable = false
+		m.statuses[i].lowThroughput = 0
+		m.statuses[i].throughputAt = time.Time{}
 	}
 	m.statuses[i].Endpoint = cfg.Endpoint
 	memo := m.memoForLocked(cfg.Endpoint)
 	m.statuses[i].Memo = memo
-	m.statuses[i].Degraded = memo != ""
+	m.statuses[i].Degraded = memo != "" || throughputLow(&m.statuses[i])
+	if port > 0 {
+		setHTTPPortEndpoint(port, cfg.Endpoint)
+	}
+}
+
+// throughputLow is true only after TWO consecutive measured-low bodies. A
+// single low sample is recorded (ThroughputKbps) but does not demote; error
+// samples with zero bytes are inconclusive and never reach here.
+func throughputLow(s *InstanceStatus) bool {
+	return s.ThroughputKbps > 0 && s.lowThroughput >= 2
+}
+
+func portOfAddr(addr string) int {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return 0
+	}
+	return n
 }
 
 // SetMemo attaches (or clears, when memo is empty) a quality note to an
@@ -355,13 +408,14 @@ func (m *ProxyManager) SetMemo(endpoint, memo string) {
 	for i := range m.statuses {
 		if normalizeEndpoint(m.statuses[i].Endpoint) == endpoint {
 			m.statuses[i].Memo = memo
-			m.statuses[i].Degraded = memo != ""
+			m.statuses[i].Degraded = memo != "" || throughputLow(&m.statuses[i])
 		}
 	}
 	m.buildCacheLocked()
 }
 
-// DegradedCount reports alive instances carrying a quality memo.
+// DegradedCount reports alive instances in the last-resort lane (a quality
+// memo or two confirmed low throughput measurements).
 func (m *ProxyManager) DegradedCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -372,6 +426,144 @@ func (m *ProxyManager) DegradedCount() int {
 		}
 	}
 	return n
+}
+
+// BulkStats reports alive nodes with a completed throughput measurement and
+// those at/above the floor. measured=0 means the gate has not run yet (or is
+// disabled), so callers must not treat 0/0 as a broken pool.
+func (m *ProxyManager) BulkStats() (usable, measured int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.statuses {
+		if s.Status != "ok" {
+			continue
+		}
+		if s.ThroughputKbps > 0 {
+			measured++
+		}
+		if s.BulkUsable {
+			usable++
+		}
+	}
+	return usable, measured
+}
+
+// applyThroughput folds one measurement into the status. A completed body at
+// or above the floor promotes immediately; two consecutive low/partial bodies
+// demote (hysteresis prevents a single bad sample from flapping the pool).
+// Errors with zero bytes are inconclusive and never demote.
+func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.statuses) || m.statuses[i].Endpoint != endpoint {
+		return // instance switched while the probe was in flight
+	}
+	s := &m.statuses[i]
+	s.throughputAt = time.Now()
+	if res.Bytes > 0 && res.Kbps > 0 {
+		s.ThroughputKbps = res.Kbps
+	}
+	complete := res.Err == nil && res.Status >= 200 && res.Status < 300 &&
+		res.Expected > 0 && res.Bytes >= res.Expected &&
+		res.Kbps >= throughputFloorKbps()
+	switch {
+	case complete:
+		s.BulkUsable = true
+		s.lowThroughput = 0
+	case res.Bytes > 0:
+		s.lowThroughput++
+		if s.lowThroughput >= 2 {
+			s.BulkUsable = false
+		}
+	}
+	s.Degraded = s.Memo != "" || throughputLow(s)
+	m.buildCacheLocked()
+}
+
+// maybeMeasureThroughput schedules a background bulk fetch when the instance
+// is due. It never blocks the health loop and never competes with a client that
+// carried bytes in the last 5s. Two workers bound total probe bandwidth.
+func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
+	if !throughputCheckEnabled() {
+		return
+	}
+	m.mu.Lock()
+	if i < 0 || i >= len(m.statuses) {
+		m.mu.Unlock()
+		return
+	}
+	st := m.statuses[i]
+	if st.Status != "ok" || st.Endpoint == "" {
+		m.mu.Unlock()
+		return
+	}
+	if !st.throughputAt.IsZero() && time.Since(st.throughputAt) < throughputInterval() {
+		m.mu.Unlock()
+		return
+	}
+	if m.throughputBusy == nil {
+		m.throughputBusy = make(map[int]bool)
+	}
+	if m.throughputBusy[i] {
+		m.mu.Unlock()
+		return
+	}
+	if m.throughputSem == nil {
+		m.throughputSem = make(chan struct{}, throughputProbeWorkers)
+	}
+	sem := m.throughputSem
+	m.mu.Unlock()
+
+	if egressActive([]int{inst.HTTPPort(), inst.SOCKSPort()}, 5*time.Second) {
+		return // a live tunnel is already proving capacity; don't compete
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		return // another instance's measurement is in flight
+	}
+
+	m.mu.Lock()
+	if m.throughputBusy[i] {
+		m.mu.Unlock()
+		<-sem
+		return
+	}
+	m.throughputBusy[i] = true
+	m.mu.Unlock()
+
+	endpoint := st.Endpoint
+	socksAddr := inst.SOCKSAddr()
+	url := throughputProbeURL()
+	want := throughputProbeSize()
+	go func() {
+		defer func() {
+			<-sem
+			m.mu.Lock()
+			delete(m.throughputBusy, i)
+			m.mu.Unlock()
+		}()
+		res := measureThroughput(socksAddr, url, want, throughputProbeTimeout)
+		m.applyThroughput(i, endpoint, res)
+	}()
+}
+
+// autoMemoShortTransfers turns repeated short plain-HTTP bodies into a memo.
+// The bridge counts by endpoint (TLS bodies are opaque); three truncations is
+// enough to stop trusting the node for bulk without waiting for an operator.
+func (m *ProxyManager) autoMemoShortTransfers(i int) {
+	st := m.statusOf(i)
+	if st.Status != "ok" || st.Endpoint == "" || st.Memo != "" {
+		return
+	}
+	n := shortTransferCount(st.Endpoint)
+	if n < shortTransferMemoAfter {
+		return
+	}
+	memo := fmt.Sprintf("auto: %d short plain-HTTP transfers; truncating or unsuitable for large downloads", n)
+	m.SetMemo(st.Endpoint, memo)
+	clearShortTransfers(st.Endpoint)
+	warnLog("auto-memo %s: %s", st.Endpoint, memo)
 }
 
 func (m *ProxyManager) markDown(i int, errMsg string) {
@@ -652,6 +844,7 @@ func (m *ProxyManager) Start() error {
 						continue
 					}
 					m.markOK(i, cfg.Name, inst.LastLatency())
+					m.afterMarkOK(i, inst)
 					return
 				}
 				debugLog("Instance %d: round over without a claim, will retry", i)
@@ -695,6 +888,14 @@ func (m *ProxyManager) statusOf(i int) InstanceStatus {
 	return InstanceStatus{}
 }
 
+// afterMarkOK is the non-blocking quality pass run after an instance is
+// promoted: consume short-transfer evidence, then schedule a bulk measurement
+// if one is due. Neither step may hold the health loop.
+func (m *ProxyManager) afterMarkOK(i int, inst *ProxySelector) {
+	m.autoMemoShortTransfers(i)
+	m.maybeMeasureThroughput(i, inst)
+}
+
 func (m *ProxyManager) HealthCheckAll() {
 	insts, _ := m.snapshot()
 
@@ -709,6 +910,7 @@ func (m *ProxyManager) HealthCheckAll() {
 				name = cfg.Name
 			}
 			m.markOK(i, name, inst.LastLatency())
+			m.afterMarkOK(i, inst)
 		} else {
 			m.markDown(i, "health check failed")
 			warnLog("Instance %d: proxy failed, switching...", i)
@@ -722,6 +924,7 @@ func (m *ProxyManager) HealthCheckAll() {
 					name = cfg.Name
 				}
 				m.markOK(i, name, inst.LastLatency())
+				m.afterMarkOK(i, inst)
 			}
 		}
 	}
@@ -841,6 +1044,7 @@ func (m *ProxyManager) recoverInstance(i int, inst *ProxySelector) {
 			continue
 		}
 		m.markOK(i, cfg.Name, inst.LastLatency())
+		m.afterMarkOK(i, inst)
 		return
 	}
 }
@@ -882,6 +1086,7 @@ func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyCo
 		}
 		if cfg := inst.ActiveConfig(); cfg != nil {
 			m.markOK(i, cfg.Name, inst.LastLatency())
+			m.afterMarkOK(i, inst)
 		}
 		return
 	}
@@ -955,6 +1160,7 @@ func (m *ProxyManager) reconcileActive(i int, inst *ProxySelector, prev *ProxyCo
 		}
 		if cfg := inst.ActiveConfig(); cfg != nil && cfg.Key() == c.Key() {
 			m.markOK(i, cfg.Name, inst.LastLatency())
+			m.afterMarkOK(i, inst)
 			infoLog("Instance %d: rotated slow %s -> %s (%dms)", i, shortName(active.Name), shortName(cfg.Name), inst.LastLatency().Milliseconds())
 		}
 		return
@@ -988,12 +1194,16 @@ func (m *ProxyManager) GetAliveStatuses() []InstanceStatus {
 	slices.SortFunc(alive, func(a, b InstanceStatus) int {
 		// Aware clients see the warning on the entry itself, and the list keeps
 		// clean nodes first so a naive client that takes proxies[0] does not
-		// start with a known-truncating node. Within each tier latency wins.
+		// start with a known-truncating or confirmed-slow node. Within each
+		// tier, measured throughput class beats handshake latency.
 		if a.Degraded != b.Degraded {
 			if a.Degraded {
 				return 1
 			}
 			return -1
+		}
+		if ta, tb := throughputTier(a.ThroughputKbps), throughputTier(b.ThroughputKbps); ta != tb {
+			return cmp.Compare(tb, ta)
 		}
 		return cmp.Compare(a.LatMs, b.LatMs)
 	})

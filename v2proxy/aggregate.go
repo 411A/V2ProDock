@@ -13,8 +13,10 @@ package main
 // hanging on a dead port.
 
 import (
+	"cmp"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -160,12 +162,43 @@ func (m *ProxyManager) aggregateRelayCandidates() []string {
 	return m.candidateLadder(false, true)
 }
 
+// throughputTier buckets measured bulk rates (kbps) so ordering reacts to a
+// real capacity class, not to noise in every sample. Unknown (0) is tier 0:
+// measured-good nodes lead, then unmeasured nodes, while confirmed-low nodes
+// are already in the degraded partition.
+func throughputTier(kbps int64) int {
+	switch {
+	case kbps >= 8192: // >= 1 MB/s
+		return 4
+	case kbps >= 4096: // >= 512 KB/s
+		return 3
+	case kbps >= 2048: // >= 256 KB/s
+		return 2
+	case kbps >= 1024: // >= 128 KB/s
+		return 1
+	default:
+		return 0
+	}
+}
+
+// sortByQuality orders one clean/degraded partition: throughput tier first,
+// latency second. Streak is applied AFTER this by orderStable, so a fast
+// flappy node cannot leap a stable node inside the same capacity tier.
+func sortByQuality(group []InstanceStatus) {
+	slices.SortStableFunc(group, func(a, b InstanceStatus) int {
+		if ta, tb := throughputTier(a.ThroughputKbps), throughputTier(b.ThroughputKbps); ta != tb {
+			return cmp.Compare(tb, ta)
+		}
+		return cmp.Compare(a.LatMs, b.LatMs)
+	})
+}
+
 // orderAlive is the routing order both candidate ladders share. Clean
-// instances always come before memo'd (degraded) ones: a node that truncates
-// large transfers must not be chosen while any clean node is alive, but it
-// stays in the ladder as the last resort instead of being discarded. Within
-// each tier the stability partition applies, so the relay ladder ranks nodes
-// exactly like the direct ladder.
+// instances always come before memo'd/low-throughput (degraded) ones: a node
+// that truncates or crawls must not be chosen while any clean node is alive,
+// but it stays in the ladder as the last resort instead of being discarded.
+// Within each tier, measured throughput class beats handshake latency, and the
+// streak partition remains the tiebreaker inside that class.
 func orderAlive(alive []InstanceStatus, minStreak int) []InstanceStatus {
 	if len(alive) == 0 {
 		return alive
@@ -179,6 +212,8 @@ func orderAlive(alive []InstanceStatus, minStreak int) []InstanceStatus {
 			clean = append(clean, s)
 		}
 	}
+	sortByQuality(clean)
+	sortByQuality(degraded)
 	out := make([]InstanceStatus, 0, len(alive))
 	out = append(out, orderStable(clean, minStreak)...)
 	out = append(out, orderStable(degraded, minStreak)...)

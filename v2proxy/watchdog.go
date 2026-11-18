@@ -170,6 +170,7 @@ func (m *ProxyManager) WatchdogCheck() {
 				m.markDown(i, err.Error())
 			} else if cfg := inst.ActiveConfig(); cfg != nil {
 				m.markOK(i, cfg.Name, inst.LastLatency())
+				m.afterMarkOK(i, inst)
 			}
 			continue
 		}

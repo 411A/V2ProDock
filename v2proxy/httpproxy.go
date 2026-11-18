@@ -189,6 +189,52 @@ var egressEpoch = time.Now()
 
 func egressElapsed() int64 { return int64(time.Since(egressEpoch)) }
 
+// httpPortEndpoints maps a bridge listener port to the upstream active behind
+// it. The manager updates it on every markOK/switch, so a short-body count is
+// attributed to the NODE, not to the local port that survives the switch.
+var httpPortEndpoints sync.Map // map[int]string
+
+// shortTransfers counts plain-HTTP bodies that ended before Content-Length.
+// TLS/CONNECT bodies are opaque here; the throughput gate covers those.
+var shortTransfers sync.Map // map[string]*atomic.Int64
+
+func setHTTPPortEndpoint(port int, endpoint string) {
+	if port <= 0 {
+		return
+	}
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		httpPortEndpoints.Delete(port)
+		return
+	}
+	httpPortEndpoints.Store(port, endpoint)
+}
+
+func noteShortTransfer(port int) {
+	v, ok := httpPortEndpoints.Load(port)
+	if !ok {
+		return
+	}
+	endpoint, _ := v.(string)
+	if endpoint == "" {
+		return
+	}
+	c, _ := shortTransfers.LoadOrStore(endpoint, new(atomic.Int64))
+	c.(*atomic.Int64).Add(1)
+}
+
+func shortTransferCount(endpoint string) int64 {
+	v, ok := shortTransfers.Load(normalizeEndpoint(endpoint))
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int64).Load()
+}
+
+func clearShortTransfers(endpoint string) {
+	shortTransfers.Delete(normalizeEndpoint(endpoint))
+}
+
 // noteEgress records a proven flow for one instance port (bridge HTTP port or
 // serving SOCKS port). Port 0 (unparseable listener addr) is dropped: a note
 // that matches nothing must never fake health.
@@ -312,8 +358,18 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	// body outliving 5 minutes was severed no matter how many bytes had moved,
 	// behind an already-committed 200.
 	_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
-	if _, err := copyBodyIdle(w, resp.Body, conn); err != nil {
-		debugLog("copy response body failed: %v", err)
+	total, copyErr := copyBodyIdle(w, resp.Body, conn)
+	if copyErr != nil {
+		debugLog("copy response body failed: %v", copyErr)
+	}
+	// A body shorter than its own Content-Length is a truncation/quality
+	// signal, not a client error. Count it per active endpoint so three
+	// occurrences can auto-memo the node (the throughput gate covers TLS,
+	// where Content-Length is invisible).
+	if resp.ContentLength > 0 && total < resp.ContentLength &&
+		(copyErr == nil || errors.Is(copyErr, io.ErrUnexpectedEOF)) {
+		noteShortTransfer(httpPort)
+		debugLog("short upstream body: %d/%d bytes", total, resp.ContentLength)
 	}
 
 	if reader.Buffered() > 0 {
