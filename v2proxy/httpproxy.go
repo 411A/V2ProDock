@@ -365,8 +365,10 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	// A body shorter than its own Content-Length is a truncation/quality
 	// signal, not a client error. Count it per active endpoint so three
 	// occurrences can auto-memo the node (the throughput gate covers TLS,
-	// where Content-Length is invisible).
-	if resp.ContentLength > 0 && total < resp.ContentLength &&
+	// where Content-Length is invisible). HEAD/204/304 legitimately carry no
+	// body even when Content-Length describes what a GET would return.
+	if r.Method != http.MethodHead && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified &&
+		resp.ContentLength > 0 && total < resp.ContentLength &&
 		(copyErr == nil || errors.Is(copyErr, io.ErrUnexpectedEOF)) {
 		noteShortTransfer(httpPort)
 		debugLog("short upstream body: %d/%d bytes", total, resp.ContentLength)
