@@ -236,10 +236,11 @@ carried bytes in the last 5 s). Results are visible as:
 
 `throughput_kbps` is kilobits/s (divide by 8 for KB/s). A node is demoted to
 the same **last-resort** lane as a memo after two consecutive low/partial
-bodies; one good body promotes it immediately. A node is never marked down.
-Ordering within the clean and degraded partitions is: measured throughput
-class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown), then the
-`AGG_MIN_STREAK` stability partition, then latency.
+bodies (the first low sample is re-checked on the next health tick, so
+demotion takes ~1–2 minutes); one good body promotes it immediately. A node is
+never marked down. Ordering within the clean and degraded partitions is:
+measured throughput class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown),
+then the `AGG_MIN_STREAK` stability partition, then latency.
 
 `/health` exposes `usable_bulk` and `bulk_measured`; once at least one node
 has been measured, a pool with `usable_bulk:0` reports `status:"degraded"` and

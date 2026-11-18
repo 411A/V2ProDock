@@ -497,7 +497,13 @@ func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
 		m.mu.Unlock()
 		return
 	}
-	if !st.throughputAt.IsZero() && time.Since(st.throughputAt) < throughputInterval() {
+	due := throughputInterval()
+	if st.lowThroughput == 1 {
+		// First low sample: confirm on the next health tick, not after the
+		// full cadence. Two strikes still protect against one transient.
+		due = throughputConfirmInterval
+	}
+	if !st.throughputAt.IsZero() && time.Since(st.throughputAt) < due {
 		m.mu.Unlock()
 		return
 	}

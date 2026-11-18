@@ -229,8 +229,11 @@ const (
 	throughputProbeTimeout      = 8 * time.Second
 	throughputProbeWorkers      = 2
 	throughputIntervalDefault   = 5 * time.Minute
-	throughputFloorKbpsDefault  = 800 // 800 kbps ≈ 100 KB/s
-	throughputURLDefault        = "https://speed.cloudflare.com/__down?bytes=%d"
+	// A first low sample is confirmed sooner than the normal cadence, so a
+	// shaped node is demoted within ~1-2 health ticks instead of ~10 minutes.
+	throughputConfirmInterval  = 30 * time.Second
+	throughputFloorKbpsDefault = 800 // 800 kbps ≈ 100 KB/s
+	throughputURLDefault       = "https://speed.cloudflare.com/__down?bytes=%d"
 	// Auto-memo after this many short plain-HTTP bodies from one endpoint.
 	// TLS/CONNECT bodies are opaque, so those are caught by the gate instead.
 	shortTransferMemoAfter = 3
