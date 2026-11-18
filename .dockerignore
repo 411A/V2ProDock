@@ -1,0 +1,17 @@
+# Runtime state and local tooling must never enter the image build context.
+# config/ holds root-owned VPN keys and the live subscription/config volume;
+# copying it made `docker compose build` fail for unprivileged builders.
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+config/
+v2proxy/v2proxy
+v2proxy/v2proxy.exe
+v2proxy/*.exe
+v2proxy/.ruff_cache/
+.mimocode/
+.agents/
+docs/
+README.md
