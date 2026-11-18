@@ -482,6 +482,9 @@ func TestPopulateCrashingCandidateIsNeverAdopted(t *testing.T) {
 // budget here is deliberately generous relative to the fake xray's death so a
 // regression that waits the full budget fails loudly instead of by a hair.
 func TestPopulateDeadCandidateDoesNotCostTheBindWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bind wait ends on child death; processAlive is best-effort on Windows (always true), so the wait cannot be observed here")
+	}
 	dir := t.TempDir()
 	installFakeXray(t, dir)
 	shrinkPopulatePortWait(t, 3*time.Second)

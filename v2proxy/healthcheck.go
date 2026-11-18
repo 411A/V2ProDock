@@ -183,11 +183,14 @@ func measureThroughputDial(dial func(ctx context.Context, network, addr string) 
 		res.Err = fmt.Errorf("throughput target returned %d", resp.StatusCode)
 		return res
 	}
+	// Read at most Content-Length, but keep Expected as the REQUESTED size:
+	// a proxy that rewrites the header to its truncation length (e.g. 12KB)
+	// must read as short, not as a valid small body. A fixed custom URL should
+	// set THROUGHPUT_CHECK_BYTES to its real size.
 	want := expected
 	if resp.ContentLength > 0 && resp.ContentLength < want {
 		want = resp.ContentLength
 	}
-	res.Expected = want
 	start := time.Now()
 	n, readErr := io.CopyN(io.Discard, resp.Body, want)
 	res.Elapsed = time.Since(start)
