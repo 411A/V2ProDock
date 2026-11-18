@@ -222,21 +222,25 @@ const egressGrace = 90 * time.Second
 // A 204 proves handshake, not capacity: a node can answer in 500ms and carry
 // 1 KB/s. Measure a real body through each instance on promotion and on a slow
 // interval, then demote low-throughput nodes through the same memo/degraded
-// path (last resort, never down). The fetch is 512KiB / 8s, so it can never
-// run in the hot path; one worker at a time keeps probe traffic bounded.
+// path (last resort, never down). The fetch is 4MiB / 45s with a 2s tail
+// window, so it can never run in the hot path; two workers keep probe traffic
+// bounded.
 const (
-	throughputProbeBytesDefault = 512 << 10
-	throughputProbeTimeout      = 8 * time.Second
-	throughputProbeWorkers      = 2
-	throughputIntervalDefault   = 5 * time.Minute
-	// A first low sample is confirmed sooner than the normal cadence, so a
-	// shaped node is demoted within ~1-2 health ticks instead of ~10 minutes.
-	throughputConfirmInterval  = 30 * time.Second
-	throughputFloorKbpsDefault = 800 // 800 kbps ≈ 100 KB/s
-	throughputURLDefault       = "https://speed.cloudflare.com/__down?bytes=%d"
-	// Auto-memo after this many short plain-HTTP bodies from one endpoint.
-	// TLS/CONNECT bodies are opaque, so those are caught by the gate instead.
-	shortTransferMemoAfter = 3
+	// 4MiB outruns the common 0.5-1MiB burst allowance, so the tail window
+	// measures sustained capacity rather than the initial credit.
+	throughputProbeBytesDefault   = 4 << 20
+	throughputProbeTimeoutDefault = 45 * time.Second
+	throughputProbeWorkers        = 2
+	throughputIntervalDefault     = 5 * time.Minute
+	throughputTailWindow          = 2 * time.Second
+	throughputMinTail             = 250 * time.Millisecond
+	throughputConfirmInterval     = 30 * time.Second // confirm a first low sample on the next tick
+	throughputFloorKbpsDefault    = 800              // 800 kbps ≈ 100 KB/s
+	shortTransferMemoAfter        = 3
+	throughputPinTTL              = 24 * time.Hour
+	throughputPinCap              = 64
+	throughputMuxConcurrencyDef   = 8
+	throughputMuxConcurrencyMax   = 128
 )
 
 // egressNoteInterval bounds how often a moving stream re-stamps the passive

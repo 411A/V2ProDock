@@ -4,6 +4,7 @@ package main
 // call is fine: renders/switches are infrequent, never per-packet).
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"strconv"
@@ -16,6 +17,8 @@ var (
 	throughputFloorWarn    sync.Once
 	throughputIntervalWarn sync.Once
 	throughputBytesWarn    sync.Once
+	throughputTimeoutWarn  sync.Once
+	throughputURLWarn      sync.Once
 )
 
 // switchWorkerCount bounds parallel temp-port probing during a switch.
@@ -155,28 +158,46 @@ func throughputInterval() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// throughputProbeSize bounds the measured body. 64KiB is enough to expose a
-// shaper; 4MiB is the largest we will spend on a background probe.
+// throughputProbeSize bounds the measured body. 4MiB outruns the common
+// 0.5-1MiB burst allowance; 16MiB is the largest background fetch allowed.
 func throughputProbeSize() int64 {
 	v := strings.TrimSpace(os.Getenv("THROUGHPUT_CHECK_BYTES"))
 	if v == "" {
 		return throughputProbeBytesDefault
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil || n < 64<<10 || n > 4<<20 {
+	if err != nil || n < 64<<10 || n > 16<<20 {
 		throughputBytesWarn.Do(func() { warnLog("THROUGHPUT_CHECK_BYTES=%q invalid, using %d", v, throughputProbeBytesDefault) })
 		return throughputProbeBytesDefault
 	}
 	return n
 }
 
-// throughputProbeURL returns the URL with the configured byte count spliced in.
-// A URL without %d is used verbatim (useful for a fixed test file); the
-// Content-Length then caps the expected body in measureThroughput.
+// throughputProbeTimeout budgets the whole 4MiB body. 100 KB/s needs ~41s, so
+// the default leaves headroom for a node that is at (not below) the floor.
+func throughputProbeTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("THROUGHPUT_TIMEOUT_SECS"))
+	if v == "" {
+		return throughputProbeTimeoutDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 5 || n > 180 {
+		throughputTimeoutWarn.Do(func() { warnLog("THROUGHPUT_TIMEOUT_SECS=%q invalid, using %s", v, throughputProbeTimeoutDefault) })
+		return throughputProbeTimeoutDefault
+	}
+	return time.Duration(n) * time.Second
+}
+
+// throughputProbeURL requires an operator-selected object. Public speed-test
+// endpoints are per-IP rate-limited (429 through the proxy), and a 429 must not
+// be mistaken for a slow node. Empty = gate idle with one warning.
 func throughputProbeURL() string {
 	raw := strings.TrimSpace(os.Getenv("THROUGHPUT_CHECK_URL"))
 	if raw == "" {
-		raw = throughputURLDefault
+		throughputURLWarn.Do(func() {
+			warnLog("THROUGHPUT_CHECK_URL is unset: bulk gate idle (set a 4MiB+ operator-controlled object URL)")
+		})
+		return ""
 	}
 	if strings.Contains(raw, "%d") {
 		// Replace only the byte placeholder: Sprintf would also interpret a
@@ -184,6 +205,81 @@ func throughputProbeURL() string {
 		return strings.Replace(raw, "%d", strconv.FormatInt(throughputProbeSize(), 10), 1)
 	}
 	return raw
+}
+
+// muxEnabled opts into xray mux.cool on supported outbounds (default off).
+// Mux can help many parallel flows on a per-flow-shaped ISP; it cannot make a
+// single bulk TCP stream faster and adds head-of-line risk, so it is a
+// measured experiment, not a default.
+func muxEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("XRAY_MUX"))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+func muxConcurrency() int {
+	v := strings.TrimSpace(os.Getenv("XRAY_MUX_CONCURRENCY"))
+	if v == "" {
+		return throughputMuxConcurrencyDef
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > throughputMuxConcurrencyMax {
+		warnLog("XRAY_MUX_CONCURRENCY=%q invalid, using %d", v, throughputMuxConcurrencyDef)
+		return throughputMuxConcurrencyDef
+	}
+	return n
+}
+
+// applyMux adds mux only where it is supported and the subscription has not
+// already chosen a policy. XTLS Vision flows are skipped: mux.cool and Vision
+// are not a valid combination.
+func applyMux(outbound map[string]any) {
+	if !muxEnabled() {
+		return
+	}
+	if _, exists := outbound["mux"]; exists {
+		return // subscription intent wins
+	}
+	switch strings.ToLower(strings.TrimSpace(fmt.Sprint(outbound["protocol"]))) {
+	case "vmess", "vless", "trojan":
+	default:
+		return
+	}
+	if containsVisionFlow(outbound) {
+		return
+	}
+	n := muxConcurrency()
+	outbound["mux"] = map[string]any{
+		"enabled":         true,
+		"concurrency":     n,
+		"xudpConcurrency": n,
+	}
+}
+
+// containsVisionFlow protects raw subscription configs that put the flow in
+// settings.vnext[].users[] rather than streamSettings.flow: mux.cool and XTLS
+// Vision are not a valid combination anywhere in the object.
+func containsVisionFlow(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if k == "flow" && strings.Contains(strings.ToLower(fmt.Sprint(val)), "vision") {
+				return true
+			}
+			if containsVisionFlow(val) {
+				return true
+			}
+		}
+	case []any:
+		for _, val := range t {
+			if containsVisionFlow(val) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tcpCongestion parses XRAY_TCP_CONGESTION: a kernel congestion-control

@@ -235,6 +235,57 @@ func clearShortTransfers(endpoint string) {
 	shortTransfers.Delete(normalizeEndpoint(endpoint))
 }
 
+// passiveRates carries positive throughput evidence from REAL completed
+// plain-HTTP bodies to the manager. Only positive evidence is recorded: a slow
+// client must never demote a node. The synthetic tail gate remains the demotion
+// authority, while a real 1MB+ stream can prove capacity even when the probe
+// target is rate-limited.
+type passiveRate struct {
+	kbps atomic.Int64
+	at   atomic.Int64 // UnixNano
+}
+
+var passiveRates sync.Map // map[string]*passiveRate
+
+func notePassiveThroughput(port int, kbps int64) {
+	if kbps <= 0 {
+		return
+	}
+	v, ok := httpPortEndpoints.Load(port)
+	if !ok {
+		return
+	}
+	endpoint, _ := v.(string)
+	if endpoint == "" {
+		return
+	}
+	r, _ := passiveRates.LoadOrStore(endpoint, &passiveRate{})
+	pr := r.(*passiveRate)
+	if kbps > pr.kbps.Load() {
+		pr.kbps.Store(kbps)
+		pr.at.Store(time.Now().UnixNano())
+	}
+}
+
+// takePassiveThroughput returns and clears a recent real-flow rate. Stale
+// samples are discarded so a burst from ten minutes ago cannot certify a node
+// that has since been shaped.
+func takePassiveThroughput(endpoint string) int64 {
+	v, ok := passiveRates.Load(normalizeEndpoint(endpoint))
+	if !ok {
+		return 0
+	}
+	pr := v.(*passiveRate)
+	at := pr.at.Load()
+	if at == 0 || time.Since(time.Unix(0, at)) > 2*healthCheckInterval {
+		passiveRates.Delete(normalizeEndpoint(endpoint))
+		return 0
+	}
+	kbps := pr.kbps.Swap(0)
+	pr.at.Store(0)
+	return kbps
+}
+
 // noteEgress records a proven flow for one instance port (bridge HTTP port or
 // serving SOCKS port). Port 0 (unparseable listener addr) is dropped: a note
 // that matches nothing must never fake health.
@@ -358,9 +409,21 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer
 	// body outliving 5 minutes was severed no matter how many bytes had moved,
 	// behind an already-committed 200.
 	_ = conn.SetDeadline(time.Now().Add(relayIdleDeadline))
+	bodyStart := time.Now()
 	total, copyErr := copyBodyIdle(w, resp.Body, conn)
+	bodyElapsed := time.Since(bodyStart)
 	if copyErr != nil {
 		debugLog("copy response body failed: %v", copyErr)
+	}
+	// A completed real body of at least 1MiB is positive capacity evidence:
+	// promote the node even if the synthetic probe target is rate-limited.
+	// A short burst cannot qualify (>=1s wall), and slow clients never demote.
+	if copyErr == nil && r.Method != http.MethodHead &&
+		resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified &&
+		resp.ContentLength > 0 && total == resp.ContentLength &&
+		total >= 1<<20 && bodyElapsed >= time.Second {
+		kbps := int64(float64(total) * 8 / bodyElapsed.Seconds() / 1000)
+		notePassiveThroughput(httpPort, kbps)
 	}
 	// A body shorter than its own Content-Length is a truncation/quality
 	// signal, not a client error. Count it per active endpoint so three

@@ -59,8 +59,14 @@ services:
       - THROUGHPUT_CHECK=${THROUGHPUT_CHECK:-1}
       - THROUGHPUT_FLOOR_KBPS=${THROUGHPUT_FLOOR_KBPS:-800}
       - THROUGHPUT_INTERVAL_SECS=${THROUGHPUT_INTERVAL_SECS:-300}
-      - THROUGHPUT_CHECK_BYTES=${THROUGHPUT_CHECK_BYTES:-524288}
-      - THROUGHPUT_CHECK_URL=${THROUGHPUT_CHECK_URL:-https://speed.cloudflare.com/__down?bytes=%d}
+      - THROUGHPUT_CHECK_BYTES=${THROUGHPUT_CHECK_BYTES:-4194304}
+      - THROUGHPUT_TIMEOUT_SECS=${THROUGHPUT_TIMEOUT_SECS:-45}
+      # No public speed-test default: those are per-IP rate-limited (429) and
+      # must not be read as a slow node. Point this at an object you control.
+      - THROUGHPUT_CHECK_URL=${THROUGHPUT_CHECK_URL:-}
+      # Measured experiment for per-flow-shaped ISPs; off by default.
+      - XRAY_MUX=${XRAY_MUX:-0}
+      - XRAY_MUX_CONCURRENCY=${XRAY_MUX_CONCURRENCY:-8}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NO_PROXY=127.0.0.1,localhost,host.docker.internal,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
     # Real liveness: a wedged Go process still passes `kill -0 1` but serves

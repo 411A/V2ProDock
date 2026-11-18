@@ -73,6 +73,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		starting := manager.StartingCount()
 		degraded := manager.DegradedCount()
 		usableBulk, measuredBulk := manager.BulkStats()
+		bulkConfigured := throughputCheckEnabled() && throughputProbeURL() != ""
 		status := "ok"
 		if alive == 0 {
 			status = "degraded"
@@ -85,6 +86,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"degraded":      degraded,
 			"usable_bulk":   usableBulk,
 			"bulk_measured": measuredBulk,
+			"bulk_check":    bulkConfigured,
 		}
 		// Every alive node carries a quality memo: service continues (small
 		// requests may be fine) but the caller must not expect large transfers

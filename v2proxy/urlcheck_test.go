@@ -220,9 +220,9 @@ func TestCheckTargetAllowsPublicIPLiteral(t *testing.T) {
 // fails - which is the entire feature.
 func checkStack(t *testing.T, served map[string]int, n int) (m *ProxyManager, base string) {
 	t.Helper()
-	// Must stay under maxPort (27999) or findAvailableBlock allocates nothing:
-	// the scan is bounded above by maxPort, so an out-of-range base silently
-	// yields a manager with zero instances.
+	// The SOCKS stubs bind ephemeral ports (proxySocks rewrites the selector),
+	// so this base is only the manager's logical port block. The API starts at
+	// base+60 and findFreePort scans upward; no fixed SOCKS port is reused.
 	const basePort = 27900
 	m = NewProxyManager(t.TempDir(), "http://probe.invalid/", basePort, n, []string{"http://127.0.0.1:9/sub"}, time.Minute)
 	m.urlChecks = newURLCheckCache()
@@ -266,10 +266,14 @@ func itoa(n int) string { return strconv.Itoa(n) }
 // so there is no race against the API reading it.
 func proxySocks(t *testing.T, inst *ProxySelector, upstream string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(inst.SOCKSPort()))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Bind ephemeral: reusing the manager's fixed port made consecutive tests
+	// collide with a previous stub/listener in TIME_WAIT under -race.
+	inst.socksPort = ln.Addr().(*net.TCPAddr).Port
+	inst.socksAddr = ln.Addr().String()
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {

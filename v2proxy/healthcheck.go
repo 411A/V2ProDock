@@ -121,13 +121,68 @@ func testSingleURLContext(ctx context.Context, proxyAddr, testURL string, timeou
 // Content-Length clamping); Bytes == Expected with Err == nil is a complete
 // transfer. Kbps is kilobits/s, so divide by 8 for KB/s.
 type ThroughputResult struct {
-	Kbps     int64
-	Bytes    int64
-	Expected int64
-	Status   int
-	Err      error
-	URL      string
-	Elapsed  time.Duration
+	Kbps         int64 // tail-window rate (kilobits/s)
+	AvgKbps      int64 // whole-body average, for observability
+	Bytes        int64
+	Expected     int64
+	Status       int
+	Err          error
+	Inconclusive bool // target throttled/forbade us (429/403/5xx): do not demote
+	URL          string
+	Elapsed      time.Duration
+}
+
+// throughputMeter samples byte progress so the caller can score the tail, not
+// the average. A node that bursts for 1MiB and then crawls has a good average
+// but a zero tail; that is precisely the shaper this gate must catch.
+type throughputMeter struct {
+	start   time.Time
+	total   int64
+	samples []throughputSample
+}
+
+type throughputSample struct {
+	at    time.Time
+	total int64
+}
+
+func (m *throughputMeter) Write(p []byte) (int, error) {
+	m.total += int64(len(p))
+	m.samples = append(m.samples, throughputSample{at: time.Now(), total: m.total})
+	return len(p), nil
+}
+
+func (m *throughputMeter) kbps(end time.Time) (tail, avg int64) {
+	elapsed := end.Sub(m.start)
+	if elapsed <= 0 {
+		elapsed = time.Millisecond
+	}
+	avg = int64(float64(m.total) * 8 / elapsed.Seconds() / 1000)
+	if len(m.samples) == 0 {
+		return 0, avg
+	}
+	cut := end.Add(-throughputTailWindow)
+	baseAt, baseTotal := m.start, int64(0)
+	found := false
+	for _, s := range m.samples {
+		if s.at.Before(cut) {
+			baseAt, baseTotal = s.at, s.total
+			found = true
+			continue
+		}
+		break
+	}
+	if !found {
+		// The whole transfer fits inside the tail window.
+		return avg, avg
+	}
+	tailElapsed := end.Sub(baseAt)
+	tailBytes := m.samples[len(m.samples)-1].total - baseTotal
+	if tailElapsed < throughputMinTail {
+		return avg, avg
+	}
+	tail = int64(float64(tailBytes) * 8 / tailElapsed.Seconds() / 1000)
+	return tail, avg
 }
 
 // measureThroughput dials the target through proxyAddr (an instance's xray
@@ -180,6 +235,7 @@ func measureThroughputDial(dial func(ctx context.Context, network, addr string) 
 	defer func() { _ = resp.Body.Close() }()
 	res.Status = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		res.Inconclusive = true
 		res.Err = fmt.Errorf("throughput target returned %d", resp.StatusCode)
 		return res
 	}
@@ -191,15 +247,16 @@ func measureThroughputDial(dial func(ctx context.Context, network, addr string) 
 	if resp.ContentLength > 0 && resp.ContentLength < want {
 		want = resp.ContentLength
 	}
-	start := time.Now()
-	n, readErr := io.CopyN(io.Discard, resp.Body, want)
-	res.Elapsed = time.Since(start)
-	res.Bytes = n
+	meter := &throughputMeter{start: time.Now()}
+	_, readErr := io.CopyN(meter, resp.Body, want)
+	end := time.Now()
+	res.Elapsed = end.Sub(meter.start)
+	res.Bytes = meter.total
 	res.Err = readErr
 	if res.Elapsed <= 0 {
 		res.Elapsed = time.Millisecond
 	}
-	res.Kbps = int64(float64(n) * 8 / res.Elapsed.Seconds() / 1000)
+	res.Kbps, res.AvgKbps = meter.kbps(end)
 	return res
 }
 

@@ -86,8 +86,11 @@ These are different failures and need different fixes:
 shaped link, the split ClientHello was itself the fingerprint: identical
 ports went from full-speed to 1–7 KB/s with fragment on. Leave it `0` unless
 handshakes are actually being reset, and watch `throughput_kbps` after
-enabling it. The gate demotes a node that collapses, but it cannot undo the
-shaping for a pool that was already working.
+enabling it. The bulk gate fetches 4 MiB and scores the last 2 seconds, so it
+catches a burst-then-throttle node that a small average probe would certify.
+It needs `THROUGHPUT_CHECK_URL` pointed at an operator-controlled object;
+public speed-test URLs are per-IP rate-limited (429) and are treated as
+inconclusive, never as a slow node.
 
 Check the container's cgroup throttle counters **during** playback:
 

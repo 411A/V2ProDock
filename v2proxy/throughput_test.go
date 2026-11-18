@@ -40,6 +40,144 @@ func TestThroughputEnvParsing(t *testing.T) {
 	if got := throughputProbeSize(); got != throughputProbeBytesDefault {
 		t.Fatalf("invalid size = %d, want default %d", got, throughputProbeBytesDefault)
 	}
+	t.Setenv("THROUGHPUT_TIMEOUT_SECS", "30")
+	if got := throughputProbeTimeout(); got != 30*time.Second {
+		t.Fatalf("timeout = %s, want 30s", got)
+	}
+	t.Setenv("THROUGHPUT_CHECK_URL", "")
+	if got := throughputProbeURL(); got != "" {
+		t.Fatalf("empty THROUGHPUT_CHECK_URL must disable, got %q", got)
+	}
+}
+
+func TestThroughputMeterTail(t *testing.T) {
+	start := time.Now()
+	m := &throughputMeter{start: start}
+	m.total = 2 << 20
+	m.samples = []throughputSample{
+		{at: start.Add(100 * time.Millisecond), total: 1 << 20},
+		{at: start.Add(200 * time.Millisecond), total: 2 << 20},
+	}
+	tail, avg := m.kbps(start.Add(3 * time.Second))
+	if tail != 0 {
+		t.Fatalf("tail = %d, want 0 after a 2.8s stall (avg=%d)", tail, avg)
+	}
+	if avg <= 0 {
+		t.Fatalf("avg = %d, want > 0", avg)
+	}
+
+	// A slow tail must score below the whole-body average.
+	m = &throughputMeter{start: start}
+	m.total = 2 << 20
+	m.samples = []throughputSample{
+		{at: start.Add(1 * time.Second), total: 1 << 20},
+		{at: start.Add(3 * time.Second), total: 2 << 20},
+	}
+	tail, avg = m.kbps(start.Add(3100 * time.Millisecond))
+	if tail >= avg {
+		t.Fatalf("tail = %d, avg = %d; the slow last window must score lower", tail, avg)
+	}
+}
+
+func TestInconclusiveProbeDoesNotDemote(t *testing.T) {
+	m := backendManager([]InstanceStatus{{Index: 0, Status: "ok", Endpoint: "node.example:443"}}, 27951, 27961)
+	m.applyThroughput(0, "node.example:443", ThroughputResult{Kbps: 0, Status: 429, Inconclusive: true})
+	s := m.statusOf(0)
+	if s.Degraded || s.ThroughputKbps != 0 || s.BulkUsable {
+		t.Fatalf("429 must be inconclusive, not a demotion: %+v", s)
+	}
+	if s.throughputAt.IsZero() {
+		t.Fatal("inconclusive probe must still advance the retry clock")
+	}
+}
+
+func TestPassiveThroughputPromotes(t *testing.T) {
+	const endpoint = "passive.example:443"
+	const port = 27977
+	m := backendManager([]InstanceStatus{{Index: 0, Status: "ok", Endpoint: endpoint}}, 27977, 27987)
+	setHTTPPortEndpoint(port, endpoint)
+	defer setHTTPPortEndpoint(port, "")
+	defer passiveRates.Delete(endpoint)
+
+	notePassiveThroughput(port, 5000)
+	m.consumePassiveThroughput(0)
+	s := m.statusOf(0)
+	if !s.BulkUsable || s.ThroughputKbps != 5000 || s.Degraded {
+		t.Fatalf("passive evidence did not promote: %+v", s)
+	}
+	// Consumed exactly once.
+	m.consumePassiveThroughput(0)
+	if s := m.statusOf(0); s.ThroughputKbps != 5000 {
+		t.Fatalf("stale passive sample re-applied: %+v", s)
+	}
+}
+
+func TestPinnedConfigSurvivesMerge(t *testing.T) {
+	m := backendManager([]InstanceStatus{{Index: 0, Status: "ok"}}, 27951, 27961)
+	m.instances[0].configs = []ProxyConfig{{Name: "proven", Endpoint: "proven.example:443"}}
+	m.instances[0].activeIndex = 0
+	m.markOK(0, "proven", time.Millisecond)
+	m.applyThroughput(0, "proven.example:443", ThroughputResult{Kbps: 5000, Bytes: 100, Expected: 100, Status: 200})
+
+	pool := []ProxyConfig{{Name: "new", Endpoint: "new.example:443"}}
+	merged := m.mergePinned(pool)
+	if len(merged) != 2 {
+		t.Fatalf("merged pool = %d configs, want 2: %+v", len(merged), merged)
+	}
+	if merged[1].Key() != "proven.example:443" {
+		t.Fatalf("pinned config missing: %+v", merged)
+	}
+}
+
+func TestMuxRendering(t *testing.T) {
+	t.Setenv("XRAY_MUX", "0")
+	ob := map[string]any{"protocol": "vless", "streamSettings": map[string]any{}}
+	applyMux(ob)
+	if _, ok := ob["mux"]; ok {
+		t.Fatal("mux must be off by default")
+	}
+
+	t.Setenv("XRAY_MUX", "1")
+	t.Setenv("XRAY_MUX_CONCURRENCY", "4")
+	applyMux(ob)
+	mux, _ := ob["mux"].(map[string]any)
+	if mux["enabled"] != true || mux["concurrency"] != 4 || mux["xudpConcurrency"] != 4 {
+		t.Fatalf("mux = %v", ob["mux"])
+	}
+
+	// Subscription intent wins.
+	existing := map[string]any{"protocol": "vmess", "mux": map[string]any{"enabled": true, "concurrency": 2}}
+	applyMux(existing)
+	if existing["mux"].(map[string]any)["concurrency"] != 2 {
+		t.Fatalf("existing mux overwritten: %v", existing["mux"])
+	}
+
+	// Vision and unsupported protocols are skipped.
+	vision := map[string]any{
+		"protocol":       "vless",
+		"streamSettings": map[string]any{"flow": "xtls-rprx-vision"},
+	}
+	applyMux(vision)
+	if _, ok := vision["mux"]; ok {
+		t.Fatalf("mux must not combine with Vision: %v", vision)
+	}
+	nested := map[string]any{
+		"protocol": "vless",
+		"settings": map[string]any{
+			"vnext": []any{map[string]any{
+				"users": []any{map[string]any{"flow": "xtls-rprx-vision"}},
+			}},
+		},
+	}
+	applyMux(nested)
+	if _, ok := nested["mux"]; ok {
+		t.Fatalf("mux must not combine with nested Vision flow: %v", nested)
+	}
+	ss := map[string]any{"protocol": "shadowsocks", "streamSettings": map[string]any{}}
+	applyMux(ss)
+	if _, ok := ss["mux"]; ok {
+		t.Fatalf("mux must not be added to shadowsocks: %v", ss)
+	}
 }
 
 func TestMeasureThroughputDial(t *testing.T) {

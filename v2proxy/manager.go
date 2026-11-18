@@ -38,7 +38,11 @@ type InstanceStatus struct {
 	// BulkUsable is true only after a completed fetch at or above the floor.
 	// A low measurement demotes the node via Degraded but never marks it down.
 	ThroughputKbps int64 `json:"throughput_kbps,omitempty"`
-	BulkUsable     bool  `json:"bulk_usable,omitempty"`
+	// ThroughputAvgKbps is the whole-body average; the primary throughput_kbps
+	// is the tail window. A large gap between them is the burst-then-throttle
+	// signature.
+	ThroughputAvgKbps int64 `json:"throughput_avg_kbps,omitempty"`
+	BulkUsable        bool  `json:"bulk_usable,omitempty"`
 	// throughputAt/lows are scheduler state, not API surface.
 	throughputAt  time.Time
 	lowThroughput int
@@ -66,10 +70,15 @@ type ProxyManager struct {
 	// deliberate last resort, not a failure. Seeded by PROXY_MEMOS and updated
 	// by POST /memo; guarded by mu.
 	memos map[string]string
-	// Throughput probes are background work: a single worker (so a 10-node
-	// pool never bursts 10 x 512KiB at once) and a per-instance in-flight set.
+	// Throughput probes are background work: a small worker pool (so a 10-node
+	// pool never bursts 10 x 4MiB at once) and a per-instance in-flight set.
 	throughputSem  chan struct{}
 	throughputBusy map[int]bool
+	// pinned keeps configs that PROVED sustained bulk throughput. Subscription
+	// refreshes drop endpoints the remote list rotated out; without this, a
+	// proven 3 MB/s node can be replaced by an unproven one. TTL-bound and
+	// removed on a health failure so a dead node is not resurrected forever.
+	pinned map[string]pinnedConfig
 	// cache is the routing ladder derived from statuses. It is written only by
 	// status writes (health tick / refresh, under mu) and read lock-free by
 	// every aggregate connection. A pointer swap means reader and writer never
@@ -102,6 +111,11 @@ type statusCache struct {
 	socks []string
 	http  []string
 	relay []string
+}
+
+type pinnedConfig struct {
+	cfg ProxyConfig
+	at  time.Time
 }
 
 // srcBreaker circuit-breaks dead subscription sources across refreshes: a
@@ -337,6 +351,7 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 		m.statuses[i].Memo = ""
 		m.statuses[i].Degraded = false
 		m.statuses[i].ThroughputKbps = 0
+		m.statuses[i].ThroughputAvgKbps = 0
 		m.statuses[i].BulkUsable = false
 		m.statuses[i].lowThroughput = 0
 		m.statuses[i].throughputAt = time.Time{}
@@ -349,6 +364,7 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 		// A different node: never inherit the previous node's throughput class
 		// or its measurement clock. The next health tick schedules a fresh one.
 		m.statuses[i].ThroughputKbps = 0
+		m.statuses[i].ThroughputAvgKbps = 0
 		m.statuses[i].BulkUsable = false
 		m.statuses[i].lowThroughput = 0
 		m.statuses[i].throughputAt = time.Time{}
@@ -404,6 +420,7 @@ func (m *ProxyManager) SetMemo(endpoint, memo string) {
 			m.memos = make(map[string]string)
 		}
 		m.memos[endpoint] = memo
+		delete(m.pinned, endpoint)
 	}
 	for i := range m.statuses {
 		if normalizeEndpoint(m.statuses[i].Endpoint) == endpoint {
@@ -460,8 +477,16 @@ func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputRes
 	}
 	s := &m.statuses[i]
 	s.throughputAt = time.Now()
+	if res.Inconclusive {
+		// The TARGET throttled/forbade the probe (429/403/5xx). That says
+		// nothing about this node's capacity; retry next interval, never demote.
+		return
+	}
 	if res.Bytes > 0 && res.Kbps > 0 {
 		s.ThroughputKbps = res.Kbps
+	}
+	if res.AvgKbps > 0 {
+		s.ThroughputAvgKbps = res.AvgKbps
 	}
 	complete := res.Err == nil && res.Status >= 200 && res.Status < 300 &&
 		res.Expected > 0 && res.Bytes >= res.Expected &&
@@ -470,6 +495,7 @@ func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputRes
 	case complete:
 		s.BulkUsable = true
 		s.lowThroughput = 0
+		m.pinLocked(i, endpoint)
 	case res.Bytes > 0:
 		s.lowThroughput++
 		if s.lowThroughput >= 2 {
@@ -477,7 +503,63 @@ func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputRes
 		}
 	}
 	s.Degraded = s.Memo != "" || throughputLow(s)
+	if s.Degraded {
+		delete(m.pinned, endpoint)
+	}
 	m.buildCacheLocked()
+}
+
+// pinLocked remembers the active config for a node that just proved sustained
+// bulk capacity. mergePinned re-adds it after a subscription refresh drops it.
+func (m *ProxyManager) pinLocked(i int, endpoint string) {
+	if i < 0 || i >= len(m.instances) {
+		return
+	}
+	cfg := m.instances[i].ActiveConfig()
+	if cfg == nil || cfg.Key() != endpoint {
+		return
+	}
+	if m.pinned == nil {
+		m.pinned = make(map[string]pinnedConfig)
+	}
+	if _, exists := m.pinned[endpoint]; !exists && len(m.pinned) >= throughputPinCap {
+		var oldestKey string
+		var oldest time.Time
+		for k, p := range m.pinned {
+			if oldestKey == "" || p.at.Before(oldest) {
+				oldestKey, oldest = k, p.at
+			}
+		}
+		delete(m.pinned, oldestKey)
+	}
+	m.pinned[endpoint] = pinnedConfig{cfg: *cfg, at: time.Now()}
+}
+
+// mergePinned appends still-fresh pinned configs that the latest subscription
+// fetch dropped. Duplicate endpoints keep the freshly fetched definition.
+func (m *ProxyManager) mergePinned(pool []ProxyConfig) []ProxyConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pinned) == 0 {
+		return pool
+	}
+	have := make(map[string]bool, len(pool)+len(m.pinned))
+	for _, c := range pool {
+		have[c.Key()] = true
+	}
+	now := time.Now()
+	for key, p := range m.pinned {
+		if now.Sub(p.at) > throughputPinTTL {
+			delete(m.pinned, key)
+			continue
+		}
+		if have[key] {
+			continue
+		}
+		pool = append(pool, p.cfg)
+		have[key] = true
+	}
+	return pool
 }
 
 // maybeMeasureThroughput schedules a background bulk fetch when the instance
@@ -520,6 +602,10 @@ func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
 	sem := m.throughputSem
 	m.mu.Unlock()
 
+	url := throughputProbeURL()
+	if url == "" {
+		return // no operator target: gate idle (warning emitted once)
+	}
 	if egressActive([]int{inst.HTTPPort(), inst.SOCKSPort()}, 5*time.Second) {
 		return // a live tunnel is already proving capacity; don't compete
 	}
@@ -540,7 +626,6 @@ func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
 
 	endpoint := st.Endpoint
 	socksAddr := inst.SOCKSAddr()
-	url := throughputProbeURL()
 	want := throughputProbeSize()
 	go func() {
 		defer func() {
@@ -549,7 +634,7 @@ func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
 			delete(m.throughputBusy, i)
 			m.mu.Unlock()
 		}()
-		res := measureThroughput(socksAddr, url, want, throughputProbeTimeout)
+		res := measureThroughput(socksAddr, url, want, throughputProbeTimeout())
 		m.applyThroughput(i, endpoint, res)
 	}()
 }
@@ -579,6 +664,9 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 		m.applyQualityLocked(i)
 		m.statuses[i].Status = "down"
 		m.statuses[i].Error = errMsg
+		if ep := m.statuses[i].Endpoint; ep != "" {
+			delete(m.pinned, ep)
+		}
 		m.buildCacheLocked()
 	}
 }
@@ -797,6 +885,7 @@ func (m *ProxyManager) Start() error {
 			time.Sleep(populateRetryDelay)
 			continue
 		}
+		pool = m.mergePinned(pool)
 		pool = dedupConfigs(pool)
 		debugLog("subscription pool: %d unique configs from %d source(s)", len(pool), len(subURLs))
 
@@ -894,10 +983,44 @@ func (m *ProxyManager) statusOf(i int) InstanceStatus {
 	return InstanceStatus{}
 }
 
+// consumePassiveThroughput promotes a node that just completed a real HTTP
+// body at or above the floor. Positive-only: a slow client is not evidence of
+// a slow node, so this path never demotes.
+func (m *ProxyManager) consumePassiveThroughput(i int) {
+	st := m.statusOf(i)
+	if st.Status != "ok" || st.Endpoint == "" {
+		return
+	}
+	rate := takePassiveThroughput(st.Endpoint)
+	if rate < throughputFloorKbps() {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.statuses) || m.statuses[i].Endpoint != st.Endpoint || m.statuses[i].Status != "ok" {
+		return
+	}
+	s := &m.statuses[i]
+	if rate > s.ThroughputKbps {
+		s.ThroughputKbps = rate
+	}
+	s.BulkUsable = true
+	s.lowThroughput = 0
+	s.throughputAt = time.Now()
+	s.Degraded = s.Memo != ""
+	if s.Degraded {
+		delete(m.pinned, st.Endpoint)
+	} else {
+		m.pinLocked(i, st.Endpoint)
+	}
+	m.buildCacheLocked()
+}
+
 // afterMarkOK is the non-blocking quality pass run after an instance is
-// promoted: consume short-transfer evidence, then schedule a bulk measurement
-// if one is due. Neither step may hold the health loop.
+// promoted: consume passive evidence, short-transfer evidence, then schedule
+// a bulk measurement if one is due. Neither step may hold the health loop.
 func (m *ProxyManager) afterMarkOK(i int, inst *ProxySelector) {
+	m.consumePassiveThroughput(i)
 	m.autoMemoShortTransfers(i)
 	m.maybeMeasureThroughput(i, inst)
 }
@@ -991,6 +1114,7 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	for _, u := range allowed {
 		m.srcBrk.note(u, !failed[u])
 	}
+	pool = m.mergePinned(pool)
 	if len(pool) == 0 {
 		warnLog("refresh got 0 configs from all sources, keeping old")
 		return

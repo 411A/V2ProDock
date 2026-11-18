@@ -984,6 +984,10 @@ func (s *ProxySelector) renderXrayConfig(cfg ProxyConfig, socksPort int, seq uin
 		return "", fmt.Errorf("bad config: %w", err)
 	}
 
+	// Optional mux.cool (XRAY_MUX=1): one TCP flow for many logical streams.
+	// A measured experiment for per-flow shaping; never a default.
+	applyMux(outbound)
+
 	// Optional per-socket congestion control (XRAY_TCP_CONGESTION, e.g. bbr).
 	// Verify support BEFORE rendering: an unknown algorithm makes every dial
 	// fail, so a typo or a kernel without the module must degrade to the

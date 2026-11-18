@@ -107,9 +107,9 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, then measured throughput class, latency; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `bulk_usable`, and `ok_streak` |
+| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, then measured throughput class, latency; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `throughput_avg_kbps`, `bulk_usable`, and `ok_streak` |
 | `/all` | GET | All instances including down ones (same quality fields) |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2,"bulk_check":true}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node, `bulk_check:false` when no probe URL is configured |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 | `/memo` | POST | Attach or clear a quality note for an upstream endpoint (`{"endpoint":"host:port","memo":"..."}`); it stays alive but ranks after every clean node |
@@ -226,21 +226,41 @@ PROXY_MEMOS="203.0.113.9:443=truncates >12KB; downloads/uploads fail"
 #### Bulk throughput gate
 
 Health probes are 204s: a node can answer in 500 ms and then carry 1 KB/s. The
-gate fetches a real 512 KiB body through each instance's SOCKS port on
-promotion and every 5 minutes (two workers at a time, skipped when a client
-carried bytes in the last 5 s). Results are visible as:
+gate fetches a real **4 MiB** body through each instance's SOCKS port on
+promotion and every 5 minutes (two workers, skipped when a client carried bytes
+in the last 5 s). It scores the **last 2 seconds**, not the average, because a
+0.5–1 MiB burst followed by 2–9 KB/s has a healthy average and a dead tail.
 
 ```json
-{"throughput_kbps": 7264, "bulk_usable": true}
+{"throughput_kbps": 7264, "throughput_avg_kbps": 31000, "bulk_usable": true}
 ```
 
-`throughput_kbps` is kilobits/s (divide by 8 for KB/s). A node is demoted to
-the same **last-resort** lane as a memo after two consecutive low/partial
-bodies (the first low sample is re-checked on the next health tick, so
-demotion takes ~1–2 minutes); one good body promotes it immediately. A node is
-never marked down. Ordering within the clean and degraded partitions is:
-measured throughput class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown),
-then the `AGG_MIN_STREAK` stability partition, then latency.
+`throughput_kbps` is the tail rate (kilobits/s; divide by 8 for KB/s);
+`throughput_avg_kbps` is the whole-body average. A large gap is the
+burst-then-throttle signature. A node is demoted to the same **last-resort**
+lane as a memo after two consecutive low/partial tails (the first low sample is
+re-checked on the next health tick, so demotion takes ~1–2 minutes); one good
+tail promotes it immediately. A node is never marked down.
+
+**The probe target is deliberately not a public speed-test URL.** Those are
+per-IP rate-limited through the proxy (429), which must not be read as a slow
+node. Set `THROUGHPUT_CHECK_URL` to an object you control (at least 4 MiB,
+`%d` is replaced by the configured byte count). Empty = gate idle with one
+warning. `429/403/5xx` are **inconclusive**: the probe clock advances, but no
+quality state changes.
+
+A completed real **plain-HTTP** body of at least 1 MiB and 1 second is positive
+capacity evidence too: it promotes the node even when the synthetic target is
+rate-limited. Slow clients never demote.
+
+A node that proves sustained bulk capacity is **pinned for 24 hours**: if a
+subscription refresh drops its endpoint, it is appended back to the pool (the
+fresh definition wins if present). A health failure or a manual memo removes the
+pin.
+
+Ordering within the clean and degraded partitions is: measured throughput
+class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown), then the
+`AGG_MIN_STREAK` stability partition, then latency.
 
 `/health` exposes `usable_bulk` and `bulk_measured`; once at least one node
 has been measured, a pool with `usable_bulk:0` reports `status:"degraded"` and
@@ -252,14 +272,23 @@ Tune or disable it:
 THROUGHPUT_CHECK=1
 THROUGHPUT_FLOOR_KBPS=800        # 800 kbps ≈ 100 KB/s
 THROUGHPUT_INTERVAL_SECS=300
-THROUGHPUT_CHECK_BYTES=524288
-THROUGHPUT_CHECK_URL=https://speed.cloudflare.com/__down?bytes=%d
+THROUGHPUT_CHECK_BYTES=4194304   # 4 MiB
+THROUGHPUT_TIMEOUT_SECS=45
+THROUGHPUT_CHECK_URL=https://your-static-host.example/probe.bin
 # THROUGHPUT_CHECK=0            # metered host or blocked target
 ```
 
 Repeated short **plain-HTTP** bodies (Content-Length not satisfied) are counted
 per endpoint; after 3, the node is auto-memo'd. HTTPS/CONNECT bodies are opaque
 to the bridge, so those are covered by the throughput gate instead.
+
+#### `XRAY_MUX` — measured per-flow shaping experiment
+
+Mux is **off by default**. `XRAY_MUX=1` adds xray `mux.cool` to VMess/VLESS/
+Trojan outbounds (`XRAY_MUX_CONCURRENCY`, default 8). It can help many parallel
+flows on an ISP that shapes per TCP flow, but it cannot make a single bulk
+stream faster and adds head-of-line risk. XTLS Vision and any subscription-
+provided `mux` are left untouched. A/B the bulk number before keeping it on.
 
 ### Stable endpoints (bots & long-polling clients)
 
@@ -320,7 +349,7 @@ curl -fsS --socks5-hostname HOST:SOCKS_PORT -o /tmp/socks.bin "$URL"
 If one upstream truncates, record it with `POST /memo` (or seed
 `PROXY_MEMOS`): it stays alive as the deliberate last resort but ranks after
 every clean node, and `/proxies` shows the warning. The bulk gate below also
-catches a node that cannot carry a 512 KiB body; memos remain useful for
+catches a node that cannot carry a 4 MiB body; memos remain useful for
 problems the gate cannot see (upload-only breakage, intermittent truncation).
 Remove the subscription/node entirely if you do not want it used even as a
 fallback. `AGG_MIN_STREAK` and the health checks cannot detect truncation on
@@ -655,8 +684,11 @@ Environment variables (set in `.env` or via docker-compose):
 | `THROUGHPUT_CHECK` | `1` | `0` disables the bulk gate (metered host or blocked probe target) |
 | `THROUGHPUT_FLOOR_KBPS` | `800` | Demotion floor in kilobits/s (800 ≈ 100 KB/s) |
 | `THROUGHPUT_INTERVAL_SECS` | `300` | Per-instance bulk re-measure cadence |
-| `THROUGHPUT_CHECK_BYTES` | `524288` | Body size for the gate (64 KiB–4 MiB) |
-| `THROUGHPUT_CHECK_URL` | Cloudflare speed test | Body URL (`%d` = configured bytes); must return a real body |
+| `THROUGHPUT_CHECK_BYTES` | `4194304` | Body size for the gate (64 KiB–16 MiB) |
+| `THROUGHPUT_TIMEOUT_SECS` | `45` | Whole-probe timeout (5–180 s) |
+| `THROUGHPUT_CHECK_URL` | — | **Required** operator-controlled body URL (`%d` = configured bytes, at least 4 MiB); empty = gate idle |
+| `XRAY_MUX` | `0` | `1` = add mux.cool to VMess/VLESS/Trojan outbounds (measured experiment; Vision/subscription mux untouched) |
+| `XRAY_MUX_CONCURRENCY` | `8` | Mux concurrency (1–128) |
 | `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |
 | `NO_COLOR` / `LOG_COLOR` | unset | Set either to disable log colors (auto-off without a TTY) |
 | `VPN_ENABLED` | `0` | `1` = serve VPN via working proxy |
