@@ -146,7 +146,7 @@ func fetchOneURL(client *http.Client, subURL string) (string, error) {
 // IS the preference order. Left as the subscription's own order, that is exactly
 // how a raw-Shadowsocks node over TCP:443 gets adopted: it is usually the fastest
 // (there is no handshake to finish) and nothing tells the daemon it is also the
-// shape an Iran DPI most readily fingerprints.
+// shape a DPI middlebox most readily fingerprints.
 //
 // This matters because latency and DPI resistance actively disagree. Latency
 // measures how quickly a tunnel OPENS. It says nothing about whether the tunnel
@@ -372,6 +372,17 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 			continue
 		}
 		proxies = append(proxies, *proxy)
+	}
+	before := len(proxies)
+	proxies, stats := filterIngestConfigs(proxies)
+	if stats.total() > 0 {
+		msg := fmt.Sprintf("subscription %s: rejected %d/%d unsafe configs (%d no TLS, %d bad Reality SNI, %d malformed)",
+			subURL, before-len(proxies), before, stats.Insecure, stats.BadSNI, stats.Malformed)
+		if len(proxies) == 0 {
+			warnLog("%s — pool has no transport-secure configs; set REQUIRE_TRANSPORT_SECURITY=0 only if you knowingly accept them", msg)
+		} else {
+			infoLog("%s", msg)
+		}
 	}
 	orderByDPIRank(proxies)
 	return proxies, nil

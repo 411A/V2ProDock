@@ -1,6 +1,6 @@
 package main
 
-// Clean-IP escape hatch for L2 censorship (CDN edge-IP blocks).
+// Clean-IP escape hatch for L2 DPI/CDN edge-IP blocks.
 //
 // When the censor null-routes or RSTs specific Cloudflare/GCore/Fastly edge
 // IPs, the SNI and credentials in subscription links are still fine — only

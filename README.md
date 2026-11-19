@@ -290,6 +290,46 @@ flows on an ISP that shapes per TCP flow, but it cannot make a single bulk
 stream faster and adds head-of-line risk. XTLS Vision and any subscription-
 provided `mux` are left untouched. A/B the bulk number before keeping it on.
 
+#### Ingest hygiene — keep unusable configs out of the pool
+
+A selector cannot rescue a pool of unusable configs. A measured public pool
+contained many Reality targets with implausible SNIs and several transports
+with no TLS at all; those flows were shaped to 1–5 KB/s as soon as they opened.
+Filtering to configs with real public SNIs moved the same host from 2.1 KB/s to
+1.15 MB/s with an identical sha256.
+
+At fetch time the daemon always rejects **Reality with an implausible SNI**
+(empty, an IP, a single-label/local name, a malformed hostname, or a name whose
+public suffix is not recognized), **Reality on the operator's optional
+`SNI_DENYLIST`**, and malformed outbound JSON.
+
+With `REQUIRE_TRANSPORT_SECURITY=1` it additionally rejects **Shadowsocks** and
+**VMess/VLESS without TLS/Reality**. This is opt-in: a general-purpose pool can
+keep every protocol; a DPI-hardened pool trades those transports for a pool
+that is less likely to be shaped.
+
+It keeps TLS VMess/VLESS, Trojan, and Reality whose SNI is the node's own
+domain or a plausible public host. An optional `SNI_DNS_CHECK=1` additionally
+rejects only definite NXDOMAIN; timeouts/SERVFAIL stay inconclusive so a
+filtered resolver does not drop a good node.
+
+```env
+REQUIRE_TRANSPORT_SECURITY=0   # 1 = DPI-hardened: reject SS/bare VMess/VLESS
+SNI_DENYLIST=                  # optional operator entries, *.suffix supported
+SNI_ALLOWLIST=                 # optional escape hatch for a new/private suffix
+SNI_DNS_CHECK=0                # 1 = strict resolvability check
+```
+
+Each filtered source logs one line:
+
+```text
+subscription ...: rejected 34/100 unsafe configs (21 no TLS, 12 bad Reality SNI, 1 malformed)
+```
+
+If every config from a source is rejected, the source is marked failed for
+that refresh; use a curated source with real-SNI configs. The 4 MiB tail gate
+still catches a secure-looking node that is throttled after the burst.
+
 ### Stable endpoints (bots & long-polling clients)
 
 Per-instance ports die and come back on every failover — pinning a Telegram
@@ -625,7 +665,7 @@ restart policy as the daemon reports it, rather than treating a successful
    failing one is rotated; a source that fails 3 refreshes in a row rests
    for 5 cycles instead of burning retry budgets every time
 
-## Under Hard Censorship
+## Under DPI Filtering
 
 Three layers, three answers (see `AGENT.md` for the full roadmap):
 
@@ -657,6 +697,11 @@ Three layers, three answers (see `AGENT.md` for the full roadmap):
 | Trojan | TCP, WebSocket |
 | Shadowsocks | TCP |
 
+Ingest hygiene always validates Reality SNIs; `REQUIRE_TRANSPORT_SECURITY=1`
+also rejects Shadowsocks and bare VMess/VLESS (no TLS transport). Keep the
+default `0` for a general-purpose pool; set `1` where DPI shaping is the
+dominant failure mode.
+
 ## Configuration
 
 Environment variables (set in `.env` or via docker-compose):
@@ -665,6 +710,10 @@ Environment variables (set in `.env` or via docker-compose):
 |----------|---------|-------------|
 | `SUBSCRIPTION_URL` | — | Single v2ray subscription URL (see [V2RayDAR](https://github.com/411A/V2RayDAR) to self-host one) |
 | `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
+| `REQUIRE_TRANSPORT_SECURITY` | `0` | `1` = DPI-hardened: also reject SS and VMess/VLESS without TLS/Reality; Reality SNI plausibility is always checked |
+| `SNI_DENYLIST` | - | Optional operator-supplied Reality SNIs (`*.suffix` supported); no names are compiled in |
+| `SNI_ALLOWLIST` | - | Optional escape hatch for a Reality host whose suffix is newer than the bundled public-suffix list (or intentionally private); denylist still wins |
+| `SNI_DNS_CHECK` | `0` | `1` = reject Reality SNI only on definite NXDOMAIN (timeouts stay inconclusive) |
 | `PROXY_INSTANCES` | `1` | Number of xray instances to run |
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
