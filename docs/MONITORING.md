@@ -92,6 +92,27 @@ It needs `THROUGHPUT_CHECK_URL` pointed at an operator-controlled object;
 public speed-test URLs are per-IP rate-limited (429) and are treated as
 inconclusive, never as a slow node.
 
+## Known latent issue: inconclusive bulk probes look healthy
+
+Observed 2026-11-19 09:45 on a filtered pool while every node carried
+0.5–5 KB/s:
+
+```json
+{"bulk_check":true,"bulk_measured":0,"degraded":0,"status":"ok","usable_bulk":0}
+```
+
+The pool was then filtered, and the state no longer reproduces — this is
+**latent, not active**. The gap is real: when every bulk probe is
+inconclusive (for example the target returns 429), `measured` stays 0, so
+`/health` cannot distinguish “not measurable” from “not measured yet” and
+keeps `status:"ok"`.
+
+It does not change transfer routing: nodes still follow the throughput tier,
+memo, and degraded rules. The optional fix is to count consecutive
+inconclusive probes per instance and degrade `/health` after K ticks. It is
+deliberately not implemented; this note exists so the observation is not
+re-litigated as a new discovery.
+
 Check the container's cgroup throttle counters **during** playback:
 
 ```bash
