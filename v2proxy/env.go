@@ -19,6 +19,8 @@ var (
 	throughputBytesWarn    sync.Once
 	throughputTimeoutWarn  sync.Once
 	throughputURLWarn      sync.Once
+	uploadBytesWarn        sync.Once
+	uploadTimeoutWarn      sync.Once
 )
 
 // switchWorkerCount bounds parallel temp-port probing during a switch.
@@ -205,6 +207,63 @@ func throughputProbeURL() string {
 		return strings.Replace(raw, "%d", strconv.FormatInt(throughputProbeSize(), 10), 1)
 	}
 	return raw
+}
+
+// uploadCheckEnabled lets an operator disable the upload probe independently
+// of the download gate. It is on only when UPLOAD_CHECK_URL is set.
+func uploadCheckEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("UPLOAD_CHECK"))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// uploadProbeURL is the operator endpoint that accepts a POST body and returns
+// 2xx only after reading it. Empty keeps the upload gate idle; no public
+// service is assumed, because a target that rejects POSTs would look like a
+// broken node.
+func uploadProbeURL() string {
+	return strings.TrimSpace(os.Getenv("UPLOAD_CHECK_URL"))
+}
+
+// uploadGateActive reports whether the upload probe can produce evidence.
+func uploadGateActive() bool {
+	return uploadCheckEnabled() && uploadProbeURL() != ""
+}
+
+// uploadProbeSize bounds the POST body. 16KiB is large enough to require a
+// real request-body path through the tunnel, small enough to run every cadence.
+func uploadProbeSize() int64 {
+	v := strings.TrimSpace(os.Getenv("UPLOAD_CHECK_BYTES"))
+	if v == "" {
+		return uploadProbeBytesDefault
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < uploadProbeBytesMin || n > uploadProbeBytesMax {
+		uploadBytesWarn.Do(func() {
+			warnLog("UPLOAD_CHECK_BYTES=%q invalid, using %d", v, uploadProbeBytesDefault)
+		})
+		return uploadProbeBytesDefault
+	}
+	return n
+}
+
+// uploadProbeTimeout bounds the whole POST, including the body write. A node
+// that accepts the request and then stalls is exactly what this gate catches.
+func uploadProbeTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("UPLOAD_CHECK_TIMEOUT_SECS"))
+	if v == "" {
+		return uploadProbeTimeoutDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < int(uploadProbeTimeoutMin/time.Second) || n > int(uploadProbeTimeoutMax/time.Second) {
+		uploadTimeoutWarn.Do(func() {
+			warnLog("UPLOAD_CHECK_TIMEOUT_SECS=%q invalid, using %s", v, uploadProbeTimeoutDefault)
+		})
+		return uploadProbeTimeoutDefault
+	}
+	return time.Duration(n) * time.Second
 }
 
 // muxEnabled opts into xray mux.cool on supported outbounds (default off).

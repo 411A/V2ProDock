@@ -91,6 +91,17 @@ func TestInconclusiveProbeDoesNotDemote(t *testing.T) {
 	}
 }
 
+func TestThroughputProbeAfterMarkDownIsIgnored(t *testing.T) {
+	const endpoint = "down-throughput.example:443"
+	m := backendManager([]InstanceStatus{{
+		Index: 0, Status: "down", Endpoint: endpoint,
+	}}, 27951, 27961)
+	m.applyThroughput(0, endpoint, ThroughputResult{Kbps: 5000, Bytes: 100, Expected: 100, Status: 200})
+	if s := m.statusOf(0); s.BulkUsable || s.ThroughputKbps != 0 {
+		t.Fatalf("a probe that finished after markDown must not promote the node: %+v", s)
+	}
+}
+
 func TestPassiveThroughputPromotes(t *testing.T) {
 	const endpoint = "passive.example:443"
 	const port = 27977

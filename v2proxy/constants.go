@@ -243,6 +243,24 @@ const (
 	throughputMuxConcurrencyMax   = 128
 )
 
+// ---- Upload-capability gate ----
+// A download probe cannot see a node that accepts CONNECT and streams a body
+// but drops or stalls a request body. That failure is common enough to matter:
+// GET succeeds while every POST fails. A small operator-targeted POST is a
+// separate, cheap signal. It is OPT-IN (UPLOAD_CHECK_URL empty by default), so
+// a deployment that never sets it keeps the exact old ordering.
+const (
+	uploadProbeBytesDefault   = 16 << 10
+	uploadProbeTimeoutDefault = 20 * time.Second
+	uploadProbeBytesMin       = 1 << 10
+	uploadProbeBytesMax       = 1 << 20
+	uploadProbeTimeoutMin     = 5 * time.Second
+	uploadProbeTimeoutMax     = 120 * time.Second
+	// Two consecutive conclusive failures confirm a broken upload path. One
+	// sample must never demote a node that just served a real body.
+	uploadFailureThreshold = 2
+)
+
 // egressNoteInterval bounds how often a moving stream re-stamps the passive
 // ledger. The ledger only answers "was there traffic within egressGrace", so
 // one stamp per second is exactly as conclusive as one per 32KiB hop, while

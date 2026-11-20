@@ -73,20 +73,30 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		starting := manager.StartingCount()
 		degraded := manager.DegradedCount()
 		usableBulk, measuredBulk := manager.BulkStats()
+		usableUpload, measuredUpload, inconclusiveUpload := manager.UploadStats()
+		brokenUpload := manager.UploadBrokenCount()
 		bulkConfigured := throughputCheckEnabled() && throughputProbeURL() != ""
+		uploadConfigured := uploadGateActive()
 		status := "ok"
 		if alive == 0 {
 			status = "degraded"
 		}
 		body := map[string]any{
-			"status":        status,
-			"instances":     total,
-			"alive":         alive,
-			"starting":      starting,
-			"degraded":      degraded,
-			"usable_bulk":   usableBulk,
-			"bulk_measured": measuredBulk,
-			"bulk_check":    bulkConfigured,
+			"status":          status,
+			"instances":       total,
+			"alive":           alive,
+			"starting":        starting,
+			"degraded":        degraded,
+			"usable_bulk":     usableBulk,
+			"bulk_measured":   measuredBulk,
+			"bulk_check":      bulkConfigured,
+			"usable_upload":   usableUpload,
+			"upload_measured": measuredUpload,
+			"upload_check":    uploadConfigured,
+			// Target-side rejections are not node evidence, but an all-
+			// inconclusive gate is still not a measured pool; report it rather
+			// than letting it look like "probe has not run yet".
+			"upload_inconclusive": inconclusiveUpload,
 		}
 		// Every alive node carries a quality memo: service continues (small
 		// requests may be fine) but the caller must not expect large transfers
@@ -100,6 +110,21 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		if measuredBulk > 0 && usableBulk == 0 {
 			body["status"] = "degraded"
 			body["bulk_warning"] = "no alive proxy passed the bulk throughput check; large transfers may fail"
+		}
+		// The upload gate is independent: a pool can download at full speed and
+		// still be unable to carry a POST. Only a CONFIRMED broken path degrades
+		// health (one failed sample is hysteresis, not a verdict), and the pool
+		// still serves its best downloader.
+		if brokenUpload > 0 && usableUpload == 0 {
+			body["status"] = "degraded"
+			body["upload_warning"] = "no alive proxy passed the upload check; request bodies may fail"
+		}
+		// A target that rejects every probe (405/429/5xx/redirect) leaves the
+		// pool unmeasured, not proven broken. Degrade health so this is not
+		// mistaken for "not run yet", but never touch node state.
+		if inconclusiveUpload > 0 && usableUpload == 0 && brokenUpload == 0 {
+			body["status"] = "degraded"
+			body["upload_probe_warning"] = "upload probes were inconclusive for every alive proxy; verify UPLOAD_CHECK_URL accepts POST and returns 2xx"
 		}
 		// Stable endpoints for clients that must never rewrite config: query
 		// once, use forever — per-connection routing survives every switch.

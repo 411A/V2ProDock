@@ -181,10 +181,58 @@ func throughputTier(kbps int64) int {
 	}
 }
 
-// sortByQuality orders one clean/degraded partition: throughput tier first,
-// latency second. Streak is applied AFTER this by orderStable, so a fast
-// flappy node cannot leap a stable node inside the same capacity tier.
-func sortByQuality(group []InstanceStatus) {
+// Upload classes order a pool that has at least one proven upload path:
+// proven first, then unmeasured, then confirmed-broken. When no alive node is
+// proven, the class is ignored entirely so the pool still picks its best
+// downloader instead of refusing service.
+const (
+	uploadBrokenTier = iota
+	uploadUnknownTier
+	uploadProvenTier
+)
+
+func uploadTier(s InstanceStatus) int {
+	switch {
+	case s.UploadBroken:
+		return uploadBrokenTier
+	case s.UploadOK:
+		return uploadProvenTier
+	default:
+		return uploadUnknownTier
+	}
+}
+
+// uploadPreferred is true only when the gate is active AND the group carries
+// positive proof. That is the "if nobody can upload, choose best download"
+// rule: without proof, upload state never penalizes a fast download-only node.
+func uploadPreferred(group []InstanceStatus) bool {
+	if !uploadGateActive() {
+		return false
+	}
+	for _, s := range group {
+		if s.UploadOK {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionQuality splits clean from last-resort nodes without reordering.
+func partitionQuality(alive []InstanceStatus) (clean, degraded []InstanceStatus) {
+	clean = make([]InstanceStatus, 0, len(alive))
+	degraded = make([]InstanceStatus, 0, len(alive))
+	for _, s := range alive {
+		if s.Degraded {
+			degraded = append(degraded, s)
+		} else {
+			clean = append(clean, s)
+		}
+	}
+	return clean, degraded
+}
+
+// sortByCapacity orders one partition: throughput tier first, latency second.
+func sortByCapacity(group []InstanceStatus) {
 	slices.SortStableFunc(group, func(a, b InstanceStatus) int {
 		if ta, tb := throughputTier(a.ThroughputKbps), throughputTier(b.ThroughputKbps); ta != tb {
 			return cmp.Compare(tb, ta)
@@ -193,30 +241,57 @@ func sortByQuality(group []InstanceStatus) {
 	})
 }
 
+// orderGroup applies upload class (when proven), capacity class, then the
+// streak stability partition. Upload class is bucketed BEFORE stability so a
+// newly proven uploader cannot be pushed behind an upload-unknown node merely
+// because it has a shorter streak.
+func orderGroup(group []InstanceStatus, minStreak int) []InstanceStatus {
+	if len(group) == 0 {
+		return group
+	}
+	if !uploadPreferred(group) {
+		sortByCapacity(group)
+		return orderStable(group, minStreak)
+	}
+	buckets := make([][]InstanceStatus, uploadProvenTier+1)
+	for _, s := range group {
+		tier := uploadTier(s)
+		buckets[tier] = append(buckets[tier], s)
+	}
+	out := make([]InstanceStatus, 0, len(group))
+	for tier := uploadProvenTier; tier >= uploadBrokenTier; tier-- {
+		bucket := buckets[tier]
+		sortByCapacity(bucket)
+		out = append(out, orderStable(bucket, minStreak)...)
+	}
+	return out
+}
+
 // orderAlive is the routing order both candidate ladders share. Clean
 // instances always come before memo'd/low-throughput (degraded) ones: a node
 // that truncates or crawls must not be chosen while any clean node is alive,
 // but it stays in the ladder as the last resort instead of being discarded.
-// Within each tier, measured throughput class beats handshake latency, and the
-// streak partition remains the tiebreaker inside that class.
+// Within each partition, a proven upload path leads (only if one exists),
+// then measured throughput class beats handshake latency, and the streak
+// partition remains the tiebreaker inside that class.
 func orderAlive(alive []InstanceStatus, minStreak int) []InstanceStatus {
 	if len(alive) == 0 {
 		return alive
 	}
-	clean := make([]InstanceStatus, 0, len(alive))
-	degraded := make([]InstanceStatus, 0, len(alive))
-	for _, s := range alive {
-		if s.Degraded {
-			degraded = append(degraded, s)
-		} else {
-			clean = append(clean, s)
-		}
-	}
-	sortByQuality(clean)
-	sortByQuality(degraded)
+	clean, degraded := partitionQuality(alive)
 	out := make([]InstanceStatus, 0, len(alive))
-	out = append(out, orderStable(clean, minStreak)...)
-	out = append(out, orderStable(degraded, minStreak)...)
+	out = append(out, orderGroup(clean, minStreak)...)
+	out = append(out, orderGroup(degraded, minStreak)...)
+	return out
+}
+
+// sortAliveByQuality is orderAlive without the streak partition, used by
+// /proxies: clean before degraded, upload class, capacity class, latency.
+func sortAliveByQuality(alive []InstanceStatus) []InstanceStatus {
+	clean, degraded := partitionQuality(alive)
+	out := make([]InstanceStatus, 0, len(alive))
+	out = append(out, orderGroup(clean, 0)...)
+	out = append(out, orderGroup(degraded, 0)...)
 	return out
 }
 

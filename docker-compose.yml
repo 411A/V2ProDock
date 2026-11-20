@@ -63,7 +63,7 @@ services:
       # Known quality problems per upstream endpoint (host:port=memo,...).
       # Memo'd nodes stay alive but rank last; exposed on /proxies.
       - PROXY_MEMOS=${PROXY_MEMOS:-}
-      # Bulk throughput gate: fetch a real 512KiB body per instance on
+      # Bulk throughput gate: fetch a real 4MiB body per instance on
       # promotion and every 5 minutes. Low nodes are demoted through the same
       # memo/degraded lane (last resort), never marked down.
       - THROUGHPUT_CHECK=${THROUGHPUT_CHECK:-1}
@@ -74,6 +74,14 @@ services:
       # No public speed-test default: those are per-IP rate-limited (429) and
       # must not be read as a slow node. Point this at an object you control.
       - THROUGHPUT_CHECK_URL=${THROUGHPUT_CHECK_URL:-}
+      # Upload-capability gate: a 16KiB POST to an operator endpoint that
+      # accepts a request body and returns 2xx. Empty = idle. A download-only
+      # node stays servable; it simply ranks below proven uploaders while any
+      # exists, and the pool still picks its best downloader when none does.
+      - UPLOAD_CHECK=${UPLOAD_CHECK:-1}
+      - UPLOAD_CHECK_URL=${UPLOAD_CHECK_URL:-}
+      - UPLOAD_CHECK_BYTES=${UPLOAD_CHECK_BYTES:-16384}
+      - UPLOAD_CHECK_TIMEOUT_SECS=${UPLOAD_CHECK_TIMEOUT_SECS:-20}
       # Measured experiment for per-flow-shaped ISPs; off by default.
       - XRAY_MUX=${XRAY_MUX:-0}
       - XRAY_MUX_CONCURRENCY=${XRAY_MUX_CONCURRENCY:-8}

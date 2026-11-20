@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -257,6 +258,106 @@ func measureThroughputDial(dial func(ctx context.Context, network, addr string) 
 		res.Elapsed = time.Millisecond
 	}
 	res.Kbps, res.AvgKbps = meter.kbps(end)
+	return res
+}
+
+// UploadResult is one POST through an instance's SOCKS port. The probe proves
+// that a request BODY traverses the tunnel, which a download-only measurement
+// cannot see. A completed 2xx with Bytes == Expected is success; a target that
+// rejects the request (4xx/5xx/redirect) is Inconclusive and condemns nothing.
+type UploadResult struct {
+	Bytes        int64
+	Expected     int64
+	Status       int
+	Err          error
+	Inconclusive bool
+	URL          string
+	Elapsed      time.Duration
+}
+
+// measureUpload sends a body through proxyAddr (the instance SOCKS port).
+func measureUpload(proxyAddr, rawURL string, size int64, timeout time.Duration) UploadResult {
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		// A bad local SOCKS address is probe configuration, not node evidence.
+		return UploadResult{Err: err, URL: rawURL, Expected: size, Inconclusive: true}
+	}
+	cd, _ := dialer.(proxy.ContextDialer)
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if cd != nil {
+			return cd.DialContext(ctx, network, addr)
+		}
+		return dialer.Dial(network, addr)
+	}
+	return measureUploadDial(dial, rawURL, size, timeout)
+}
+
+func measureUploadDial(dial func(ctx context.Context, network, addr string) (net.Conn, error),
+	rawURL string, size int64, timeout time.Duration) UploadResult {
+	res := UploadResult{URL: rawURL, Expected: size}
+	if size <= 0 {
+		size = uploadProbeBytesDefault
+		res.Expected = size
+	}
+	if size > uploadProbeBytesMax {
+		size = uploadProbeBytesMax
+		res.Expected = size
+	}
+	payload := bytes.Repeat([]byte{'v'}, int(size))
+
+	transport := &http.Transport{
+		DialContext:           dial,
+		TLSHandshakeTimeout:   healthTLSHandshakeTimeout,
+		ResponseHeaderTimeout: healthResponseHeaderTimeout,
+		MaxIdleConns:          1,
+		IdleConnTimeout:       5 * time.Second,
+		DisableKeepAlives:     true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		// An upload endpoint must accept the POST directly. Following a
+		// redirect would turn some redirects into a GET, hiding a broken
+		// request-body path behind a successful page fetch.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(payload))
+	if err != nil {
+		// A malformed configured URL is never evidence about this node.
+		res.Inconclusive = true
+		res.Err = err
+		return res
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		res.Inconclusive = true
+		res.Err = fmt.Errorf("upload target scheme %q must be http or https", req.URL.Scheme)
+		return res
+	}
+	req.ContentLength = int64(len(payload))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Cache-Control", "no-store")
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	res.Elapsed = time.Since(start)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	defer func() { _ = resp.Body.Close() }()
+	res.Status = resp.StatusCode
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, probeDrainCap))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// The target answered (or redirected): the node carried the request
+		// far enough to get a verdict about the TARGET, not about capacity.
+		res.Inconclusive = true
+		res.Err = fmt.Errorf("upload target returned %d", resp.StatusCode)
+		return res
+	}
+	res.Bytes = int64(len(payload))
 	return res
 }
 

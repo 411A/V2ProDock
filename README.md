@@ -107,9 +107,9 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies, clean first then memo'd/degraded, then measured throughput class, latency; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `throughput_avg_kbps`, `bulk_usable`, and `ok_streak` |
+| `/proxies` | GET | Alive proxies: clean first (proven uploaders, then measured throughput class, then latency), then memo'd/degraded; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `throughput_avg_kbps`, `bulk_usable`, `upload_ok`, `upload_broken`, and `ok_streak` |
 | `/all` | GET | All instances including down ones (same quality fields) |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2,"bulk_check":true}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node, `bulk_check:false` when no probe URL is configured |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2,"bulk_check":true,"usable_upload":2,"upload_measured":2,"upload_inconclusive":0,"upload_check":true}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node, `bulk_check:false` when no probe URL is configured; `upload_warning` when the upload gate confirmed broken paths and no alive node is upload-capable, `upload_probe_warning` when every probe is target-rejected (unmeasured, not broken) |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 | `/memo` | POST | Attach or clear a quality note for an upstream endpoint (`{"endpoint":"host:port","memo":"..."}`); it stays alive but ranks after every clean node |
@@ -255,16 +255,25 @@ rate-limited. Slow clients never demote.
 
 A node that proves sustained bulk capacity is **pinned for 24 hours**: if a
 subscription refresh drops its endpoint, it is appended back to the pool (the
-fresh definition wins if present). A health failure or a manual memo removes the
-pin.
+fresh definition wins if present). Pinning prefers proven uploaders; when **no**
+alive node proves a POST path, the best downloader is still pinned, so a
+download-only pool is not lost to churn. A health failure, a manual memo, or a
+confirmed broken upload path (when a proven peer exists) removes the pin.
 
-Ordering within the clean and degraded partitions is: measured throughput
-class (≥1 MB/s, ≥512 KB/s, ≥256 KB/s, ≥128 KB/s, unknown), then the
-`AGG_MIN_STREAK` stability partition, then latency.
+Ordering within the clean and degraded partitions is: proven upload path (only
+while at least one node has it), measured throughput class (≥1 MB/s, ≥512 KB/s,
+≥256 KB/s, ≥128 KB/s, unknown), the `AGG_MIN_STREAK` stability partition, then
+latency. A node with no upload proof is still servable; if **no** alive node is
+proven, upload state is ignored and the pool simply picks its best downloader.
 
 `/health` exposes `usable_bulk` and `bulk_measured`; once at least one node
 has been measured, a pool with `usable_bulk:0` reports `status:"degraded"` and
-a `bulk_warning`, because small probes are not evidence of bulk capacity.
+a `bulk_warning`, because small probes are not evidence of bulk capacity. The
+independent upload fields are `usable_upload`, `upload_measured`,
+`upload_inconclusive`, and `upload_check`, with an `upload_warning` when the
+gate confirmed broken paths and no alive node can carry a POST, or an
+`upload_probe_warning` when every probe was target-rejected (unmeasured, never
+treated as a dead node).
 
 Tune or disable it:
 
@@ -277,6 +286,35 @@ THROUGHPUT_TIMEOUT_SECS=45
 THROUGHPUT_CHECK_URL=https://your-static-host.example/probe.bin
 # THROUGHPUT_CHECK=0            # metered host or blocked target
 ```
+
+#### Upload-capability gate — POSTs are a separate path
+
+A download probe cannot detect a node that accepts a CONNECT and streams a
+response body but drops or stalls a request body. That failure is invisible to
+`throughput_kbps`: GET succeeds at full speed while every POST fails. A small
+POST through the same SOCKS port closes that blind spot.
+
+```env
+UPLOAD_CHECK=1
+UPLOAD_CHECK_URL=https://your-echo-host.example/post  # accepts a body, returns 2xx
+UPLOAD_CHECK_BYTES=16384        # 16 KiB, same cadence as the bulk gate
+UPLOAD_CHECK_TIMEOUT_SECS=20
+```
+
+The target must accept a POST and return 2xx only after reading the body; an
+echo endpoint is ideal. A target-level rejection (4xx/5xx/redirect) is
+inconclusive and condemns nothing. Two consecutive conclusive failures mark the
+node `upload_broken`; one success restores `upload_ok`. A broken or unmeasured
+node is **never removed**: proven uploaders are ordered first only while at
+least one exists, and if none does the pool chooses its best downloader. Empty
+`UPLOAD_CHECK_URL` keeps the gate idle and preserves the old ordering exactly.
+
+Pinning prefers proven uploaders: once any alive node proves a POST path, a
+newly pinned node must prove it too. When none does, the best downloader is
+still pinned so the pool cannot lose its only working nodes to churn.
+`upload_broken` and `upload_ok` are exposed on `/proxies`; `/health` carries
+`usable_upload`, `upload_measured`, `upload_inconclusive`, `upload_check`, and
+the two warnings above.
 
 Repeated short **plain-HTTP** bodies (Content-Length not satisfied) are counted
 per endpoint; after 3, the node is auto-memo'd. HTTPS/CONNECT bodies are opaque
@@ -736,6 +774,10 @@ Environment variables (set in `.env` or via docker-compose):
 | `THROUGHPUT_CHECK_BYTES` | `4194304` | Body size for the gate (64 KiB–16 MiB) |
 | `THROUGHPUT_TIMEOUT_SECS` | `45` | Whole-probe timeout (5–180 s) |
 | `THROUGHPUT_CHECK_URL` | — | **Required** operator-controlled body URL (`%d` = configured bytes, at least 4 MiB); empty = gate idle |
+| `UPLOAD_CHECK` | `1` | `0` disables the upload probe; it also stays idle when `UPLOAD_CHECK_URL` is empty |
+| `UPLOAD_CHECK_URL` | — | Optional operator endpoint that accepts a POST body and returns 2xx after reading it; empty = gate idle |
+| `UPLOAD_CHECK_BYTES` | `16384` | POST body size (1 KiB–1 MiB) |
+| `UPLOAD_CHECK_TIMEOUT_SECS` | `20` | Whole-POST timeout (5–120 s) |
 | `XRAY_MUX` | `0` | `1` = add mux.cool to VMess/VLESS/Trojan outbounds (measured experiment; Vision/subscription mux untouched) |
 | `XRAY_MUX_CONCURRENCY` | `8` | Mux concurrency (1–128) |
 | `LOG_LEVEL` | `info` | `info` = important logs only; `debug` = verbose + xray logs |

@@ -43,9 +43,19 @@ type InstanceStatus struct {
 	// signature.
 	ThroughputAvgKbps int64 `json:"throughput_avg_kbps,omitempty"`
 	BulkUsable        bool  `json:"bulk_usable,omitempty"`
-	// throughputAt/lows are scheduler state, not API surface.
+	// UploadOK is positive proof that a request BODY traverses this node.
+	// UploadBroken is the confirmed negative after two consecutive conclusive
+	// failures. Neither is a hard failure: a download-only node is still
+	// servable and still ranked by download capacity. UploadOK only wins the
+	// ladder when at least one alive node has it, so a pool with no capable
+	// node falls back to its best downloader instead of refusing service.
+	UploadOK     bool `json:"upload_ok,omitempty"`
+	UploadBroken bool `json:"upload_broken,omitempty"`
+	// throughputAt/lows and uploadAt/fails are scheduler state, not API surface.
 	throughputAt  time.Time
 	lowThroughput int
+	uploadAt      time.Time
+	uploadFails   int
 	// Stability signals: consecutive successful health checks on the current
 	// upstream, and when it was adopted. Long-polling clients should prefer
 	// high streaks over merely low latency (stable-slow beats flappy-fast).
@@ -74,6 +84,9 @@ type ProxyManager struct {
 	// pool never bursts 10 x 4MiB at once) and a per-instance in-flight set.
 	throughputSem  chan struct{}
 	throughputBusy map[int]bool
+	// Upload probes share the worker pool but have their own in-flight set:
+	// they are small and independent of the download cadence.
+	uploadBusy map[int]bool
 	// pinned keeps configs that PROVED sustained bulk throughput. Subscription
 	// refreshes drop endpoints the remote list rotated out; without this, a
 	// proven 3 MB/s node can be replaced by an unproven one. TTL-bound and
@@ -355,6 +368,10 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 		m.statuses[i].BulkUsable = false
 		m.statuses[i].lowThroughput = 0
 		m.statuses[i].throughputAt = time.Time{}
+		m.statuses[i].UploadOK = false
+		m.statuses[i].UploadBroken = false
+		m.statuses[i].uploadFails = 0
+		m.statuses[i].uploadAt = time.Time{}
 		if port > 0 {
 			setHTTPPortEndpoint(port, "")
 		}
@@ -368,6 +385,10 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 		m.statuses[i].BulkUsable = false
 		m.statuses[i].lowThroughput = 0
 		m.statuses[i].throughputAt = time.Time{}
+		m.statuses[i].UploadOK = false
+		m.statuses[i].UploadBroken = false
+		m.statuses[i].uploadFails = 0
+		m.statuses[i].uploadAt = time.Time{}
 	}
 	m.statuses[i].Endpoint = cfg.Endpoint
 	memo := m.memoForLocked(cfg.Endpoint)
@@ -465,6 +486,69 @@ func (m *ProxyManager) BulkStats() (usable, measured int) {
 	return usable, measured
 }
 
+// UploadStats reports alive nodes whose upload probe has run, those proven
+// able to carry a request body, and those whose only attempts were target-side
+// rejections. 0/0/0 means the gate is off or has not run, not a broken pool.
+func (m *ProxyManager) UploadStats() (usable, measured, inconclusive int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.statuses {
+		if s.Status != "ok" || s.uploadAt.IsZero() {
+			continue
+		}
+		measured++
+		if s.UploadOK {
+			usable++
+			continue
+		}
+		if !s.UploadBroken && s.uploadFails == 0 {
+			inconclusive++
+		}
+	}
+	return usable, measured, inconclusive
+}
+
+// UploadBrokenCount reports alive nodes whose upload path is CONFIRMED broken.
+// One failed sample is deliberately not counted: health must not degrade on a
+// transient the same hysteresis protects in the routing ladder.
+func (m *ProxyManager) UploadBrokenCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, s := range m.statuses {
+		if s.Status == "ok" && s.UploadBroken {
+			n++
+		}
+	}
+	return n
+}
+
+// uploadPinnableLocked reports whether a node may be preserved across a
+// subscription refresh. With the upload gate active, a proven upload path
+// wins; but when NO alive node has upload proof, download proof is still the
+// best evidence available, so the pool must not lose its best downloader just
+// because nothing in the working set can carry a POST. Caller holds m.mu.
+func (m *ProxyManager) uploadPinnableLocked(s *InstanceStatus) bool {
+	if !uploadGateActive() || s.UploadOK {
+		return true
+	}
+	return !m.anyUploadProvenLocked()
+}
+
+// anyUploadProvenLocked reports whether any CLEAN alive node proves BOTH a
+// request-body path and bulk capacity. A node with only one half is not yet a
+// reason to stop pinning a proven downloader; a degraded node is last-resort
+// by the same partition as the routing ladder. Caller holds m.mu.
+func (m *ProxyManager) anyUploadProvenLocked() bool {
+	for i := range m.statuses {
+		s := &m.statuses[i]
+		if s.Status == "ok" && s.UploadOK && s.BulkUsable && !s.Degraded {
+			return true
+		}
+	}
+	return false
+}
+
 // applyThroughput folds one measurement into the status. A completed body at
 // or above the floor promotes immediately; two consecutive low/partial bodies
 // demote (hysteresis prevents a single bad sample from flapping the pool).
@@ -472,8 +556,9 @@ func (m *ProxyManager) BulkStats() (usable, measured int) {
 func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputResult) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if i < 0 || i >= len(m.statuses) || m.statuses[i].Endpoint != endpoint {
-		return // instance switched while the probe was in flight
+	if i < 0 || i >= len(m.statuses) || m.statuses[i].Endpoint != endpoint ||
+		m.statuses[i].Status != "ok" {
+		return // switched or went down while the probe was in flight
 	}
 	s := &m.statuses[i]
 	s.throughputAt = time.Now()
@@ -495,7 +580,9 @@ func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputRes
 	case complete:
 		s.BulkUsable = true
 		s.lowThroughput = 0
-		m.pinLocked(i, endpoint)
+		if m.uploadPinnableLocked(s) {
+			m.pinLocked(i, endpoint)
+		}
 	case res.Bytes > 0:
 		s.lowThroughput++
 		if s.lowThroughput >= 2 {
@@ -505,6 +592,47 @@ func (m *ProxyManager) applyThroughput(i int, endpoint string, res ThroughputRes
 	s.Degraded = s.Memo != "" || throughputLow(s)
 	if s.Degraded {
 		delete(m.pinned, endpoint)
+	}
+	m.buildCacheLocked()
+}
+
+// applyUpload folds one POST verdict into the status. Success promotes the
+// node's upload class and pins it when bulk capacity is already proven. Two
+// consecutive conclusive failures confirm the broken state; one failure leaves
+// an already-proven node in place (hysteresis), and any target-level rejection
+// (4xx/5xx/redirect) changes nothing. It never marks a node down.
+func (m *ProxyManager) applyUpload(i int, endpoint string, res UploadResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.statuses) || m.statuses[i].Endpoint != endpoint ||
+		m.statuses[i].Status != "ok" {
+		return // switched or went down while the probe was in flight
+	}
+	s := &m.statuses[i]
+	s.uploadAt = time.Now()
+	if res.Inconclusive {
+		return
+	}
+	ok := res.Err == nil && res.Status >= 200 && res.Status < 300 &&
+		(res.Expected <= 0 || res.Bytes >= res.Expected)
+	if ok {
+		s.UploadOK = true
+		s.UploadBroken = false
+		s.uploadFails = 0
+		if s.BulkUsable && !s.Degraded {
+			m.pinLocked(i, endpoint)
+		}
+	} else {
+		s.uploadFails++
+		if s.uploadFails >= uploadFailureThreshold {
+			s.UploadOK = false
+			s.UploadBroken = true
+			// Drop the pin only when another alive node can upload: this node
+			// is then a priority-lowered fallback, not the only path.
+			if m.anyUploadProvenLocked() {
+				delete(m.pinned, endpoint)
+			}
+		}
 	}
 	m.buildCacheLocked()
 }
@@ -636,6 +764,80 @@ func (m *ProxyManager) maybeMeasureThroughput(i int, inst *ProxySelector) {
 		}()
 		res := measureThroughput(socksAddr, url, want, throughputProbeTimeout())
 		m.applyThroughput(i, endpoint, res)
+	}()
+}
+
+// maybeMeasureUpload schedules the small POST probe with the same cadence and
+// worker pool as the download gate. It never blocks the health loop and never
+// competes with a client that carried bytes in the last 5s.
+func (m *ProxyManager) maybeMeasureUpload(i int, inst *ProxySelector) {
+	url := uploadProbeURL()
+	if !uploadCheckEnabled() || url == "" {
+		return // opt-in gate: no target, no behavior change
+	}
+	m.mu.Lock()
+	if i < 0 || i >= len(m.statuses) {
+		m.mu.Unlock()
+		return
+	}
+	st := m.statuses[i]
+	if st.Status != "ok" || st.Endpoint == "" {
+		m.mu.Unlock()
+		return
+	}
+	due := throughputInterval()
+	if st.uploadFails == 1 {
+		// First failure: confirm on the next health tick, not after the full
+		// cadence. Two strikes still protect against one transient.
+		due = throughputConfirmInterval
+	}
+	if !st.uploadAt.IsZero() && time.Since(st.uploadAt) < due {
+		m.mu.Unlock()
+		return
+	}
+	if m.uploadBusy == nil {
+		m.uploadBusy = make(map[int]bool)
+	}
+	if m.uploadBusy[i] {
+		m.mu.Unlock()
+		return
+	}
+	if m.throughputSem == nil {
+		m.throughputSem = make(chan struct{}, throughputProbeWorkers)
+	}
+	sem := m.throughputSem
+	m.mu.Unlock()
+
+	if egressActive([]int{inst.HTTPPort(), inst.SOCKSPort()}, 5*time.Second) {
+		return // a live tunnel is already proving capacity; don't compete
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		return // both workers busy with other probes
+	}
+
+	m.mu.Lock()
+	if m.uploadBusy[i] {
+		m.mu.Unlock()
+		<-sem
+		return
+	}
+	m.uploadBusy[i] = true
+	m.mu.Unlock()
+
+	endpoint := st.Endpoint
+	socksAddr := inst.SOCKSAddr()
+	size := uploadProbeSize()
+	go func() {
+		defer func() {
+			<-sem
+			m.mu.Lock()
+			delete(m.uploadBusy, i)
+			m.mu.Unlock()
+		}()
+		res := measureUpload(socksAddr, url, size, uploadProbeTimeout())
+		m.applyUpload(i, endpoint, res)
 	}()
 }
 
@@ -1008,7 +1210,7 @@ func (m *ProxyManager) consumePassiveThroughput(i int) {
 	s.lowThroughput = 0
 	s.throughputAt = time.Now()
 	s.Degraded = s.Memo != ""
-	if s.Degraded {
+	if s.Degraded || !m.uploadPinnableLocked(s) {
 		delete(m.pinned, st.Endpoint)
 	} else {
 		m.pinLocked(i, st.Endpoint)
@@ -1023,6 +1225,7 @@ func (m *ProxyManager) afterMarkOK(i int, inst *ProxySelector) {
 	m.consumePassiveThroughput(i)
 	m.autoMemoShortTransfers(i)
 	m.maybeMeasureThroughput(i, inst)
+	m.maybeMeasureUpload(i, inst)
 }
 
 func (m *ProxyManager) HealthCheckAll() {
@@ -1321,24 +1524,11 @@ func (m *ProxyManager) GetAliveStatuses() []InstanceStatus {
 	}
 	m.mu.Unlock()
 
-	slices.SortFunc(alive, func(a, b InstanceStatus) int {
-		// Aware clients see the warning on the entry itself, and the list keeps
-		// clean nodes first so a naive client that takes proxies[0] does not
-		// start with a known-truncating or confirmed-slow node. Within each
-		// tier, measured throughput class beats handshake latency.
-		if a.Degraded != b.Degraded {
-			if a.Degraded {
-				return 1
-			}
-			return -1
-		}
-		if ta, tb := throughputTier(a.ThroughputKbps), throughputTier(b.ThroughputKbps); ta != tb {
-			return cmp.Compare(tb, ta)
-		}
-		return cmp.Compare(a.LatMs, b.LatMs)
-	})
-
-	return alive
+	// Clean nodes first so a naive client that takes proxies[0] does not start
+	// with a known-truncating or confirmed-slow node. Within each partition a
+	// proven upload path leads when one exists, then measured throughput class
+	// beats handshake latency.
+	return sortAliveByQuality(alive)
 }
 
 func (m *ProxyManager) InstanceCount() int {

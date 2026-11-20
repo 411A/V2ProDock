@@ -81,6 +81,7 @@ These are different failures and need different fixes:
 | A repeatable ceiling at the same byte count (~12–16 KB) on one proxy, while another proxy moves the same file | Broken/truncating upstream hop |
 | Large TLS transfers stall but tiny requests work, on every path | Path MTU / MSS (especially VPN clients) |
 | 204 health checks pass but bulk throughput is 1–7 KB/s on one node | Shaped/throttled upstream; the bulk gate demotes it (`throughput_kbps`, `degraded`) |
+| Downloads work but most POSTs fail on one node | Upload-capability gate; set `UPLOAD_CHECK_URL` and the node is ranked below proven uploaders (`upload_broken`), still last-resort instead of removed |
 
 `XRAY_FRAGMENT=1` is an anti-RST tool, not a speed setting. Measured on a
 shaped link, the split ClientHello was itself the fingerprint: identical
@@ -91,6 +92,25 @@ catches a burst-then-throttle node that a small average probe would certify.
 It needs `THROUGHPUT_CHECK_URL` pointed at an operator-controlled object;
 public speed-test URLs are per-IP rate-limited (429) and are treated as
 inconclusive, never as a slow node.
+
+## Downloads work, uploads fail — probe the request-body path
+
+Throughput is measured by downloading a body. A node can pass that test and
+still drop or stall a request body, which is why large POSTs fail while GETs
+are fine. The optional upload gate sends a 16 KiB POST through the same SOCKS
+port to `UPLOAD_CHECK_URL` on the same cadence. Two consecutive conclusive
+failures mark `upload_broken`; one success restores `upload_ok`. Rejections by
+the target (4xx/5xx/redirect) are inconclusive.
+
+The node is never removed. Proven uploaders lead the ladder only while at least
+one exists; if none does, the pool still chooses its best downloader. Pinning
+follows the same rule: a proven uploader is preferred, but with no proven node
+the best downloader is still pinned across subscription refreshes. The gate is
+off unless `UPLOAD_CHECK_URL` is set, and `upload_broken` is visible on
+`/proxies` while `/health` reports `usable_upload`/`upload_measured`. If every
+probe is target-rejected, `/health` reports `upload_inconclusive` and
+`upload_probe_warning` instead of silently looking unmeasured; node state is
+untouched.
 
 ## Known latent issue: inconclusive bulk probes look healthy
 
