@@ -112,18 +112,26 @@ probe is target-rejected, `/health` reports `upload_inconclusive` and
 `upload_probe_warning` instead of silently looking unmeasured; node state is
 untouched.
 
-## Single-upstream mode (UPSTREAM_PROXY)
+## Mixed pool (subscriptions + static upstreams)
 
-When `UPSTREAM_PROXY` is set, the daemon runs exactly one xray child and sends
-all traffic to that external SOCKS5 server. Subscriptions and `PROXY_INSTANCES`
-are ignored, so `/proxies` and `/health` describe one upstream, not a ranked
-pool; `/refresh` is a no-op. Health, aggregate ports, memos, throughput and
-upload gates still operate on that upstream. If it dies, every local client
-path fails until it returns (or until you unset the variable and restart). This
-is deliberate: one upstream has no second route to fail over to.
+`STATIC_UPSTREAMS` adds operator-declared socks5/http/https proxies to the same
+pool as subscription configs. Static entries fill the first ports; subscription
+configs fill the rest and remain available as replacements. Every instance gets
+the same health, throughput, upload, memo and pinning treatment, and duplicate
+`host:port` entries are collapsed (static wins). `UPSTREAM_PROXY` is one-entry
+sugar for the same path; it no longer disables subscriptions.
 
-A malformed `UPSTREAM_PROXY` fails startup closed. Credentials are confined to
-the 0600 xray config; status and logs expose only `host:port`.
+`PORT_COUNT` (legacy alias `PROXY_INSTANCES`) is the number of exposed instance
+ports. If fewer distinct healthy sources exist, `/health` reports
+`requested`/`allocated`/`shortfall` and a `shortfall_reason`; those ports have
+no healthy backend, while the stable aggregate ports still route to the best
+alive instance. A proxy failure re-points that port to another working,
+distinct source when available; otherwise it stays down and the aggregate
+continues on the surviving ports.
+
+A malformed static entry fails startup closed. Credentials are confined to the
+0600 xray config; status and logs expose only `scheme://host:port` and the
+source name.
 
 ## Known latent issue: inconclusive bulk probes look healthy
 

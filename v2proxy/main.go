@@ -47,7 +47,13 @@ func main() {
 		xrayDir = v
 	}
 	portBase = portOrDefault("PORT_BASE", portBase)
-	if v := os.Getenv("PROXY_INSTANCES"); v != "" {
+	if v := strings.TrimSpace(os.Getenv("PORT_COUNT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			instanceCount = n
+		} else {
+			warnLog("PORT_COUNT=%q invalid, using %d", v, instanceCount)
+		}
+	} else if v := strings.TrimSpace(os.Getenv("PROXY_INSTANCES")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			instanceCount = n
 		}
@@ -70,15 +76,15 @@ func main() {
 		}
 	}
 
-	upstreamMode := upstreamProxyEnabled()
-	if len(subURLs) == 0 && !upstreamMode {
+	staticSources := staticUpstreamsConfigured()
+	if len(subURLs) == 0 && !staticSources {
 		fmt.Print("Enter subscription URL: ")
 		if _, err := fmt.Scanln(&subURL); err != nil {
 			errLog("scan failed: %v", err)
 		}
 		subURLs = splitURLs(subURL)
 		if len(subURLs) == 0 {
-			errLog("Subscription URL is required")
+			errLog("Subscription URL or STATIC_UPSTREAMS/UPSTREAM_PROXY is required")
 			os.Exit(1)
 		}
 		if err := os.MkdirAll(configDir, 0755); err != nil {
@@ -92,11 +98,8 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if upstreamMode {
-		infoLog("UPSTREAM_PROXY set: single external SOCKS5 upstream; subscription pool disabled")
-		if len(subURLs) > 0 {
-			warnLog("%d configured subscription source(s) ignored while UPSTREAM_PROXY is set", len(subURLs))
-		}
+	if staticSources {
+		infoLog("configured static upstream(s); merging with %d subscription source(s)", len(subURLs))
 	} else {
 		infoLog("configured %d subscription source(s)", len(subURLs))
 	}
@@ -179,7 +182,7 @@ func main() {
 	bannerLog(fmt.Sprintf("Working proxies: %d/%d", manager.AliveCount(), manager.InstanceCount()))
 
 	go healthCheckLoop(manager)
-	if !upstreamMode {
+	if len(subURLs) > 0 {
 		go subscriptionLoop(manager)
 	}
 

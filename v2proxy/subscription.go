@@ -20,6 +20,13 @@ type ProxyConfig struct {
 	Raw      string
 	Endpoint string // normalized "host:port" identity; same server is never exposed twice
 	XrayCfg  json.RawMessage
+	// Static marks an operator-declared upstream (STATIC_UPSTREAMS or
+	// UPSTREAM_PROXY). Static entries are prepended to the pool and keep
+	// their order through shuffles; they are still ordinary candidates.
+	Static bool
+	// Source is a credential-free label for APIs and logs:
+	// "static:<name>" or "subscription:<scheme://host>".
+	Source string
 
 	// rank is this line's DPI-resistance tier, computed once by orderByDPIRank.
 	// Unexported so it travels with the config through the selector without
@@ -325,7 +332,20 @@ func orderByDPIRank(configs []ProxyConfig) {
 		}
 	})
 }
+
+// subscriptionSourceLabel is the durable, credential-free source identity for
+// API and logs. Paths and queries are dropped: subscription URLs often carry
+// tokens there, and the host is enough to tell sources apart.
+func subscriptionSourceLabel(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "subscription"
+	}
+	return "subscription:" + u.Scheme + "://" + u.Host
+}
+
 func FetchSubscription(subURL string) ([]ProxyConfig, error) {
+	source := subscriptionSourceLabel(subURL)
 	client := &http.Client{
 		Timeout: fetchTimeout,
 		Transport: &http.Transport{
@@ -371,6 +391,7 @@ func FetchSubscription(subURL string) ([]ProxyConfig, error) {
 		if err != nil {
 			continue
 		}
+		proxy.Source = source
 		proxies = append(proxies, *proxy)
 	}
 	before := len(proxies)

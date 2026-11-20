@@ -86,13 +86,13 @@ Run multiple independent proxy instances in a single container:
 ```bash
 # .env
 SUBSCRIPTION_URLS=https://sub1.example,https://sub2.example,https://sub3.example
-PROXY_INSTANCES=3
+PORT_COUNT=3
 ```
 
-Port layout: all SOCKS5 ports come first, then all HTTP ports. Instance `i` of `N` gets `SOCKS5=PORT_BASE+i` and `HTTP=PORT_BASE+N+i` (e.g. with `N=3`: SOCKS `27019-27021`, HTTP `27022-27024`). Query them via the API:
+Port layout: all SOCKS5 ports come first, then all HTTP ports. Instance `i` of `N` gets `SOCKS5=PORT_BASE+i` and `HTTP=PORT_BASE+N+i` (e.g. with `N=3`: SOCKS `27019-27021`, HTTP `27022-27024`). `PROXY_INSTANCES` is the legacy alias for `PORT_COUNT`. Query them via the API:
 
 ```bash
-# Returns alive proxies sorted by lowest latency
+# Returns alive proxies sorted by measured quality
 curl http://localhost:27018/proxies
 ```
 
@@ -107,9 +107,9 @@ curl http://localhost:27018/proxies
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/proxies` | GET | Alive proxies: clean first (proven uploaders, then measured throughput class, then latency), then memo'd/degraded; each carries `endpoint`, `memo`, `degraded`, `throughput_kbps`, `throughput_avg_kbps`, `bulk_usable`, `upload_ok`, `upload_broken`, and `ok_streak` |
+| `/proxies` | GET | Alive proxies: clean first (proven uploaders, then measured throughput class, then latency), then memo'd/degraded; each carries `source`, `role`, `endpoint`, `memo`, `degraded`, `throughput_kbps`, `throughput_avg_kbps`, `bulk_usable`, `upload_ok`, `upload_broken`, and `ok_streak` |
 | `/all` | GET | All instances including down ones (same quality fields) |
-| `/health` | GET | `{"status":"ok","instances":3,"alive":2,"starting":1,"degraded":0,"usable_bulk":2,"bulk_measured":2,"bulk_check":true,"usable_upload":2,"upload_measured":2,"upload_inconclusive":0,"upload_check":true}` + stable `aggregate_socks`/`aggregate_http` endpoints; `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node, `bulk_check:false` when no probe URL is configured; `upload_warning` when the upload gate confirmed broken paths and no alive node is upload-capable, `upload_probe_warning` when every probe is target-rejected (unmeasured, not broken) |
+| `/health` | GET | `{"status":"ok","instances":3,"alive":3,"starting":0,"degraded":0,"requested":3,"allocated":3,"shortfall":0,"usable_bulk":2,"bulk_measured":2,"bulk_check":true,"usable_upload":2,"upload_measured":2,"upload_inconclusive":0,"upload_check":true}` + stable `aggregate_socks`/`aggregate_http` endpoints; `shortfall_reason` when fewer healthy sources than requested ports, `fallback_only:true` when every alive proxy has a memo, `status:"degraded"` when the bulk gate measured no usable node, `bulk_check:false` when no probe URL is configured; `upload_warning` when the upload gate confirmed broken paths and no alive node is upload-capable, `upload_probe_warning` when every probe is target-rejected (unmeasured, not broken) |
 | `/vpn` | GET | VPN pinning proof: upstream SOCKS + egress IP + `verified` |
 | `/refresh` | POST | Force subscription re-fetch |
 | `/memo` | POST | Attach or clear a quality note for an upstream endpoint (`{"endpoint":"host:port","memo":"..."}`); it stays alive but ranks after every clean node |
@@ -320,31 +320,35 @@ Repeated short **plain-HTTP** bodies (Content-Length not satisfied) are counted
 per endpoint; after 3, the node is auto-memo'd. HTTPS/CONNECT bodies are opaque
 to the bridge, so those are covered by the throughput gate instead.
 
-#### Single external SOCKS5 upstream (optional)
+#### Mixed pool: subscriptions + static upstreams
 
-If another local proxy manager already holds a working node and this daemon's
-own pool is temporarily poor, point V2ProDock at that SOCKS5 listener instead
-of chaining two full pools:
+Static upstreams are ordinary pool candidates, not a separate mode:
 
 ```env
-UPSTREAM_PROXY=socks5://gateway-host:1080
-# with auth:
-# UPSTREAM_PROXY=socks5://user:pass@gateway-host:1080
+PORT_COUNT=5
+STATIC_UPSTREAMS="edge=socks5://gateway-host:1080,office=http://gateway-host:8080"
+# legacy shortcut for one static entry:
+# UPSTREAM_PROXY=socks5://gateway-host:1080
 ```
 
-In this mode V2ProDock runs **one** xray child with a native `socks` outbound
-and routes everything through that upstream. The subscription pool is disabled
-and `PROXY_INSTANCES` is ignored: ranking ten copies of the same external node
-would be noise, and leaving subscription configs active would make status,
-memos and pinning describe nodes that are no longer used. Health checks,
-stable aggregate ports, memos, throughput and upload gates all still apply to
-the single upstream.
+Each static entry becomes one config with its own source label, health checks,
+throughput tail probe, upload probe, memo/degraded handling and port. Static
+entries are trusted and fill the first ports; subscription configs fill the
+remaining ports and stay available as replacements. When a port's proxy dies,
+the selector re-points it to another working config with a **different
+`host:port`**; if none exists, that port goes down and `/health` reports the
+shortfall. The stable aggregate ports always route to the best alive instance,
+even when only one source survives.
 
-Unset `UPSTREAM_PROXY` and restart to return to the normal multi-node pool.
-There is no hot reload. A malformed value fails startup closed rather than
-silently falling back to a different pool. Do not point it at this daemon's
-own listener ports. Credentials are written only to the 0600 xray config; logs
-and `/proxies` expose `host:port`, never the password.
+`PORT_COUNT` is the number of exposed instance ports; `PROXY_INSTANCES` remains
+a legacy alias. Duplicate endpoints are collapsed, with a static declaration
+winning over a subscription line. `UPSTREAM_PROXY` is sugar for a single static
+entry and no longer disables subscriptions; if no subscription URLs are
+configured, the static entries are the pool.
+
+A malformed static entry fails startup closed. Credentials are confined to the
+0600 xray config; logs, errors and `/proxies` expose `scheme://host:port` and
+the source name, never the password.
 
 #### `XRAY_MUX` — measured per-flow shaping experiment
 
@@ -774,12 +778,14 @@ Environment variables (set in `.env` or via docker-compose):
 |----------|---------|-------------|
 | `SUBSCRIPTION_URL` | — | Single v2ray subscription URL (see [V2RayDAR](https://github.com/411A/V2RayDAR) to self-host one) |
 | `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
-| `UPSTREAM_PROXY` | — | Optional `socks5://[user:pass@]host:port` single external upstream; enables one-instance mode and disables subscriptions. Unset + restart to return to the pool; malformed values fail closed |
+| `STATIC_UPSTREAMS` | — | Comma/newline-separated `name=socks5://[user:pass@]host:port`, `name=http://...`, or `name=https://...` entries merged into the same pool |
+| `UPSTREAM_PROXY` | — | Legacy sugar for one static entry (same parser/renderer); no longer disables subscriptions |
+| `PORT_COUNT` | `1` | Number of instance ports to expose (`PROXY_INSTANCES` is the legacy alias) |
 | `REQUIRE_TRANSPORT_SECURITY` | `0` | `1` = DPI-hardened: also reject SS and VMess/VLESS without TLS/Reality; Reality SNI plausibility is always checked |
 | `SNI_DENYLIST` | - | Optional operator-supplied Reality SNIs (`*.suffix` supported); no names are compiled in |
 | `SNI_ALLOWLIST` | - | Optional escape hatch for a Reality host whose suffix is newer than the bundled public-suffix list (or intentionally private); denylist still wins |
 | `SNI_DNS_CHECK` | `0` | `1` = reject Reality SNI only on definite NXDOMAIN (timeouts stay inconclusive) |
-| `PROXY_INSTANCES` | `1` | Number of xray instances to run (ignored in `UPSTREAM_PROXY` mode) |
+| `PROXY_INSTANCES` | `1` | Legacy alias for `PORT_COUNT` |
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity (must be `https://` — plain HTTP is DPI-killed on bare transports, causing false downs) |
@@ -860,7 +866,7 @@ For devices with limited RAM (256MB-512MB):
 GOGC=100
 GOMEMLIMIT=128MiB
 MAX_CONNS=64
-PROXY_INSTANCES=1
+PORT_COUNT=1
 ```
 
 ```bash
@@ -868,7 +874,7 @@ PROXY_INSTANCES=1
 GOGC=50
 GOMEMLIMIT=256MiB
 MAX_CONNS=256
-PROXY_INSTANCES=3
+PORT_COUNT=3
 ```
 
 ## License

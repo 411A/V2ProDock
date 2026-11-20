@@ -34,6 +34,11 @@ type InstanceStatus struct {
 	// Degraded is the machine-readable form of Memo != "".
 	Memo     string `json:"memo,omitempty"`
 	Degraded bool   `json:"degraded,omitempty"`
+	// Source is the credential-free origin: "static:<name>" or
+	// "subscription:<scheme://host>". Role is "primary" while this instance is
+	// serving and "standby" while its port has no healthy source.
+	Source string `json:"source,omitempty"`
+	Role   string `json:"role,omitempty"`
 	// ThroughputKbps is the measured bulk rate (kilobits/s; 0 = not measured).
 	// BulkUsable is true only after a completed fetch at or above the floor.
 	// A low measurement demotes the node via Degraded but never marks it down.
@@ -68,11 +73,11 @@ type ProxyManager struct {
 	instances []*ProxySelector
 	statuses  []InstanceStatus
 	subURLs   []string
-	// upstream is the single external SOCKS5 config in UPSTREAM_PROXY mode.
-	// It is nil in normal pool mode. upstreamErr fails startup closed when the
-	// operator configured an invalid upstream; never silently fall back.
-	upstream      *ProxyConfig
-	upstreamErr   error
+	// staticConfigs are operator-declared upstreams merged into every pool
+	// alongside subscription configs. staticErr fails startup closed when a
+	// declared entry is malformed; never silently drop it.
+	staticConfigs []ProxyConfig
+	staticErr     error
 	xrayDir       string
 	testURL       string
 	portBase      int
@@ -192,23 +197,14 @@ func (b *srcBreaker) note(url string, ok bool) {
 }
 
 func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subURLs []string, checkInterval time.Duration) *ProxyManager {
-	// Single-upstream mode has exactly one thing to serve. Running N local
-	// xray children against the same external SOCKS endpoint adds memory and
-	// duplicate health/probe traffic without adding a second route.
-	var upstream *ProxyConfig
-	var upstreamErr error
-	if upstreamProxyEnabled() {
-		upstream, upstreamErr = upstreamProxyConfig()
-		if instanceCount > 1 {
-			warnLog("UPSTREAM_PROXY is set: using a single external upstream and ignoring PROXY_INSTANCES=%d", instanceCount)
-		}
-		instanceCount = 1
-	}
+	// Static upstreams are pool candidates, not a separate mode. Parsing them
+	// here keeps every consumer (startup, refresh, API) on one source list.
+	staticConfigs, staticErr := staticUpstreamConfigs()
 
 	m := &ProxyManager{
 		subURLs:       subURLs,
-		upstream:      upstream,
-		upstreamErr:   upstreamErr,
+		staticConfigs: staticConfigs,
+		staticErr:     staticErr,
 		xrayDir:       xrayDir,
 		testURL:       testURL,
 		portBase:      portBase,
@@ -305,28 +301,55 @@ func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
 	return nil, lastErr
 }
 
-// initialPool is the one place startup chooses between the subscription pool
-// and UPSTREAM_PROXY mode. A configured-but-invalid upstream fails closed: it
-// must never silently fall back to fetching a different pool.
+// initialPool is the one place startup chooses between subscription data,
+// static upstreams, and both. A malformed static entry fails closed. A dead
+// subscription source no longer takes static upstreams down with it.
 func (m *ProxyManager) initialPool(urls []string) ([]ProxyConfig, error) {
-	if m.upstreamErr != nil {
-		return nil, m.upstreamErr
+	if m.staticErr != nil {
+		return nil, m.staticErr
 	}
-	if m.upstream != nil {
-		return []ProxyConfig{*m.upstream}, nil
+	var subs []ProxyConfig
+	hasSubs := false
+	for _, u := range urls {
+		if strings.TrimSpace(u) != "" {
+			hasSubs = true
+			break
+		}
 	}
-	return fetchPoolWithRetry(urls)
+	if hasSubs {
+		var err error
+		subs, err = fetchPoolWithRetry(urls)
+		if err != nil {
+			if len(m.staticConfigs) == 0 {
+				return nil, err
+			}
+			warnLog("subscriptions unavailable (%v); serving %d static upstream(s)", err, len(m.staticConfigs))
+		}
+	}
+	pool := make([]ProxyConfig, 0, len(m.staticConfigs)+len(subs))
+	pool = append(pool, m.staticConfigs...)
+	pool = append(pool, subs...)
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("no subscription URLs and no static upstreams configured")
+	}
+	return pool, nil
 }
 
 func dedupConfigs(in []ProxyConfig) []ProxyConfig {
-	seen := make(map[string]bool, len(in))
+	seen := make(map[string]int, len(in))
 	out := make([]ProxyConfig, 0, len(in))
 	for _, c := range in {
 		key := c.Key()
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, c)
+		if idx, ok := seen[key]; ok {
+			// Operator-declared static upstream wins identity ties even if a
+			// subscription line arrived first.
+			if c.Static && !out[idx].Static {
+				out[idx] = c
+			}
+			continue
 		}
+		seen[key] = len(out)
+		out = append(out, c)
 	}
 	if dropped := len(in) - len(out); dropped > 0 {
 		debugLog("dedup: dropped %d duplicate line(s)/same-server entries", dropped)
@@ -340,8 +363,32 @@ func dedupConfigs(in []ProxyConfig) []ProxyConfig {
 // often cluster in one region of the pool). Uniqueness across instances is
 // still guaranteed by the shared claim set, not by ordering.
 func shuffleConfigs(in []ProxyConfig, seed int64) {
+	hasStatic := false
+	for i := range in {
+		if in[i].Static {
+			hasStatic = true
+			break
+		}
+	}
 	r := rand.New(rand.NewSource(seed))
-	r.Shuffle(len(in), func(a, b int) { in[a], in[b] = in[b], in[a] })
+	if !hasStatic {
+		r.Shuffle(len(in), func(a, b int) { in[a], in[b] = in[b], in[a] })
+		return
+	}
+	// Operator-declared upstreams are trusted and fill the first ports. Keep
+	// their declared order; shuffle only the subscription remainder.
+	static := make([]ProxyConfig, 0, len(in))
+	rest := make([]ProxyConfig, 0, len(in))
+	for _, c := range in {
+		if c.Static {
+			static = append(static, c)
+		} else {
+			rest = append(rest, c)
+		}
+	}
+	r.Shuffle(len(rest), func(a, b int) { rest[a], rest[b] = rest[b], rest[a] })
+	copy(in, static)
+	copy(in[len(static):], rest)
 }
 
 func (m *ProxyManager) snapshot() (insts []*ProxySelector, subURLs []string) {
@@ -394,6 +441,7 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 	port := portOfAddr(m.statuses[i].HTTP)
 	if cfg == nil {
 		m.statuses[i].Endpoint = ""
+		m.statuses[i].Source = ""
 		m.statuses[i].Memo = ""
 		m.statuses[i].Degraded = false
 		m.statuses[i].ThroughputKbps = 0
@@ -424,6 +472,7 @@ func (m *ProxyManager) applyQualityLocked(i int) {
 		m.statuses[i].uploadAt = time.Time{}
 	}
 	m.statuses[i].Endpoint = cfg.Endpoint
+	m.statuses[i].Source = cfg.Source
 	memo := m.memoForLocked(cfg.Endpoint)
 	m.statuses[i].Memo = memo
 	m.statuses[i].Degraded = memo != "" || throughputLow(&m.statuses[i])
@@ -517,6 +566,23 @@ func (m *ProxyManager) BulkStats() (usable, measured int) {
 		}
 	}
 	return usable, measured
+}
+
+// AllocationStats reports requested ports versus ports that currently hold a
+// healthy source. A shortfall is explicit; no source is silently duplicated.
+func (m *ProxyManager) AllocationStats() (requested, allocated int, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	requested = len(m.statuses)
+	for _, s := range m.statuses {
+		if s.Status == "ok" {
+			allocated++
+		}
+	}
+	if allocated < requested {
+		reason = fmt.Sprintf("%d of %d requested ports have a healthy source", allocated, requested)
+	}
+	return requested, allocated, reason
 }
 
 // UploadStats reports alive nodes whose upload probe has run, those proven
@@ -898,6 +964,7 @@ func (m *ProxyManager) markDown(i int, errMsg string) {
 	if i >= 0 && i < len(m.statuses) {
 		m.applyQualityLocked(i)
 		m.statuses[i].Status = "down"
+		m.statuses[i].Role = "standby"
 		m.statuses[i].Error = errMsg
 		if ep := m.statuses[i].Endpoint; ep != "" {
 			delete(m.pinned, ep)
@@ -1011,6 +1078,7 @@ func (m *ProxyManager) markOK(i int, name string, lat time.Duration) {
 	if i >= 0 && i < len(m.statuses) {
 		m.statuses[i].Status = "ok"
 		m.statuses[i].Error = ""
+		m.statuses[i].Role = "primary"
 		m.applyQualityLocked(i)
 		if name != "" {
 			m.statuses[i].Name = name
@@ -1048,15 +1116,15 @@ func serveReady(alive, total int) bool {
 // background. The manager lock is only held for short state updates so the
 // API stays responsive during populate.
 func (m *ProxyManager) Start() error {
-	if m.upstreamErr != nil {
-		return m.upstreamErr
+	if m.staticErr != nil {
+		return m.staticErr
 	}
 	insts, subURLs := m.snapshot()
 	if len(insts) == 0 {
 		return fmt.Errorf("no instances configured")
 	}
-	if m.upstream != nil {
-		infoLog("Upstream mode: single external SOCKS5 upstream %s; subscriptions disabled", m.upstream.Endpoint)
+	if len(m.staticConfigs) > 0 {
+		infoLog("Sources: %d static upstream(s) + subscription pool", len(m.staticConfigs))
 	}
 
 	// Populate until EVERY instance holds a unique working proxy. Rounds refetch
@@ -1334,11 +1402,11 @@ func (m *ProxyManager) probeRelay() {
 }
 
 func (m *ProxyManager) RefreshSubscriptions() {
-	if m.upstream != nil {
-		debugLog("UPSTREAM_PROXY active: keeping the single upstream; subscription refresh skipped")
+	insts, subURLs := m.snapshot()
+	if len(subURLs) == 0 {
+		debugLog("no subscription sources; static upstreams stay in place")
 		return
 	}
-	insts, subURLs := m.snapshot()
 
 	// Dead sources rest instead of burning full retry budgets every cycle.
 	allowed := make([]string, 0, len(subURLs))
@@ -1360,12 +1428,18 @@ func (m *ProxyManager) RefreshSubscriptions() {
 	for _, u := range allowed {
 		m.srcBrk.note(u, !failed[u])
 	}
-	pool = m.mergePinned(pool)
 	if len(pool) == 0 {
+		// Keep the current mixed pool (including static entries) rather than
+		// dropping working static upstreams because subscriptions failed.
 		warnLog("refresh got 0 configs from all sources, keeping old")
 		return
 	}
-	pool = dedupConfigs(pool)
+	// Static upstreams stay at the front; subscriptions keep their DPI order.
+	mixed := make([]ProxyConfig, 0, len(m.staticConfigs)+len(pool))
+	mixed = append(mixed, m.staticConfigs...)
+	mixed = append(mixed, pool...)
+	mixed = m.mergePinned(mixed)
+	mixed = dedupConfigs(mixed)
 	shuffleBase := time.Now().UnixNano()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, probeWorkers)
@@ -1373,8 +1447,8 @@ func (m *ProxyManager) RefreshSubscriptions() {
 		// Captured BEFORE the swap: reconcile needs the pre-refresh active
 		// to tell "remote list rotated" apart from "proxy died".
 		prevActive := inst.ActiveConfig()
-		configs := make([]ProxyConfig, len(pool))
-		copy(configs, pool)
+		configs := make([]ProxyConfig, len(mixed))
+		copy(configs, mixed)
 		shuffleConfigs(configs, shuffleBase+int64(i)*1099511628211)
 		debugLog("Instance %d: refreshed %d unique configs", i, len(configs))
 		inst.UpdateConfigs(configs)

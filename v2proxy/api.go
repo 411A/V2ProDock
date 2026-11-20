@@ -72,6 +72,7 @@ func startAPI(manager *ProxyManager, basePort int) int {
 		alive := manager.AliveCount()
 		starting := manager.StartingCount()
 		degraded := manager.DegradedCount()
+		requested, allocated, shortfallReason := manager.AllocationStats()
 		usableBulk, measuredBulk := manager.BulkStats()
 		usableUpload, measuredUpload, inconclusiveUpload := manager.UploadStats()
 		brokenUpload := manager.UploadBrokenCount()
@@ -87,6 +88,9 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			"alive":           alive,
 			"starting":        starting,
 			"degraded":        degraded,
+			"requested":       requested,
+			"allocated":       allocated,
+			"shortfall":       requested - allocated,
 			"usable_bulk":     usableBulk,
 			"bulk_measured":   measuredBulk,
 			"bulk_check":      bulkConfigured,
@@ -97,6 +101,12 @@ func startAPI(manager *ProxyManager, basePort int) int {
 			// inconclusive gate is still not a measured pool; report it rather
 			// than letting it look like "probe has not run yet".
 			"upload_inconclusive": inconclusiveUpload,
+		}
+		if shortfallReason != "" {
+			body["shortfall_reason"] = shortfallReason
+			if allocated > 0 {
+				body["status"] = "degraded"
+			}
 		}
 		// Every alive node carries a quality memo: service continues (small
 		// requests may be fine) but the caller must not expect large transfers
