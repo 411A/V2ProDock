@@ -320,6 +320,32 @@ Repeated short **plain-HTTP** bodies (Content-Length not satisfied) are counted
 per endpoint; after 3, the node is auto-memo'd. HTTPS/CONNECT bodies are opaque
 to the bridge, so those are covered by the throughput gate instead.
 
+#### Single external SOCKS5 upstream (optional)
+
+If another local proxy manager already holds a working node and this daemon's
+own pool is temporarily poor, point V2ProDock at that SOCKS5 listener instead
+of chaining two full pools:
+
+```env
+UPSTREAM_PROXY=socks5://gateway-host:1080
+# with auth:
+# UPSTREAM_PROXY=socks5://user:pass@gateway-host:1080
+```
+
+In this mode V2ProDock runs **one** xray child with a native `socks` outbound
+and routes everything through that upstream. The subscription pool is disabled
+and `PROXY_INSTANCES` is ignored: ranking ten copies of the same external node
+would be noise, and leaving subscription configs active would make status,
+memos and pinning describe nodes that are no longer used. Health checks,
+stable aggregate ports, memos, throughput and upload gates all still apply to
+the single upstream.
+
+Unset `UPSTREAM_PROXY` and restart to return to the normal multi-node pool.
+There is no hot reload. A malformed value fails startup closed rather than
+silently falling back to a different pool. Do not point it at this daemon's
+own listener ports. Credentials are written only to the 0600 xray config; logs
+and `/proxies` expose `host:port`, never the password.
+
 #### `XRAY_MUX` — measured per-flow shaping experiment
 
 Mux is **off by default**. `XRAY_MUX=1` adds xray `mux.cool` to VMess/VLESS/
@@ -401,7 +427,7 @@ intermittently while small API calls look fine.
 
 First identify the port. This stack publishes **27000-27017** and
 **27019-27100**; per-instance ports start at `PORT_BASE` (`27019` by
-default) and aggregates are `27015-27017`. A port like `27910` is outside
+default) and aggregates are `27015-27017`. A port like `28010` is outside
 that range unless you changed `PORT_BASE`/the compose mapping, so it is
 normally an upstream node or a different tool. Confirm with:
 
@@ -748,11 +774,12 @@ Environment variables (set in `.env` or via docker-compose):
 |----------|---------|-------------|
 | `SUBSCRIPTION_URL` | — | Single v2ray subscription URL (see [V2RayDAR](https://github.com/411A/V2RayDAR) to self-host one) |
 | `SUBSCRIPTION_URLS` | — | Comma-separated URLs (one per instance, overrides `SUBSCRIPTION_URL`) |
+| `UPSTREAM_PROXY` | — | Optional `socks5://[user:pass@]host:port` single external upstream; enables one-instance mode and disables subscriptions. Unset + restart to return to the pool; malformed values fail closed |
 | `REQUIRE_TRANSPORT_SECURITY` | `0` | `1` = DPI-hardened: also reject SS and VMess/VLESS without TLS/Reality; Reality SNI plausibility is always checked |
 | `SNI_DENYLIST` | - | Optional operator-supplied Reality SNIs (`*.suffix` supported); no names are compiled in |
 | `SNI_ALLOWLIST` | - | Optional escape hatch for a Reality host whose suffix is newer than the bundled public-suffix list (or intentionally private); denylist still wins |
 | `SNI_DNS_CHECK` | `0` | `1` = reject Reality SNI only on definite NXDOMAIN (timeouts stay inconclusive) |
-| `PROXY_INSTANCES` | `1` | Number of xray instances to run |
+| `PROXY_INSTANCES` | `1` | Number of xray instances to run (ignored in `UPSTREAM_PROXY` mode) |
 | `PORT_BASE` | `27019` | Base port: N SOCKS5 ports, then N HTTP ports (`SOCKS=base+i`, `HTTP=base+N+i`) |
 | `API_PORT` | `27018` | Port for the HTTP API |
 | `HEALTH_CHECK_URL` | `https://www.gstatic.com/generate_204` | URL used to test proxy connectivity (must be `https://` — plain HTTP is DPI-killed on bare transports, causing false downs) |

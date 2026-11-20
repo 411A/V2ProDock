@@ -64,10 +64,15 @@ type InstanceStatus struct {
 }
 
 type ProxyManager struct {
-	mu            sync.Mutex
-	instances     []*ProxySelector
-	statuses      []InstanceStatus
-	subURLs       []string
+	mu        sync.Mutex
+	instances []*ProxySelector
+	statuses  []InstanceStatus
+	subURLs   []string
+	// upstream is the single external SOCKS5 config in UPSTREAM_PROXY mode.
+	// It is nil in normal pool mode. upstreamErr fails startup closed when the
+	// operator configured an invalid upstream; never silently fall back.
+	upstream      *ProxyConfig
+	upstreamErr   error
 	xrayDir       string
 	testURL       string
 	portBase      int
@@ -187,8 +192,23 @@ func (b *srcBreaker) note(url string, ok bool) {
 }
 
 func NewProxyManager(xrayDir, testURL string, portBase, instanceCount int, subURLs []string, checkInterval time.Duration) *ProxyManager {
+	// Single-upstream mode has exactly one thing to serve. Running N local
+	// xray children against the same external SOCKS endpoint adds memory and
+	// duplicate health/probe traffic without adding a second route.
+	var upstream *ProxyConfig
+	var upstreamErr error
+	if upstreamProxyEnabled() {
+		upstream, upstreamErr = upstreamProxyConfig()
+		if instanceCount > 1 {
+			warnLog("UPSTREAM_PROXY is set: using a single external upstream and ignoring PROXY_INSTANCES=%d", instanceCount)
+		}
+		instanceCount = 1
+	}
+
 	m := &ProxyManager{
 		subURLs:       subURLs,
+		upstream:      upstream,
+		upstreamErr:   upstreamErr,
 		xrayDir:       xrayDir,
 		testURL:       testURL,
 		portBase:      portBase,
@@ -283,6 +303,19 @@ func fetchPoolWithRetry(urls []string) ([]ProxyConfig, error) {
 		debugLog("fetch pool retry %d/2: %v", attempt+1, lastErr)
 	}
 	return nil, lastErr
+}
+
+// initialPool is the one place startup chooses between the subscription pool
+// and UPSTREAM_PROXY mode. A configured-but-invalid upstream fails closed: it
+// must never silently fall back to fetching a different pool.
+func (m *ProxyManager) initialPool(urls []string) ([]ProxyConfig, error) {
+	if m.upstreamErr != nil {
+		return nil, m.upstreamErr
+	}
+	if m.upstream != nil {
+		return []ProxyConfig{*m.upstream}, nil
+	}
+	return fetchPoolWithRetry(urls)
 }
 
 func dedupConfigs(in []ProxyConfig) []ProxyConfig {
@@ -1015,9 +1048,15 @@ func serveReady(alive, total int) bool {
 // background. The manager lock is only held for short state updates so the
 // API stays responsive during populate.
 func (m *ProxyManager) Start() error {
+	if m.upstreamErr != nil {
+		return m.upstreamErr
+	}
 	insts, subURLs := m.snapshot()
 	if len(insts) == 0 {
 		return fmt.Errorf("no instances configured")
+	}
+	if m.upstream != nil {
+		infoLog("Upstream mode: single external SOCKS5 upstream %s; subscriptions disabled", m.upstream.Endpoint)
 	}
 
 	// Populate until EVERY instance holds a unique working proxy. Rounds refetch
@@ -1081,7 +1120,7 @@ func (m *ProxyManager) Start() error {
 			notePopProgress()
 			time.Sleep(populateRetryDelay)
 		}
-		pool, err := fetchPoolWithRetry(subURLs)
+		pool, err := m.initialPool(subURLs)
 		if err != nil {
 			warnLog("populate round %d: fetch failed: %v — retrying...", round, err)
 			time.Sleep(populateRetryDelay)
@@ -1295,6 +1334,10 @@ func (m *ProxyManager) probeRelay() {
 }
 
 func (m *ProxyManager) RefreshSubscriptions() {
+	if m.upstream != nil {
+		debugLog("UPSTREAM_PROXY active: keeping the single upstream; subscription refresh skipped")
+		return
+	}
 	insts, subURLs := m.snapshot()
 
 	// Dead sources rest instead of burning full retry budgets every cycle.

@@ -112,6 +112,19 @@ probe is target-rejected, `/health` reports `upload_inconclusive` and
 `upload_probe_warning` instead of silently looking unmeasured; node state is
 untouched.
 
+## Single-upstream mode (UPSTREAM_PROXY)
+
+When `UPSTREAM_PROXY` is set, the daemon runs exactly one xray child and sends
+all traffic to that external SOCKS5 server. Subscriptions and `PROXY_INSTANCES`
+are ignored, so `/proxies` and `/health` describe one upstream, not a ranked
+pool; `/refresh` is a no-op. Health, aggregate ports, memos, throughput and
+upload gates still operate on that upstream. If it dies, every local client
+path fails until it returns (or until you unset the variable and restart). This
+is deliberate: one upstream has no second route to fail over to.
+
+A malformed `UPSTREAM_PROXY` fails startup closed. Credentials are confined to
+the 0600 xray config; status and logs expose only `host:port`.
+
 ## Known latent issue: inconclusive bulk probes look healthy
 
 Observed 2026-11-19 09:45 on a filtered pool while every node carried

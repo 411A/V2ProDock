@@ -72,7 +72,7 @@ func TestSplitURLs(t *testing.T) {
 func TestSubscriptionHint(t *testing.T) {
 	// Production case: the host curls fine, the container has no route.
 	// The hint must say so instead of blaming the URL (loopback rewrite).
-	unreach := subscriptionHint(errors.New(`Get "http://192.168.1.87:27141/subscription.txt": dial tcp 192.168.1.87:27141: connect: network is unreachable`))
+	unreach := subscriptionHint(errors.New(`Get "http://198.51.100.10:27141/subscription.txt": dial tcp 198.51.100.10:27141: connect: network is unreachable`))
 	if !strings.Contains(unreach, "NO route") || !strings.Contains(unreach, "ip route") {
 		t.Fatalf("unreachable hint must name the container network + fact commands, got %q", unreach)
 	}

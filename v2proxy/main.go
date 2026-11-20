@@ -70,7 +70,8 @@ func main() {
 		}
 	}
 
-	if len(subURLs) == 0 {
+	upstreamMode := upstreamProxyEnabled()
+	if len(subURLs) == 0 && !upstreamMode {
 		fmt.Print("Enter subscription URL: ")
 		if _, err := fmt.Scanln(&subURL); err != nil {
 			errLog("scan failed: %v", err)
@@ -91,7 +92,14 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	infoLog("configured %d subscription source(s)", len(subURLs))
+	if upstreamMode {
+		infoLog("UPSTREAM_PROXY set: single external SOCKS5 upstream; subscription pool disabled")
+		if len(subURLs) > 0 {
+			warnLog("%d configured subscription source(s) ignored while UPSTREAM_PROXY is set", len(subURLs))
+		}
+	} else {
+		infoLog("configured %d subscription source(s)", len(subURLs))
+	}
 
 	if err := EnsureXray(xrayDir); err != nil {
 		errLog("Xray setup failed: %v", err)
@@ -170,8 +178,10 @@ func main() {
 
 	bannerLog(fmt.Sprintf("Working proxies: %d/%d", manager.AliveCount(), manager.InstanceCount()))
 
-	go subscriptionLoop(manager)
 	go healthCheckLoop(manager)
+	if !upstreamMode {
+		go subscriptionLoop(manager)
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
